@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Hydrogel VBD Simulation
 
 This repository contains a Python-first MVP framework for a VBD-based electric-field-assisted hydrogel DLP printing simulation.
@@ -27,3 +28,6 @@ After installing the package in editable mode, the demo can also be run as a mod
 python -m pip install -e .
 python -m hydrogel_vbd.main_loop --layers 3 --output outputs/demo
 ```
+=======
+# VBD_simulator
+>>>>>>> 3a7c9504345d20ae5a82bcd52cad71e42b4e0d9f
