@@ -1,0 +1,7 @@
+{
+  "electrode_ids": ["left", "right"],
+  "voltage_min": -5.0,
+  "voltage_max": 5.0,
+  "regularization": 0.001,
+  "direction": [0.0, 0.0, 1.0]
+}

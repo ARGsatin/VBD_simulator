@@ -1,0 +1,6 @@
+{
+  "substeps": 2,
+  "iterations": 8,
+  "damping": 0.08,
+  "backend": "python-reference"
+}

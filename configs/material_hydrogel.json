@@ -1,0 +1,10 @@
+{
+  "density": 1050.0,
+  "young_modulus_min": 500.0,
+  "young_modulus_max": 15000.0,
+  "poisson_ratio": 0.45,
+  "damping": 0.08,
+  "curing_exponent": 1.5,
+  "peel_stress_crit": 120.0,
+  "electric_response_alpha": 0.01
+}
