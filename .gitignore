@@ -17,6 +17,7 @@ dist/
 *.egg-info/
 
 outputs/
+.worktrees/
 *.npz
 *.vtu
 
