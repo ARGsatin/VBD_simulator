@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hydrogel_vbd.control.field_controller import PIDFieldState
 from hydrogel_vbd.state import FieldCommand
 
 
@@ -19,4 +20,17 @@ def insert_field_commands(source_gcode: str, commands_by_layer: dict[int, FieldC
                 f";E_FIELD: ELECTRODE={electrode_id}, VOLTAGE={float(voltage):.6f}, DURATION={command.duration:.6f}"
             )
         output_lines.append(";E_FIELD: OFF")
+    return "\n".join(output_lines) + "\n"
+
+
+def insert_pid_field_commands(source_gcode: str, commands_by_layer: dict[int, PIDFieldState]) -> str:
+    output_lines: list[str] = []
+    for line in source_gcode.splitlines():
+        output_lines.append(line)
+        if not line.startswith(";LAYER:"):
+            continue
+        layer_id = int(line.split(":", 1)[1].strip())
+        command = commands_by_layer.get(layer_id)
+        if command is not None:
+            output_lines.append(f"M150 E{command.E_z:.6f}")
     return "\n".join(output_lines) + "\n"
