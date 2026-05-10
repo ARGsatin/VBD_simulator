@@ -1,3 +1,23 @@
+# -*- coding: utf-8 -*-
+"""NPZ 层状态持久化 —— 将每层仿真结果保存为 NumPy 压缩格式或从中恢复。
+
+本模块提供层仿真结果（``LayerResult``）的序列化/反序列化功能。
+使用 ``.npz`` 格式存储，这是一种基于 NumPy 的压缩存档格式，
+便于后续分析和与 MATLAB 等工具的互操作。
+
+存储内容
+--------
+每个 NPZ 文件包含该层的一次完整子系统仿真结果：
+* ``layer_id``：层索引
+* ``x_sim``：仿真后的节点位置 (N, 3)
+* ``v_sim``：仿真后的节点速度 (N, 3)
+* ``voltage``：该层施加的电极电压向量
+* ``max_deformation``：该层最大变形量 (m)
+* ``rms_error``：该层 RMS 形状误差 (m)
+* ``success``：求解是否收敛
+* ``error_metrics``：完整的误差指标字典（通过键值对分别存储）
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,6 +28,23 @@ from hydrogel_vbd.state import LayerResult
 
 
 def save_layer_state(path: str | Path, result: LayerResult) -> Path:
+    """将层仿真结果保存为 NPZ 文件。
+
+    创建必要的输出目录，将 ``LayerResult`` 的所有字段
+    序列化到单个压缩 NumPy 存档中。
+
+    Parameters
+    ----------
+    path : str or Path
+        输出文件路径（含 ``.npz`` 扩展名）。
+    result : LayerResult
+        待保存的层仿真结果。
+
+    Returns
+    -------
+    Path
+        写入的 NPZ 文件路径。
+    """
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -20,12 +57,38 @@ def save_layer_state(path: str | Path, result: LayerResult) -> Path:
         rms_error=np.array(result.rms_error, dtype=float),
         success=np.array(result.success, dtype=bool),
         metric_keys=np.array(list(result.error_metrics.keys())),
-        metric_values=np.array(list(result.error_metrics.values()), dtype=float),
+        metric_values=np.array(
+            list(result.error_metrics.values()), dtype=float
+        ),
     )
     return output
 
 
 def load_layer_state(path: str | Path) -> dict:
+    """从 NPZ 文件加载层仿真结果。
+
+    读取之前保存的层状态文件，返回包含所有字段的字典。
+    注意：返回的字典不是 ``LayerResult`` 对象，而是其字段的
+    扁平化表示，便于灵活使用。
+
+    Parameters
+    ----------
+    path : str or Path
+        输入 NPZ 文件路径。
+
+    Returns
+    -------
+    dict
+        包含以下键的字典：
+        - ``"layer_id"`` (int)：层索引
+        - ``"x_sim"`` (np.ndarray, shape (N, 3))：节点位置
+        - ``"v_sim"`` (np.ndarray, shape (N, 3))：节点速度
+        - ``"voltage"`` (np.ndarray)：电极电压向量
+        - ``"max_deformation"`` (float)：最大变形量
+        - ``"rms_error"`` (float)：RMS 误差
+        - ``"success"`` (bool)：求解是否收敛
+        - ``"error_metrics"`` (dict[str, float])：完整误差指标
+    """
     with np.load(Path(path), allow_pickle=False) as data:
         metric_keys = [str(item) for item in data["metric_keys"]]
         metric_values = [float(item) for item in data["metric_values"]]

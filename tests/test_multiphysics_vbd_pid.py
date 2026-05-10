@@ -44,19 +44,30 @@ class MultiphysicsVbdPidTests(unittest.TestCase):
         mesh.activate_layer(0)
         bottom = mesh.bottom_nodes(0)
         mesh.czm_state[bottom] = CZMState.FREE
-        mesh.vertices[bottom, 2] = config.d_min * 10.0
-        mesh.prev_vertices[bottom, 2] = 0.0
 
-        terms = build_local_physics_terms(mesh, config, e_z=10.0, x_prev=mesh.prev_vertices)
+        # ── 构建纯流体拖曳场景：F = I 无弹性形变 ──
+        mesh.vertices = mesh.ideal_vertices * config.c_shrink
+        # 底部 z 向上微抬 d_min*10，prev 留在原始位置产生向上速度
+        mesh.vertices[bottom, 2] += config.d_min * 10.0
+        mesh.prev_vertices[bottom, 2] = mesh.ideal_vertices[bottom, 2] * config.c_shrink
+
+        # (a) 流体激活跃：time_free 小 → 满足 t_fluid_max 条件
+        mesh.time_free[bottom] = 0.0
+        terms = build_local_physics_terms(mesh, config, e_z=0.0, x_prev=mesh.prev_vertices)
 
         self.assertEqual(terms.force.shape, mesh.vertices.shape)
         self.assertEqual(terms.hessian.shape, (mesh.vertices.shape[0], 3, 3))
         self.assertTrue(np.all(terms.force[bottom, 2] < 0.0))
         self.assertTrue(np.all(terms.hessian[bottom, 2, 2] > 0.0))
 
-        mesh.vertices[bottom, 2] = config.d_fluid_max * 2.0
-        far_terms = build_local_physics_terms(mesh, config, e_z=10.0, x_prev=mesh.prev_vertices)
-        self.assertTrue(np.all(far_terms.hessian[bottom, 2, 2] < terms.hessian[bottom, 2, 2]))
+        # (b) 流体截止：time_free ≥ t_fluid_max → 跳过流体贡献
+        mesh.time_free[bottom] = config.t_fluid_max + 1.0
+        far_terms = build_local_physics_terms(mesh, config, e_z=0.0, x_prev=mesh.prev_vertices)
+
+        # 流体 Hessian 被移除，总 Hessian 应下降（弹性部分不变）
+        hessian_drop = terms.hessian[bottom, 2, 2] - far_terms.hessian[bottom, 2, 2]
+        self.assertTrue(np.all(hessian_drop > 0.0),
+                        f"fluid Hessian not removed (drop={hessian_drop})")
 
     def test_vbd_solver_skips_fixed_nodes_tracks_convergence_and_blocks_damaging_extrapolation(self):
         from hydrogel_vbd.config import SimulationConfig

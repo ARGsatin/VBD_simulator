@@ -1,3 +1,27 @@
+# -*- coding: utf-8 -*-
+"""局部物理项组装器 —— 综合弹性体、CZM 粘聚力和流体拖曳力的逐节点组装。
+
+本模块是力的**核心计算引擎**，在每个时间步被调用一次。
+它将以下物理贡献按节点聚合为统一的力与 Hessian：
+
+1. **重力**：均匀体积力 f = m · g
+2. **电场力**：f_z = q_ion · E_z（仅 Z 方向）
+3. **Neo-Hookean 超弹性**：通过四面体有限元组装的弹性力与 Hessian
+4. **CZM 粘聚区**：基于牵引-分离法则的损伤软化力（仅底面节点）
+5. **流体挤压流拖曳**：FREE 状态下节点接近离型膜时的挤压膜阻尼
+   （Reynolds 润滑近似，f ∝ v_z / gap³）
+
+组装策略
+--------
+* 先遍历所有活动四面体组装超弹性贡献（主要计算热点）
+* 再遍历所有活动节点，根据 CZM 状态施加界面力或流体拖曳力
+* 所有贡献直接累加到 ``force`` 和 ``hessian`` 数组中
+
+.. note::
+   ``hessian`` 存储的是**对角块** Hessian（每个节点一个 3×3 矩阵），
+   这是 VBD（Vertex-Block Diagonal）求解器的要求。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,11 +30,53 @@ import numpy as np
 
 from hydrogel_vbd.config import SimulationConfig
 from hydrogel_vbd.forces.czm import CZMState
+from hydrogel_vbd.solver.elastic_energy import compute_tet_force_and_hessian_contributions
 from hydrogel_vbd.state import MeshState
+
+
+def _poisson_to_lame(mu: float, kappa: float) -> tuple[float, float]:
+    """从剪切模量 μ 和体积模量 κ 计算 Lamé 第一参数 λ。
+
+    各向同性线弹性材料需要 Lamé 参数 (λ, μ) 来描述本构关系，
+    但输入配置文件通常提供工程常数 (μ, κ)。
+    本函数完成从 (μ, κ) 到 (μ, λ) 的转换。
+
+    转换公式（基于 κ = λ + 2μ/3）：
+    .. math::
+        λ = κ - \\frac{2}{3}μ
+
+    Parameters
+    ----------
+    mu : float
+        剪切模量（Pa），即 Lamé 第二参数。
+    kappa : float
+        体积模量（Pa）。
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(mu, lam)`` —— 注意第一个元素仍是 μ（不变），
+        第二个元素是计算得到的 λ。
+    """
+    lam = kappa - (2.0 / 3.0) * mu
+    return mu, lam
 
 
 @dataclass
 class LocalPhysicsTerms:
+    """局部物理项组装结果 —— 单步的力向量与对角块 Hessian。
+
+    本数据结构用于存储 ``build_local_physics_terms()`` 的输出，
+    包含当前时间步所有局部物理贡献的累加结果。
+
+    Attributes
+    ----------
+    force : np.ndarray, shape (N, 3)
+        每节点的净力向量（N）。非活动节点保持零。
+    hessian : np.ndarray, shape (N, 3, 3)
+        每节点的对角块 Hessian 矩阵（N/m）。用于 VBD 求解器
+        的局部线性化。非活动节点为单位矩阵（已在外层初始化）。
+    """
     force: np.ndarray
     hessian: np.ndarray
 
@@ -26,14 +92,52 @@ def build_local_physics_terms(
     active = mesh.active_vertex_mask
     masses = mesh.masses
     g = np.asarray(config.g, dtype=float)
+
+    # ---- 重力 + 电场力 ----
     force[active] += masses[active, None] * g
     force[active, 2] += config.q_ion * float(e_z)
 
-    stiffness = max(float(config.mu), 1.0) * 1e-4
-    displacement = mesh.vertices - mesh.ideal_vertices
-    force[active] += -stiffness * displacement[active]
-    hessian[active] += stiffness * np.eye(3)
+    # ---- Neo-Hookean 超弹性（经四面体组装）----
+    mu_val = float(config.mu)
+    kappa_val = float(config.kappa)
+    mu_lame, lam_lame = _poisson_to_lame(mu_val, kappa_val)
 
+    tet_active = mesh.active_tet_mask
+    dm_inv = mesh.dm_inv
+    tet_volumes = mesh.tet_volumes
+    # 收缩系数补偿（参考形状可能被 c_shrink 缩放）
+    c_shrink = float(config.c_shrink)
+
+    for tet_id in np.flatnonzero(tet_active):
+        tet = mesh.tets[tet_id]
+        tet_verts = mesh.vertices[tet]  # (4, 3)
+        dm_inv_tet = dm_inv[tet_id]     # (3, 3)
+        rest_vol = float(tet_volumes[tet_id]) * (c_shrink ** 3)
+
+        try:
+            forces_per_vertex, hessian_per_vertex = compute_tet_force_and_hessian_contributions(
+                tet_verts,
+                dm_inv_tet,
+                rest_vol,
+                mu_lame,
+                lam_lame,
+                inverted_penalty=1e8,
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            # 退化单元：回退到线性弹簧
+            stiffness = max(mu_lame, 1.0) * 1e-4
+            for local_idx, node_id in enumerate(tet):
+                if active[node_id]:
+                    force[node_id] += -stiffness * (mesh.vertices[node_id] - mesh.ideal_vertices[node_id])
+                    hessian[node_id] += stiffness * np.eye(3)
+            continue
+
+        for local_idx, node_id in enumerate(tet):
+            if active[node_id]:
+                force[node_id] += forces_per_vertex[local_idx]
+                hessian[node_id] += hessian_per_vertex[local_idx]
+
+    # ---- CZM 粘聚区 + 流体拖曳（逐顶点）----
     for node_id in np.flatnonzero(active):
         state = CZMState(int(mesh.czm_state[node_id]))
         if state == CZMState.DAMAGING:
