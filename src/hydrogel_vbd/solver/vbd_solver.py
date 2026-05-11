@@ -279,6 +279,10 @@ class PythonReferenceVBDSolver:
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()   # 记录本迭代初始位置（用于 Chebyshev）
 
+            # TODO: 未来重构需将弹力与Hessian计算下沉移入着色循环的最内层，
+            #       以恢复真正的Gauss-Seidel性能。当前在着色循环外部统一计算全局
+            #       物理力（基于上一轮旧坐标），使Gauss-Seidel跌落为Jacobi迭代，
+            #       降低了收敛速度，也使"图着色"失去了其核心加速意义。
             # ── 重新计算物理项（位置变化后力场变化） ──
             terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
             max_dx = 0.0
@@ -432,19 +436,17 @@ class PythonReferenceVBDSolver:
         lifting_top: np.ndarray,
         on_iteration: Callable[[int, float], None] | None = None,
     ) -> VBDSolveResult:
-        """带平台运动学的剥离-静平衡求解。
+        """单步"提升 + 静平衡"求解（供 Python 控制循环调用）。
 
-        真实 DLP 打印中，每层曝光后平台会抬升将固化层从离型膜剥离。
-        本方法分两阶段模拟该过程：
+        控制反转（Inversion of Control）架构：
+        本函数已降级为"单步求解器"，仅执行**一次**微小提升
+        和**一次** VBD 静平衡迭代循环。不含任何 while 循环
+        控制提升距离，时间流逝由 Python 端循环接管。
 
-        **阶段 1 — 平台提升剥离**
-        - 以 ``v_lift`` 速度抬升顶部（平台夹持）节点
-        - 实时更新 CZM 状态（内聚力判据→损伤演化→失效）
-        - 直到底部所有节点进入 FREE 状态或达到最大提升距离
-
-        **阶段 2 — 静平衡**
-        - 平台停稳后执行 VBD 隐式迭代
-        - 让网格在重力、弹性、残余应力下达到静力平衡
+        每一调用步：
+        1. 刚性抬升顶部节点 Z 坐标 ``v_lift * dt`` 米
+        2. 更新 CZM 内聚力状态
+        3. 调用核心 VBD 隐式迭代直到静平衡
 
         Parameters
         ----------
@@ -470,47 +472,36 @@ class PythonReferenceVBDSolver:
             | ~mesh.active_vertex_mask
         )
 
-        # ════════════════════ 阶段 1：平台提升剥离 ════════════════════
+        # ════════════════════ 单步提升 ════════════════════
         v_lift = float(config.v_lift)
-        lift_distance = 0.0
-        lift_max = 5.0 * config.layer_thickness  # 最大提升距离 = 5倍层厚
         bottom = mesh.bottom_nodes(layer_id)
 
-        while lift_distance < lift_max:
-            # ── 刚性抬升顶部节点（仅 Z 方向） ──
-            mesh.vertices[lifting_top, 2] += v_lift * config.dt
-            lift_distance += v_lift * config.dt
+        # 刚性抬升顶部节点（仅 Z 方向）— 单步 v_lift * dt
+        mesh.vertices[lifting_top, 2] += v_lift * config.dt
 
-            # ── 更新 CZM 状态（提离型膜脱粘） ──
-            from hydrogel_vbd.physics.czm import update_czm_states
+        # ── 更新 CZM 状态（提离型膜脱粘）──
+        from hydrogel_vbd.physics.czm import update_czm_states
 
-            if len(bottom):
-                update_czm_states(
-                    mesh,
-                    bottom,
-                    # 施加略高于内聚强度的拉力以模拟剥离
-                    internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
-                    area=config.node_area,
-                    t_max=config.T_max,
-                    k_czm=config.K_czm,
-                    delta_f=config.delta_f,
-                    z_fep=config.z_fep,
-                    dt=config.dt,
-                )
+        if len(bottom):
+            update_czm_states(
+                mesh,
+                bottom,
+                internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
+                area=config.node_area,
+                t_max=config.T_max,
+                k_czm=config.K_czm,
+                delta_f=config.delta_f,
+                z_fep=config.z_fep,
+                dt=config.dt,
+            )
 
-            # ── 全部脱膜则退出提升循环 ──
-            if len(bottom) == 0 or np.all(mesh.czm_state[bottom] == CZMState.FREE):
-                break
-
-        # ════════════════════ 阶段 2：静平衡迭代 ════════════════════
-        #   重新计算固定掩码（CZM 状态已变更）
+        # ════════════════════ 静平衡迭代 ════════════════════
         fixed[:] = (
             mesh.is_top_fixed
             | (mesh.czm_state == CZMState.FIXED)
             | ~mesh.active_vertex_mask
         )
 
-        # ── 与 solve_until_stable 相同的 VBD 核心逻辑 ──
         terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
@@ -543,7 +534,6 @@ class PythonReferenceVBDSolver:
         N_stable = int(config.N_stable)
         target_epsilon = float(config.epsilon)
 
-        # ── 静平衡主循环（与 solve_until_stable 相同） ──
         for iteration in range(1, config.max_iters + 1):
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()
@@ -621,11 +611,10 @@ class PythonReferenceVBDSolver:
             if stable_counter >= N_stable:
                 break
 
-            # ── 迭代回调：用于 GUI 事件泵 / 进度更新 ──
             if on_iteration is not None:
                 on_iteration(iteration, max_dx)
 
-        # ── 后处理：更新速度和动能 ──
+        # ── 后处理 ──
         free = mesh.active_vertex_mask & ~fixed
         mesh.velocities[free] = (
             mesh.vertices[free] - x_prev[free]

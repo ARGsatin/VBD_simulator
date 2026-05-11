@@ -16,8 +16,9 @@ VBDSolveResult solve_until_stable(
     double e_z,
     int layer_id);
 
-// solve_with_lift：带平台提升剥离 + 静平衡
-VBDSolveResult solve_with_lift(
+// solve_lift_and_relax：单步提升 + 单次静平衡（控制反转架构）
+// Python 侧接管时间流逝循环，反复调用此单步函数
+VBDSolveResult solve_lift_and_relax(
     MeshData& mesh,
     const SolverConfig& cfg,
     double e_z,

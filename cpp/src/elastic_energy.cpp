@@ -69,7 +69,7 @@ Eigen::Matrix<double, 9, 9> neo_hookean_material_tangent_9x9(
 
     Eigen::Matrix3d FinvT = F.inverse().transpose();
     double log_J = std::log(J);
-    double coeff = lam * log_J - mu;
+    double coeff = mu - lam * log_J;
 
     Eigen::Matrix<double, 9, 9> C = Eigen::Matrix<double, 9, 9>::Zero();
     for (int i = 0; i < 3; ++i) {
@@ -86,8 +86,8 @@ Eigen::Matrix<double, 9, 9> neo_hookean_material_tangent_9x9(
                     // (λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
                     val += coeff * FinvT(i, l) * FinvT(k, j);
 
-                    // λ · F^{-T}_{ij} · F^{-T}_{kl}
-                    val += lam * FinvT(i, j) * FinvT(k, l);
+                    // λ · F^{-T}_{ij} · F^{-T}_{lk}
+                    val += lam * FinvT(i, j) * FinvT(l, k);
 
                     C(row, col) = val;
                 }

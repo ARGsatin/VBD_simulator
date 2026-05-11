@@ -552,17 +552,23 @@ class OCCFragmentMesher:
             return mesh_state, n_layers
 
         except Exception as exc:
-            # 网格生成失败，尝试回退到 Delaunay 点云剖分
-            warnings.warn(
-                f"Gmsh 网格生成失败: {exc}。"
-                " 自动回退到 scipy.spatial.Delaunay 点云剖分方案。"
-            )
             # 确保 Gmsh 已清理
             try:
                 gmsh.finalize()
             except Exception:
                 pass
 
+            # ── 关键防御：STEP 文件绝对禁止回退到 Delaunay ──
+            if is_step:
+                raise RuntimeError(
+                    f"STEP 模型 OCC 网格划分失败: {exc}"
+                ) from exc
+
+            # STL 格式：尝试回退到 Delaunay 点云剖分
+            warnings.warn(
+                f"Gmsh 网格生成失败: {exc}。"
+                " 自动回退到 scipy.spatial.Delaunay 点云剖分方案。"
+            )
             return self._fallback_delaunay(cfg)
 
         finally:
@@ -632,15 +638,36 @@ class OCCFragmentMesher:
                 " 请将模型导出为封闭的 B-Rep 实体 (.step 格式)。"
             )
 
-        # ── 3. 获取包围盒（mm 单位）──
-        bbox = gmsh.model.occ.getBoundingBox(
-            dim=-1, tag=-1  # 所有实体
-        )
-        if not bbox:
-            raise RuntimeError("无法获取模型包围盒（模型可能为空）")
+        # ── 3. 安全遍历所有 OCC 实体获取包围盒（mm 单位）──
+        #     逐实体遍历，避免 dim=-1,tag=-1 全局查询的拓扑兼容性问题
+        x_min = float("inf")
+        y_min = float("inf")
+        z_min = float("inf")
+        x_max = float("-inf")
+        y_max = float("-inf")
+        z_max = float("-inf")
 
-        x_min, y_min, z_min = bbox[0], bbox[1], bbox[2]
-        x_max, y_max, z_max = bbox[3], bbox[4], bbox[5]
+        for dim, tag in all_entities:
+            try:
+                bbox = gmsh.model.occ.getBoundingBox(dim, tag)
+            except Exception:
+                # 某些低维实体（点/线）可能无法获取包围盒，跳过
+                continue
+            if not bbox or len(bbox) < 6:
+                continue
+
+            x_min = min(x_min, float(bbox[0]))
+            y_min = min(y_min, float(bbox[1]))
+            z_min = min(z_min, float(bbox[2]))
+            x_max = max(x_max, float(bbox[3]))
+            y_max = max(y_max, float(bbox[4]))
+            z_max = max(z_max, float(bbox[5]))
+
+        if not np.isfinite(x_min) or not np.isfinite(x_max):
+            raise RuntimeError(
+                "无法获取模型包围盒 —— 所有 OCC 实体均未返回有效包围盒"
+            )
+
         extent_x = x_max - x_min
         extent_y = y_max - y_min
         extent_z = z_max - z_min
@@ -1130,13 +1157,38 @@ class OCCFragmentMesher:
                     cfg,
                 )
 
-            # STEP 路径：获取包围盒
-            bbox = gmsh.model.occ.getBoundingBox(dim=-1, tag=-1)
-            if not bbox or len(bbox) < 6:
-                raise RuntimeError("无法获取 STEP 模型包围盒")
+            # STEP 路径：安全遍历所有 OCC 实体获取包围盒（mm 单位）
+            #   逐实体遍历，避免 dim=-1,tag=-1 全局查询的拓扑兼容性问题
+            x_min_val = float("inf")
+            y_min_val = float("inf")
+            z_min_val = float("inf")
+            x_max_val = float("-inf")
+            y_max_val = float("-inf")
+            z_max_val = float("-inf")
 
-            z_min_m = bbox[2] * _STL_UNIT_SCALE
-            z_max_m = bbox[5] * _STL_UNIT_SCALE
+            all_occ_entities = gmsh.model.occ.getEntities(dim=-1)
+            for dim_e, tag_e in all_occ_entities:
+                try:
+                    bbox = gmsh.model.occ.getBoundingBox(dim_e, tag_e)
+                except Exception:
+                    continue
+                if not bbox or len(bbox) < 6:
+                    continue
+                x_min_val = min(x_min_val, float(bbox[0]))
+                y_min_val = min(y_min_val, float(bbox[1]))
+                z_min_val = min(z_min_val, float(bbox[2]))
+                x_max_val = max(x_max_val, float(bbox[3]))
+                y_max_val = max(y_max_val, float(bbox[4]))
+                z_max_val = max(z_max_val, float(bbox[5]))
+
+            if not np.isfinite(z_min_val) or not np.isfinite(z_max_val):
+                raise RuntimeError(
+                    "无法获取 STEP 模型包围盒 —— "
+                    "所有 OCC 实体均未返回有效包围盒"
+                )
+
+            z_min_m = z_min_val * _STL_UNIT_SCALE
+            z_max_m = z_max_val * _STL_UNIT_SCALE
             extent_z_m = z_max_m - z_min_m
             n_layers = max(
                 1,

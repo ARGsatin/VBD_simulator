@@ -19,6 +19,7 @@ try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 except ImportError:
     raise ImportError(
         "PySide6 和 matplotlib 未安装。请运行:\n"
@@ -139,19 +140,43 @@ class MeshViewer(QtWidgets.QWidget):
                 alpha=0.8,
             )
 
-        # 自动缩放以包含所有点
-        self._ax.set_xlim(
-            float(np.min(vertices[:, 0])) - 0.01,
-            float(np.max(vertices[:, 0])) + 0.01,
-        )
-        self._ax.set_ylim(
-            float(np.min(vertices[:, 1])) - 0.01,
-            float(np.max(vertices[:, 1])) + 0.01,
-        )
-        self._ax.set_zlim(
-            float(np.min(vertices[:, 2])) - 0.01,
-            float(np.max(vertices[:, 2])) + 0.01,
-        )
+        # —— 自动缩放以包含所有点 + 基准底座平面 ——
+        x_min_v = float(np.min(vertices[:, 0]))
+        x_max_v = float(np.max(vertices[:, 0]))
+        y_min_v = float(np.min(vertices[:, 1]))
+        y_max_v = float(np.max(vertices[:, 1]))
+        z_min_v = float(np.min(vertices[:, 2]))
+        z_max_v = float(np.max(vertices[:, 2]))
+
+        x_range = x_max_v - x_min_v or 0.01
+        y_range = y_max_v - y_min_v or 0.01
+        z_range = z_max_v - z_min_v or 0.01
+        pad = max(x_range, y_range, z_range) * 0.1
+
+        # 基准底座平面：Z=0 处半透明灰色矩形，带 20% 外扩边距
+        expand = 0.2
+        x_pad = x_range * expand or 0.01
+        y_pad = y_range * expand or 0.01
+        base_corners = np.array([
+            [x_min_v - x_pad, y_min_v - y_pad, 0.0],
+            [x_max_v + x_pad, y_min_v - y_pad, 0.0],
+            [x_max_v + x_pad, y_max_v + y_pad, 0.0],
+            [x_min_v - x_pad, y_max_v + y_pad, 0.0],
+        ])
+        self._ax.add_collection3d(Poly3DCollection(
+            [base_corners],
+            alpha=0.2,
+            facecolors='gray',
+            edgecolors='black',
+            linewidths=1.0,
+        ))
+
+        self._ax.set_xlim(x_min_v - pad, x_max_v + pad)
+        self._ax.set_ylim(y_min_v - pad, y_max_v + pad)
+        # 锁定 Z 轴下限略低于 0，确保底座平面不被裁剪
+        z_lower = min(z_min_v - pad, -0.05 * z_range)
+        self._ax.set_zlim(z_lower, z_max_v + pad)
+
         self._fig.tight_layout()
         self._canvas.draw_idle()
 
@@ -250,23 +275,43 @@ class MeshViewer(QtWidgets.QWidget):
                 alpha=0.8,
             )
 
-        # 自动缩放
-        x_range = float(np.ptp(vertices_deformed[:, 0])) or 0.01
-        y_range = float(np.ptp(vertices_deformed[:, 1])) or 0.01
-        z_range = float(np.ptp(vertices_deformed[:, 2])) or 0.01
+        # —— 自动缩放以包含所有点 + 基准底座平面 ——
+        x_min_d = float(np.min(vertices_deformed[:, 0]))
+        x_max_d = float(np.max(vertices_deformed[:, 0]))
+        y_min_d = float(np.min(vertices_deformed[:, 1]))
+        y_max_d = float(np.max(vertices_deformed[:, 1]))
+        z_min_d = float(np.min(vertices_deformed[:, 2]))
+        z_max_d = float(np.max(vertices_deformed[:, 2]))
+
+        x_range = x_max_d - x_min_d or 0.01
+        y_range = y_max_d - y_min_d or 0.01
+        z_range = z_max_d - z_min_d or 0.01
         pad = max(x_range, y_range, z_range) * 0.1
-        self._ax.set_xlim(
-            float(np.min(vertices_deformed[:, 0])) - pad,
-            float(np.max(vertices_deformed[:, 0])) + pad,
-        )
-        self._ax.set_ylim(
-            float(np.min(vertices_deformed[:, 1])) - pad,
-            float(np.max(vertices_deformed[:, 1])) + pad,
-        )
-        self._ax.set_zlim(
-            float(np.min(vertices_deformed[:, 2])) - pad,
-            float(np.max(vertices_deformed[:, 2])) + pad,
-        )
+
+        # 基准底座平面：Z=0 处半透明灰色矩形，带 20% 外扩边距
+        expand = 0.2
+        x_pad = x_range * expand or 0.01
+        y_pad = y_range * expand or 0.01
+        base_corners = np.array([
+            [x_min_d - x_pad, y_min_d - y_pad, 0.0],
+            [x_max_d + x_pad, y_min_d - y_pad, 0.0],
+            [x_max_d + x_pad, y_max_d + y_pad, 0.0],
+            [x_min_d - x_pad, y_max_d + y_pad, 0.0],
+        ])
+        self._ax.add_collection3d(Poly3DCollection(
+            [base_corners],
+            alpha=0.2,
+            facecolors='gray',
+            edgecolors='black',
+            linewidths=1.0,
+        ))
+
+        self._ax.set_xlim(x_min_d - pad, x_max_d + pad)
+        self._ax.set_ylim(y_min_d - pad, y_max_d + pad)
+        # 锁定 Z 轴下限略低于 0，确保底座平面不被裁剪
+        z_lower = min(z_min_d - pad, -0.05 * z_range)
+        self._ax.set_zlim(z_lower, z_max_d + pad)
+
         self._fig.tight_layout()
         self._canvas.draw_idle()
         # 强制刷新事件循环
