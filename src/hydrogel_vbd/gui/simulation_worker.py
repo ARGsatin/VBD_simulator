@@ -352,12 +352,12 @@ class SimulationWorker(QtCore.QObject):
                 f"  🔹 第 {layer_id + 1}/{self._n_layers} 层 ← 开始 VBD 求解"
             )
 
-            # ── 激活当前层 ──
-            activator.activate_layer(self._mesh, layer_id)
+            # ── 激活当前层（继承版：处理激活传播 + FEP 阈值）──
+            activator.activate_with_inheritance(
+                self._mesh, layer_id, z_fep=self._config.z_fep
+            )
 
-            # ── PID 电场 ──
-            # 注意：pid.update 接收宏观平均误差（标量），此处需先计算误差
-            # 当前简化：直接传入 0.0（后续版本将通过 metrics 模块计算）
+            # ── PID 电场（首步误差默认为 0，后续由 metrics 模块更新）──
             pid_state = pid.update(0.0)  # FIXME: 接入形状误差计算
             e_z = pid_state.E_z
 
