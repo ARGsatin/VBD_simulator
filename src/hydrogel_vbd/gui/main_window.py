@@ -921,32 +921,145 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_stl_preview(self) -> None:
         """在 3D 视图中展示模型的原始表面。
 
-        对 STL 格式使用 trimesh 三角面预览；
-        对 STEP 格式（无可直接渲染的三角面）仅显示包围盒信息。
+        - **STL 格式**：直接使用 trimesh 三角面渲染。
+        - **STEP 格式**：启动临时 Gmsh 流程，生成极粗 2D 表面网格
+          作为"快速表面代理（Surface Proxy）"。仅生成面网格
+          （``gmsh.model.mesh.generate(2)``），跳过昂贵的 3D 体划分，
+          使用 Delaunay 算法确保秒开预览。
         """
         import os as _os
+
         try:
             stl = self._stl_trimesh
             if stl is not None:
-                # STL 格式：渲染三角面
+                # ── STL 格式：已有三角面，直接渲染 ──
                 self._viewer.show_stl_surface(
                     stl.vertices,
                     stl.faces,
                     title=f"STL 模型 — {self._stl_path.name}",
                 )
-            else:
-                # STEP 格式：无可渲染三角面，显示包围盒线框
-                ext = _os.path.splitext(str(self._stl_path))[1].lower() if self._stl_path else ""
-                is_step = ext in ('.step', '.stp', '.igs', '.iges', '.brep')
-                if is_step and hasattr(self, '_bbox_x'):
-                    self._viewer.show_bounding_box(
-                        self._bbox_x,
-                        self._bbox_y,
-                        self._bbox_z,
-                        title=f"STEP 模型包围盒 — {self._stl_path.name}",
-                    )
+                return
+
+            # ── STEP 格式：快速表面代理 ──
+            ext = _os.path.splitext(str(self._stl_path))[1].lower() if self._stl_path else ""
+            is_step = ext in ('.step', '.stp', '.igs', '.iges', '.brep')
+            if not (is_step and hasattr(self, '_bbox_x')):
+                return
+
+            self._status.showMessage("正在生成几何预览 …")
+            QtWidgets.QApplication.processEvents()
+
+            # 计算包围盒对角线长度（m）
+            dx = self._bbox_x[1] - self._bbox_x[0]
+            dy = self._bbox_y[1] - self._bbox_y[0]
+            dz = self._bbox_z[1] - self._bbox_z[0]
+            diag_m = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+
+            # Gmsh 使用 mm 单位 → 转为 mm
+            diag_mm = diag_m * 1000.0
+
+            try:
+                import gmsh as _gmsh
+            except ImportError:
+                self._log.append_log(
+                    "  (Gmsh 未安装，回退到包围盒预览)"
+                )
+                self._viewer.show_bounding_box(
+                    self._bbox_x, self._bbox_y, self._bbox_z,
+                    title=f"STEP 模型包围盒 — {self._stl_path.name}",
+                )
+                self._status.showMessage(
+                    f"已加载 {self._stl_path.name} | "
+                    f"{self._actual_layers} 层"
+                )
+                return
+
+            _gmsh.initialize()
+            try:
+                _gmsh.option.setNumber("General.Terminal", 0)
+                _gmsh.model.add("_surface_preview")
+
+                # 导入 STEP 几何
+                imported = _gmsh.model.occ.importShapes(str(self._stl_path))
+                if not imported:
+                    raise RuntimeError("Gmsh OCC 无法导入 STEP 模型")
+                _gmsh.model.occ.synchronize()
+
+                # ── 极粗网格尺寸：包围盒对角线的 1/20 ──
+                coarse_size = max(diag_mm / 20.0, 0.1)
+                _gmsh.option.setNumber("Mesh.CharacteristicLengthMin", coarse_size)
+                _gmsh.option.setNumber("Mesh.CharacteristicLengthMax", coarse_size * 2.0)
+
+                # ── Delaunay 表面网格（不进行 3D 体划分）──
+                _gmsh.option.setNumber("Mesh.Algorithm", 5)          # Delaunay
+                _gmsh.option.setNumber("Mesh.Algorithm3D", 1)        # 不影响 2D
+                _gmsh.option.setNumber("Mesh.Optimize", 1)           # 基础优化
+                _gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)     # 禁用 Netgen
+
+                # 仅生成 2D 表面网格
+                _gmsh.model.mesh.generate(2)
+
+                # ── 提取表面三角面片 ──
+                node_tags, coords, _ = _gmsh.model.mesh.getNodes()
+                coords = np.array(coords).reshape(-1, 3)  # (N, 3) in mm
+                vertices_preview = coords * 0.001  # mm → m
+
+                # 获取 2D 单元（三角形）
+                elem_types, elem_tags, elem_node_tags = _gmsh.model.mesh.getElements(dim=2)
+                faces_preview = None
+                for et, ent in zip(elem_types, elem_node_tags):
+                    if et == 2:  # 2 = 3-node triangle
+                        faces_preview = np.array(ent, dtype=int).reshape(-1, 3)
+                        break
+                    if et == 3:  # 3 = 4-node quad → 拆分为 2 个三角形
+                        quads = np.array(ent, dtype=int).reshape(-1, 4)
+                        t1 = quads[:, [0, 1, 2]]
+                        t2 = quads[:, [0, 2, 3]]
+                        faces_preview = np.vstack([t1, t2])
+                        break
+
+                if faces_preview is None or faces_preview.size == 0:
+                    raise RuntimeError("未能提取表面三角面片")
+
+                # ── Gmsh 返回 1-based 索引 → 0-based ──
+                faces_preview = faces_preview - 1
+
+                # ── 渲染表面代理 ──
+                self._viewer.show_stl_surface(
+                    vertices_preview,
+                    faces_preview,
+                    title=f"STEP 几何预览 — {self._stl_path.name}",
+                )
+
+            finally:
+                try:
+                    if _gmsh.isInitialized():
+                        _gmsh.finalize()
+                except Exception:
+                    pass
+
+            self._status.showMessage(
+                f"已加载 {self._stl_path.name} | "
+                f"{self._actual_layers} 层 | "
+                f"表面预览 ✓"
+            )
+
         except Exception as exc:
             self._log.append_log(f"  (预览失败: {exc})")
+            # 最终回退：包围盒
+            if hasattr(self, '_bbox_x'):
+                try:
+                    self._viewer.show_bounding_box(
+                        self._bbox_x, self._bbox_y, self._bbox_z,
+                        title=f"STEP 模型包围盒 — {self._stl_path.name}",
+                    )
+                except Exception:
+                    pass
+            self._status.showMessage(
+                f"已加载 {self._stl_path.name} | "
+                f"{self._actual_layers} 层 | "
+                f"预览失败（包围盒回退）"
+            )
 
     def _on_clear_stl(self) -> None:
         """清除 STL 模型，恢复到 Demo 模式。"""
