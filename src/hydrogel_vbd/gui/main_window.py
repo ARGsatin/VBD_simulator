@@ -36,15 +36,15 @@ except ImportError:
         "PySide6 未安装。请运行: pip install pyside6"
     )
 
-from hydrogel_vbd.config import SimulationConfig
+from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.field_controller import PIDFieldController
-from hydrogel_vbd.forces.czm import update_czm_states
+from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.geometry.layer_activator import LayerActivator
 from hydrogel_vbd.geometry.stl_mesher import create_demo_or_stl, STLMesher
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
-from hydrogel_vbd.state import LayerResult, MeshState
+from hydrogel_vbd.core.state import LayerResult, MeshState
 from hydrogel_vbd.gui.mesh_viewer import MeshViewer
 
 
@@ -227,6 +227,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chk_custom_res: QtWidgets.QCheckBox | None = None
         self._lbl_auto_res: QtWidgets.QLabel | None = None
 
+        # ── 后处理动画回放状态 ──
+        self.animation_frames: list[dict[str, Any]] = []
+        self._anim_tets: np.ndarray | None = None
+        self._anim_timer: QtCore.QTimer | None = None
+        self.current_frame_idx: int = 0
+
         self._init_central()
         self._update_button_states()
 
@@ -245,7 +251,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── 顶部工具栏 ──
         top_bar = QtWidgets.QHBoxLayout()
 
-        self._btn_load = QtWidgets.QPushButton("📂 加载 STL 模型")
+        self._btn_load = QtWidgets.QPushButton("📂 加载 CAD 模型")
         self._btn_load.clicked.connect(self._on_load_stl)
 
         self._btn_clear = QtWidgets.QPushButton("✕ 清除模型")
@@ -271,11 +277,21 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._btn_run.clicked.connect(self._on_run)
 
+        self._btn_stop_anim = QtWidgets.QPushButton("⏹ 停止回放")
+        self._btn_stop_anim.setStyleSheet(
+            "QPushButton { font-weight: bold; background-color: #f44336; "
+            "color: white; padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
+        )
+        self._btn_stop_anim.clicked.connect(self._on_stop_animation)
+        self._btn_stop_anim.setVisible(False)
+
         top_bar.addWidget(self._btn_load)
         top_bar.addWidget(self._btn_clear)
         top_bar.addWidget(self._lbl_model, 1)
         top_bar.addWidget(self._btn_mesh)
         top_bar.addWidget(self._btn_run)
+        top_bar.addWidget(self._btn_stop_anim)
         root.addLayout(top_bar)
 
         # ── 中部：参数 + 进度/日志 + 3D 视图 ──
@@ -364,7 +380,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── 底部状态栏 ──
         self._status = QtWidgets.QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("就绪 — 请加载 STL 模型或使用 Demo 模式")
+        self._status.showMessage("就绪 — 请加载 CAD 模型 (*.stl *.step) 或使用 Demo 模式")
 
         # 初始状态：Demo 模式，分辨率自动（不可编辑）
         self._set_demo_mode()
@@ -560,6 +576,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
 
+        # ── 停止正在播放的动画回放并隐藏停止按钮 ──
+        self._stop_animation_timer()
+        self.animation_frames.clear()
+        self._anim_tets = None
+        self.current_frame_idx = 0
+        self._btn_stop_anim.setVisible(False)
+
         self._stl_path = Path(path)
         self._generated_mesh = None
         self.mesh = None
@@ -570,8 +593,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._auto_calculate_mesh_params()
         except Exception as exc:
             self._log.clear()
-            self._log.append_log(f"[错误] 无法解析 STL 文件: {exc}")
-            self._status.showMessage("STL 加载失败 ✗")
+            self._log.append_log(f"[错误] 无法解析 CAD 模型文件: {exc}")
+            self._status.showMessage("模型加载失败 ✗")
             self._stl_path = None
             self._lbl_model.setText("无模型 (使用 Demo 网格)")
             self._set_demo_mode()
@@ -581,7 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_stl_mode()
         self._lbl_model.setText(f"模型: {self._stl_path.name}")
         self._log.clear()
-        self._log.append_log(f"已加载 STL: {self._stl_path}")
+        self._log.append_log(f"已加载 CAD 模型: {self._stl_path}")
         self._log.append_log(
             f"  · 模型包围盒: "
             f"X[{self._bbox_x[0]:.3f}~{self._bbox_x[1]:.3f}] "
@@ -760,14 +783,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_clear_stl(self) -> None:
         """清除 STL 模型，恢复到 Demo 模式。"""
+        # ── 停止正在播放的动画回放并恢复 3D 视图 ──
+        self._stop_animation_timer()
+        self.animation_frames.clear()
+        self._anim_tets = None
+        self.current_frame_idx = 0
+        self._btn_stop_anim.setVisible(False)
+
         self._stl_path = None
         self._generated_mesh = None
         self.mesh = None
         self._actual_layers = 0
         self._lbl_model.setText("无模型 (使用 Demo 网格)")
         self._set_demo_mode()
+        self._viewer.clear()  # 清空 3D 视图（恢复到空白状态）
         self._log.clear()
-        self._log.append_log("已清除 STL 模型，将使用 Demo 网格")
+        self._log.append_log("已清除 CAD 模型，将使用 Demo 网格")
         self._status.showMessage("就绪 — Demo 模式")
         self._update_button_states()
 
@@ -866,6 +897,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         except Exception as exc:
+            # ── 即使网格生成失败，也隐藏停止回放按钮（无有效网格可播放）──
+            self._btn_stop_anim.setVisible(False)
+
             import traceback
             self._log.append_log(f"\n[错误] 网格生成失败: {exc}")
             self._log.append_log(traceback.format_exc())
@@ -921,6 +955,12 @@ class MainWindow(QtWidgets.QMainWindow):
             f"顶点: {len(saved_generated_mesh.vertices)} | "
             f"四面体: {len(saved_generated_mesh.tets)}"
         )
+        # ── 停止之前可能还在运行的动画回放定时器 ──
+        self._stop_animation_timer()
+        self.animation_frames.clear()
+        self._anim_tets = None
+        self.current_frame_idx = 0
+
         self._status.showMessage("仿真运行中 …")
 
         # get_config() 会触发 _on_params → 清空 self._generated_mesh / self.mesh
@@ -987,6 +1027,69 @@ class MainWindow(QtWidgets.QMainWindow):
         results: list[LayerResult] = []
         n_layers = self._actual_layers
 
+        # ── 帧数据缓存：初始化动画帧列表 ──
+        self.animation_frames.clear()
+        self._anim_tets = mesh.tets.copy()
+
+        # ── 渲染降频与异步刷新 ─────────────────────────────────
+        #   render_interval:  物理引擎跑 N 步，界面才刷新 1 次
+        #   displacement_threshold:  形变积累超过此阈值时强制刷新
+        #   last_render_displacement:  上次刷新时的形变量 (m)
+        step_counter = 0
+        render_interval = 50
+        displacement_threshold = 0.1e-3  # 0.1 mm
+        last_render_displacement = 0.0
+
+        def _on_physics_iteration(
+            iteration: int, max_dx: float
+        ) -> None:
+            """物理求解器每次 VBD 迭代后的回调。
+
+            用于降频泵送 Qt 事件循环并条件性刷新 3D 视图，
+            防止长时间密集计算导致 GUI "未响应"。
+            """
+            nonlocal step_counter, last_render_displacement
+
+            step_counter += 1
+
+            # 取出当前顶点坐标（mesh.vertices 已被求解器原地更新）
+            x_current = mesh.vertices.copy()
+            current_displacement = float(
+                np.max(
+                    np.linalg.norm(
+                        x_current - mesh.ideal_vertices, axis=1
+                    )
+                )
+            )
+
+            # 条件一：步数计数器取模命中 (降频)
+            # 条件二：形变累积超过阈值 (关键帧强制刷新)
+            should_render = (
+                (step_counter % render_interval == 0)
+                or (
+                    current_displacement - last_render_displacement
+                    >= displacement_threshold
+                )
+            )
+
+            if should_render:
+                self._viewer.show_deformed_mesh(
+                    x_current,
+                    mesh.tets,
+                    mesh.active_vertex_mask,
+                    title=(
+                        f"第 {layer_id + 1}/{n_layers} 层"
+                        f" — 迭代 {iteration}"
+                    ),
+                )
+                QtWidgets.QApplication.processEvents()
+                last_render_displacement = current_displacement
+            else:
+                # 即使不渲染，也定期泵送事件循环以避免"未响应"
+                if step_counter % 20 == 0:
+                    QtWidgets.QApplication.processEvents()
+        # ────────────────────────────────────────────────────────
+
         for layer_id in range(n_layers):
             self._progress.set_layer(layer_id + 1, n_layers)
             self._log.append_log(
@@ -1013,7 +1116,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 dt=config.dt,
             )
 
-            # 平台运动学 + VBD 求解
+            # 平台运动学 + VBD 求解（传入回调以支持渲染降频）
             if config.v_lift > 0 and np.any(mesh.is_top_fixed):
                 lifting_top = np.flatnonzero(mesh.is_top_fixed)
                 solve_result = solver.solve_with_lift(
@@ -1021,6 +1124,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     layer_id=layer_id,
                     e_z=controller.E_z,
                     lifting_top=lifting_top,
+                    on_iteration=_on_physics_iteration,
                 )
                 self._log.append_log(
                     f"  提升完成, 静平衡迭代 {solve_result.iterations} 步, "
@@ -1028,7 +1132,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 solve_result = solver.solve_until_stable(
-                    mesh, layer_id=layer_id, e_z=controller.E_z
+                    mesh,
+                    layer_id=layer_id,
+                    e_z=controller.E_z,
+                    on_iteration=_on_physics_iteration,
                 )
 
             x_sim, v_sim = solve_result.x, solve_result.v
@@ -1088,13 +1195,21 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             results.append(result)
 
-            # 实时展示变形网格
+            # ── 每层完成后的 GUI 更新（保证层间可见）──
             self._viewer.show_deformed_mesh(
                 x_sim,
                 mesh.tets,
                 mesh.active_vertex_mask,
-                title=f"第 {layer_id + 1}/{n_layers} 层 — 变形网格",
+                title=f"第 {layer_id + 1}/{n_layers} 层 — 层完成",
             )
+            QtWidgets.QApplication.processEvents()
+
+            # ── 缓存动画帧：每层完成后保存一帧 ──
+            self.animation_frames.append({
+                "vertices": x_sim.copy(),
+                "active_mask": mesh.active_vertex_mask.copy(),
+                "title": f"第 {layer_id + 1}/{n_layers} 层 — 层完成",
+            })
 
             # 输出 VTU
             write_vtu(
@@ -1105,9 +1220,138 @@ class MainWindow(QtWidgets.QMainWindow):
                 },
             )
 
+        # ── 强制末帧刷新：仿真循环结束后确保显示最终结果 ──
+        if results:
+            final_result = results[-1]
+            self._viewer.show_deformed_mesh(
+                final_result.x_sim,
+                mesh.tets,
+                mesh.active_vertex_mask,
+                title=f"仿真完成 — 全部 {n_layers} 层",
+            )
+            QtWidgets.QApplication.processEvents()
+            self._log.append_log(
+                "  ✓ 末帧已刷新 — 3D 视图显示最终变形结果"
+            )
+
+            # ── 缓存最终帧 ──
+            self.animation_frames.append({
+                "vertices": final_result.x_sim.copy(),
+                "active_mask": mesh.active_vertex_mask.copy(),
+                "title": f"仿真完成 — 全部 {n_layers} 层",
+            })
+
         # CSV 汇总
         write_metrics_csv(reports_dir / "error_metrics.csv", results)
+
+        # ── 无缝衔接：仿真结束后自动启动动画回放 ──
+        if self.animation_frames:
+            self._log.append_log(
+                f"  🎬 已缓存 {len(self.animation_frames)} 帧，启动动画回放 …"
+            )
+            self.start_animation_playback()
+
         return results
+
+    # ========================================================================
+    # 后处理动画回放
+    # ========================================================================
+    def _stop_animation_timer(self) -> None:
+        """安全停止动画回放定时器。"""
+        if self._anim_timer is not None and self._anim_timer.isActive():
+            self._anim_timer.stop()
+            self._anim_timer = None
+
+    def start_animation_playback(self) -> None:
+        """启动后处理动画回放。
+
+        使用 ``QtCore.QTimer`` 以约 30 FPS（33 ms 间隔）循环播放
+        仿真过程中缓存的所有帧。若动画已在运行则先停止再重启。
+        """
+        if not self.animation_frames:
+            self._log.append_log(
+                "  ⚠ 无动画帧可播放（animation_frames 为空）"
+            )
+            return
+
+        # 停止已有的定时器（如果正在播放）
+        self._stop_animation_timer()
+
+        self.current_frame_idx = 0
+
+        # 创建定时器：约 33 ms → ~30 FPS
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._anim_timer.timeout.connect(self._update_anim_frame)
+        self._anim_timer.start(33)
+
+        # 显示"停止回放"按钮
+        self._btn_stop_anim.setVisible(True)
+
+        self._log.append_log(
+            "  ▶ 动画回放开始 (循环播放, ~30 FPS, "
+            f"{len(self.animation_frames)} 帧)"
+        )
+        self._status.showMessage(
+            f"动画回放中 … [{len(self.animation_frames)} 帧]"
+        )
+
+    def _update_anim_frame(self) -> None:
+        """逐帧渲染动画：每次定时器超时时调用。
+
+        按顺序读取 ``self.animation_frames`` 中的顶点数据，
+        调用 ``self._viewer.show_deformed_mesh`` 刷新 3D 视图。
+        播放到最后一帧后自动回到第 0 帧实现无限循环。
+        """
+        if not self.animation_frames or self._anim_tets is None:
+            self._stop_animation_timer()
+            return
+
+        frame = self.animation_frames[self.current_frame_idx]
+
+        self._viewer.show_deformed_mesh(
+            frame["vertices"],
+            self._anim_tets,
+            frame["active_mask"],
+            title=f"🔁 回放 — {frame['title']}",
+        )
+        QtWidgets.QApplication.processEvents()
+
+        # 循环播放：到达末尾后重置到第 0 帧
+        self.current_frame_idx += 1
+        if self.current_frame_idx >= len(self.animation_frames):
+            self.current_frame_idx = 0
+
+    def _on_stop_animation(self) -> None:
+        """手动停止动画回放，恢复初始网格视图。
+
+        停止定时器，清空动画帧缓存，隐藏停止按钮，
+        并将 3D 视图恢复为划分网格后的初始状态。
+        """
+        # 停止定时器
+        self._stop_animation_timer()
+
+        # 清空动画帧
+        self.animation_frames.clear()
+        self._anim_tets = None
+        self.current_frame_idx = 0
+
+        # 隐藏停止按钮
+        self._btn_stop_anim.setVisible(False)
+
+        # 恢复 3D 视图为初始网格（如果存在）
+        if self._generated_mesh is not None:
+            mesh = self._generated_mesh
+            self._viewer.show_initial_mesh(mesh.vertices, mesh.tets)
+            self._status.showMessage(
+                f"已停止回放 | 网格就绪 ✓ | {self._actual_layers} 层 | "
+                f"{len(mesh.vertices)} 顶点 | {len(mesh.tets)} 四面体"
+            )
+        else:
+            self._viewer.clear()
+            self._status.showMessage("已停止回放 — 无网格数据")
+
+        self._log.append_log("  ⏹ 动画回放已手动停止")
 
     def _on_finish(self, results: list[LayerResult]) -> None:
         """仿真完成汇总。

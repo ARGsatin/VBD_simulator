@@ -14,7 +14,7 @@ class LiftSolverTests(unittest.TestCase):
     """平台提升-静平衡求解器单元测试。"""
 
     def setUp(self) -> None:
-        from hydrogel_vbd.config import SimulationConfig
+        from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 
         self.config = SimulationConfig(
@@ -61,7 +61,7 @@ class VbdSolverSolveUntilStableTests(unittest.TestCase):
     """确保 solve_until_stable 向后兼容。"""
 
     def setUp(self) -> None:
-        from hydrogel_vbd.config import SimulationConfig
+        from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 
         self.config = SimulationConfig(max_iters=4, epsilon=1e-12, N_stable=2)

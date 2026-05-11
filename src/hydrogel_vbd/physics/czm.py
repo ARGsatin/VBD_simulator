@@ -41,7 +41,7 @@ from enum import IntEnum
 
 import numpy as np
 
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.state import MeshState
 
 
 class CZMState(IntEnum):

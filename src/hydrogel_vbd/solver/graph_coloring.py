@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.state import MeshState
 
 
 def greedy_vertex_coloring(mesh: MeshState) -> np.ndarray:

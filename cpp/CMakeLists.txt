@@ -5,6 +5,9 @@ project(vbd_solver_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── OpenMP ──
+find_package(OpenMP REQUIRED)
+
 # ── 优化标志 ──
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -15,7 +18,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 endif()
 
 if(MSVC)
-    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /fp:fast /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /fp:fast /DNDEBUG /openmp")
 endif()
 
 # ── 拉取 Eigen（仅头文件） ──
@@ -53,7 +56,7 @@ pybind11_add_module(vbd_solver_cpp ${VBD_SOURCES})
 
 target_include_directories(vbd_solver_cpp PRIVATE ${CPP_INCLUDE_DIR})
 
-target_link_libraries(vbd_solver_cpp PRIVATE Eigen3::Eigen)
+target_link_libraries(vbd_solver_cpp PRIVATE Eigen3::Eigen OpenMP::OpenMP_CXX)
 
 # 安装到源目录（以便 Python 导入）
 install(TARGETS vbd_solver_cpp DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src/hydrogel_vbd)

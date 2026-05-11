@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 class StateAndActivationTests(unittest.TestCase):
     def test_mesh_state_initializes_velocities_and_activation_masks(self):
-        from hydrogel_vbd.state import MeshState
+        from hydrogel_vbd.core.state import MeshState
 
         vertices = np.array(
             [
@@ -40,7 +40,7 @@ class StateAndActivationTests(unittest.TestCase):
         np.testing.assert_array_equal(mesh.active_tet_mask, np.array([True, False]))
 
     def test_mesh_state_rejects_invalid_shapes(self):
-        from hydrogel_vbd.state import MeshState
+        from hydrogel_vbd.core.state import MeshState
 
         with self.assertRaisesRegex(ValueError, "vertices"):
             MeshState(
@@ -52,7 +52,7 @@ class StateAndActivationTests(unittest.TestCase):
 
     def test_layer_activator_returns_updated_mesh(self):
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
-        from hydrogel_vbd.state import MeshState
+        from hydrogel_vbd.core.state import MeshState
 
         mesh = MeshState(
             vertices=np.zeros((4, 3)),

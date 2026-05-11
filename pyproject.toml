@@ -14,7 +14,7 @@ gui = ["pyside6"]
 all = ["pyside6", "pytest"]
 
 [project.scripts]
-hydrogel-vbd-demo = "hydrogel_vbd.main_loop:main"
+hydrogel-vbd-demo = "hydrogel_vbd.core.main_loop:main"
 hydrogel-vbd-gui = "hydrogel_vbd.gui.main_window:launch_gui"
 
 [tool.setuptools.package-data]

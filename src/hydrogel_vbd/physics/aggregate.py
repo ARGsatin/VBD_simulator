@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from hydrogel_vbd.state import ForceState
+from hydrogel_vbd.core.state import ForceState
 
 
 def aggregate_forces(

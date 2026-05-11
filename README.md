@@ -40,9 +40,11 @@ VBD_simulator/
 │
 ├── src/hydrogel_vbd/                  # 主代码包
 │   ├── __init__.py                    # 包初始化
-│   ├── config.py                      # 仿真配置数据类（YAML 加载）
-│   ├── state.py                       # 仿真状态管理（网格/顶点数据）
-│   ├── main_loop.py                   # 主仿真循环（逐层求解）
+│   │
+│   ├── core/                          # 核心层：配置、状态、主循环
+│   │   ├── config.py                  # 仿真配置数据类（YAML 加载）
+│   │   ├── state.py                   # 仿真状态管理（网格/顶点数据）
+│   │   └── main_loop.py               # 主仿真循环（逐层求解）
 │   │
 │   ├── control/                       # 控制模块
 │   │   ├── field_controller.py        # PID 电场控制器
@@ -52,7 +54,7 @@ VBD_simulator/
 │   │   ├── metrics.py                 # 评估指标计算
 │   │   └── shape_error.py             # 形状误差计算
 │   │
-│   ├── forces/                        # 物理力模型（9 种力）
+│   ├── physics/                       # 物理层：力模型 + 本构 + 弹性能量
 │   │   ├── aggregate.py               # 力聚合与 Hessian 装配
 │   │   ├── czm.py                     # 内聚力模型（损伤断裂）
 │   │   ├── electric.py                # 电场力
@@ -60,7 +62,9 @@ VBD_simulator/
 │   │   ├── gravity.py                 # 重力
 │   │   ├── local_terms.py             # 局部物理项（弹性 + 惯性）
 │   │   ├── peel.py                    # 剥离力
-│   │   └── surface_tension.py         # 表面张力
+│   │   ├── surface_tension.py         # 表面张力
+│   │   ├── hydrogel_model.py          # 水凝胶本构模型（固化度相关）
+│   │   └── elastic_energy.py          # 四面体超弹性能量计算
 │   │
 │   ├── geometry/                      # 几何处理模块
 │   │   ├── conformal_pipeline.py      # 保形网格管道
@@ -69,7 +73,8 @@ VBD_simulator/
 │   │
 │   ├── gui/                           # 图形界面（PySide6）
 │   │   ├── main_window.py             # 主窗口
-│   │   └── mesh_viewer.py             # 网格可视化组件
+│   │   ├── mesh_viewer.py             # 网格可视化组件
+│   │   └── simulation_worker.py       # 仿真工作线程（QThread）
 │   │
 │   ├── io/                            # 输入输出模块
 │   │   ├── gcode_exporter.py          # G-code 导出（含 M150 电场指令）
@@ -77,12 +82,8 @@ VBD_simulator/
 │   │   ├── report_writer.py           # CSV/JSON 报告写入
 │   │   └── vtk_writer.py              # VTK/VTU 可视化输出
 │   │
-│   ├── material/                      # 材料模块
-│   │   └── hydrogel_model.py          # 水凝胶本构模型（固化度相关）
-│   │
 │   └── solver/                        # 求解器模块
 │       ├── constraints.py             # 约束处理（狄利克雷边界）
-│       ├── elastic_energy.py          # 超弹性能量计算
 │       ├── graph_coloring.py          # 图着色（VBD 顶点分组）
 │       └── vbd_solver.py              # VBD 主求解器（Chebyshev 半隐式）
 │
@@ -117,9 +118,10 @@ VBD_simulator/
 │   └── superpowers/                   # 开发计划
 │       └── plans/
 │
-├── 测试模型/                          # 测试用 STL 模型
-│   ├── 长方体(1).STL
-│   └── demo7(1).STL
+├── assets/                            # 静态资源
+│   └── test_models/                   # 测试用 STL 模型
+│       ├── 长方体(1).STL
+│       └── demo7(1).STL
 │
 └── outputs/                           # 仿真输出目录
 ```
@@ -167,11 +169,11 @@ pip install -e .
 ### 运行仿真
 
 ```powershell
-# 方式一：直接调用函数
-python -c "import sys; sys.path.insert(0,'src'); from hydrogel_vbd.main_loop import run_demo; run_demo(layers=3, output='outputs/demo')"
+# 方式一：命令行动态引入
+python -c "import sys; sys.path.insert(0,'src'); from hydrogel_vbd.core.main_loop import run_demo; run_demo(layers=3, output='outputs/demo')"
 
-# 方式二：作为模块运行
-python -m hydrogel_vbd.main_loop --layers 3 --output outputs/demo
+# 方式二：直接运行主循环
+python src/hydrogel_vbd/core/main_loop.py --layers 3
 
 # 方式三：启动图形界面
 python run_gui.py
@@ -238,9 +240,9 @@ cmake --install .
 
 | 类 | 模块 | 职责 |
 |----|------|------|
-| `SimulationConfig` | `config` | 全局参数数据中心 |
-| `MeshState` | `state` | 网格顶点/四面体/掩码管理 |
-| `VbdSolver` | `solver.vbd_solver` | Chebyshev 半隐式 VBD 求解 |
+| `SimulationConfig` | `core.config` | 全局参数数据中心 |
+| `MeshState` | `core.state` | 网格顶点/四面体/掩码管理 |
+| `PythonReferenceVBDSolver` | `solver.vbd_solver` | Chebyshev 半隐式 VBD 求解 |
 | `FieldController` | `control.field_controller` | PID 电场调节 |
 | `LayerActivator` | `geometry.layer_activator` | 新层激活与保形 |
 

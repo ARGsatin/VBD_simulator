@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hydrogel_vbd.state import LayerResult
+from hydrogel_vbd.core.state import LayerResult
 
 
 def save_layer_state(path: str | Path, result: LayerResult) -> Path:

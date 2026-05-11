@@ -71,9 +71,9 @@ from typing import Any
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
+from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.solver.graph_coloring import greedy_vertex_coloring
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.state import MeshState
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -465,9 +465,18 @@ class OCCFragmentMesher:
     def build_layered_mesh(
         self, config: SimulationConfig | None = None
     ) -> tuple[MeshState, int]:
-        """构建 OCC Boolean Fragment 分层四面体网格。
+        """构建分层四面体网格（双通道：STEP → OCC 切片 / STL → GEO 回退）。
 
-        这是推荐的核心方法，替代 :meth:`DelaunayTetMesher.build_layered_mesh`。
+        核心理念
+        --------
+        根据文件扩展名自动选择网格生成路径：
+
+        * **通道 A (STEP/OCC)** — .step/.stp/.igs/.brep:
+          使用 Gmsh OpenCASCADE 几何内核进行 Boolean Fragment 水平切片，
+          在几何层面将模型切分为"千层蛋糕"结构，保证四面体不跨层。
+        * **通道 B (STL/GEO)** — .stl:
+          使用 ``gmsh.merge()`` 直接加载离散面片，跳过 OCC 实体操作，
+          以整体非切层模式生成网格。层归属通过四面体重心 Z 坐标分配。
 
         Parameters
         ----------
@@ -486,7 +495,7 @@ class OCCFragmentMesher:
         ImportError
             如果 Gmsh 不可用。
         RuntimeError
-            如果 OCC Boolean Fragment 或网格剖分失败。
+            如果网格剖分失败。
         """
         if not _GMSH_AVAILABLE:
             raise ImportError(
@@ -501,15 +510,7 @@ class OCCFragmentMesher:
 
         layer_thickness_m = float(cfg.layer_thickness)
 
-        # 格式警告：非 STEP 文件提示鲁棒性风险
-        if not self._is_step_file(self.stl_path):
-            warnings.warn(
-                "⚠ 当前加载的是非 B-Rep 格式模型（如 STL）。"
-                " OCC 布尔碎片化操作对离散三角面片的鲁棒性有限，"
-                " 强烈建议使用 .step / .stp 格式的 B-Rep 模型。"
-                " 如遇失败将自动回退到 Delaunay 点云剖分方案。",
-                UserWarning,
-            )
+        is_step = self._is_step_file(self.stl_path)
 
         # ── 初始化 Gmsh ──
         gmsh.initialize()
@@ -517,13 +518,23 @@ class OCCFragmentMesher:
             # 抑制 Gmsh 终端输出（可选：设为 1 恢复输出）
             gmsh.option.setNumber("General.Terminal", 0)
 
-            mesh_state, n_layers = self._build_with_occ(layer_thickness_m, cfg)
+            if is_step:
+                # ── 通道 A：STEP B-Rep 实体 OCC 高保真切片 ──
+                mesh_state, n_layers = self._build_step_occ(
+                    layer_thickness_m, cfg
+                )
+            else:
+                # ── 通道 B：STL 离散面片 GEO/Merge 安全回退 ──
+                mesh_state, n_layers = self._build_stl_geo(
+                    layer_thickness_m, cfg
+                )
+
             return mesh_state, n_layers
 
         except Exception as exc:
-            # OCC 路径失败，尝试回退到 Delaunay 点云剖分
+            # 网格生成失败，尝试回退到 Delaunay 点云剖分
             warnings.warn(
-                f"OCC Boolean Fragment 失败: {exc}。"
+                f"Gmsh 网格生成失败: {exc}。"
                 " 自动回退到 scipy.spatial.Delaunay 点云剖分方案。"
             )
             # 确保 Gmsh 已清理
@@ -543,14 +554,26 @@ class OCCFragmentMesher:
                 pass
 
     # ------------------------------------------------------------------
-    # OCC Boolean Fragment 核心逻辑
+    # 通道 A：STEP B-Rep 实体 OCC Boolean Fragment 高保真切片
     # ------------------------------------------------------------------
-    def _build_with_occ(
+    def _build_step_occ(
         self,
         layer_thickness_m: float,
         cfg: SimulationConfig,
     ) -> tuple[MeshState, int]:
-        """使用 Gmsh OCC Boolean Fragment 构建分层网格。
+        r"""通道 A：使用 Gmsh OCC 几何内核进行 Boolean Fragment 水平切片。
+
+        专为 STEP / STP / IGS / BREP 等 B-Rep 格式模型设计。
+        通过 Z 轴切片平面组与 3D 实体的 Boolean Fragment 操作，
+        在**几何层面**将模型强制切分为层结构，确保第四面体不跨层。
+
+        流程
+        ----
+        1. ``gmsh.model.occ.importShapes()`` 导入 B-Rep 实体
+        2. 动态筛选 3D 实体（volumes）
+        3. ``gmsh.model.occ.addRectangle()`` 生成水平切片平面
+        4. ``gmsh.model.occ.fragment()`` 执行布尔碎片化
+        5. ``gmsh.model.occ.synchronize()`` 同步几何
 
         Parameters
         ----------
@@ -563,17 +586,33 @@ class OCCFragmentMesher:
         -------
         tuple[MeshState, int]
         """
-        # ── 1. 导入模型到 OCC ──
-        # Gmsh 内部默认单位为 mm（对于 STL/STEP 等 CAD 格式）
-        # 我们全程在 mm 单位下操作，最后提取时转换为 m
-        gmsh.model.add("OCC_Fragment_Model")
+        # ── 1. 导入 B-Rep 模型到 OCC 几何内核 ──
+        gmsh.model.add("STEP_OCC_Model")
         imported = gmsh.model.occ.importShapes(self.stl_path)
         if not imported:
-            raise RuntimeError(f"无法导入模型: {self.stl_path}（格式不支持或文件损坏）")
+            raise RuntimeError(
+                f"无法导入 STEP 模型: {self.stl_path}（格式不支持或文件损坏）"
+            )
 
         gmsh.model.occ.synchronize()
 
-        # ── 2. 获取包围盒（mm 单位）──
+        # ── 2. 动态筛选 3D 实体（volumes）──
+        all_entities = gmsh.model.occ.getEntities(dim=-1)
+        _dimension_id = 3  # dim=3 表示 3D 体积实体
+
+        volumes = [
+            e[1] for e in all_entities if e[0] == _dimension_id
+        ]
+        if not volumes:
+            # 如果没有 3D 实体，尝试从所有实体中获取包围盒
+            # （某些 STEP 可能只导入为 shells/faces）
+            raise RuntimeError(
+                "STEP 模型中未检测到 3D 实体 (volumes)。"
+                " 模型可能仅包含开放面片，无法进行 Boolean Fragment。"
+                " 请将模型导出为封闭的 B-Rep 实体 (.step 格式)。"
+            )
+
+        # ── 3. 获取包围盒（mm 单位）──
         bbox = gmsh.model.occ.getBoundingBox(
             dim=-1, tag=-1  # 所有实体
         )
@@ -592,7 +631,7 @@ class OCCFragmentMesher:
         z_max_m = z_max * _STL_UNIT_SCALE
         extent_z_m = extent_z * _STL_UNIT_SCALE
 
-        # ── 3. 计算层数 ──
+        # ── 4. 计算层数 ──
         n_layers = max(1, int(math.ceil(extent_z_m / layer_thickness_m)))
         if n_layers <= 1:
             # 单层：无需碎片化，直接划分网格
@@ -600,8 +639,7 @@ class OCCFragmentMesher:
                 layer_thickness_m, z_min_m, n_layers, cfg
             )
 
-        # ── 4. 生成切片平面组 ──
-        # 在模型 XY 包围盒基础上向外扩展 50% 边距，确保平面完全覆盖截面
+        # ── 5. 生成切片平面组 ──
         margin_x = extent_x * 0.5
         margin_y = extent_y * 0.5
         plane_x0 = x_min - margin_x
@@ -609,12 +647,9 @@ class OCCFragmentMesher:
         plane_dx = extent_x + 2.0 * margin_x
         plane_dy = extent_y + 2.0 * margin_y
 
-        # 切平面位置：Z = z_min + k * layer_thickness_mm (k = 1, 2, ..., n_layers-1)
-        # 注意：Z_min 和 Z_max 已经是实体自身的边界，无需额外切割
         cutting_plane_tags: list[int] = []
         for k in range(1, n_layers):
             z_mm = z_min + k * layer_thickness_mm
-            # 确保切割平面严格在模型内部（避免浮点误差导致平面与底/顶面重合）
             if z_mm <= z_min + 1e-6 or z_mm >= z_max - 1e-6:
                 continue
             plane_tag = gmsh.model.occ.addRectangle(
@@ -623,31 +658,21 @@ class OCCFragmentMesher:
             cutting_plane_tags.append(plane_tag)
 
         if not cutting_plane_tags:
-            # 没有内部分割面（极端薄层情况），直接划分网格
             return self._mesh_and_extract(
                 layer_thickness_m, z_min_m, n_layers, cfg
             )
 
         gmsh.model.occ.synchronize()
 
-        # ── 5. Boolean Fragment ──
-        # 获取所有 3D 实体作为碎片化目标
+        # ── 6. Boolean Fragment：3D 实体 + 切片平面 → 碎片化实体 ──
         solids = gmsh.model.occ.getEntities(dim=3)
         if not solids:
             raise RuntimeError(
-                "模型中没有 3D 实体。"
-                " STL 格式可能无法被 OCC 识别为封闭实体。"
-                " 请使用 .step 格式导入 B-Rep 模型。"
+                "OCC 同步后丢失了 3D 实体。模型可能不封闭。"
             )
 
-        # 切割工具：所有切片平面（dim=2）
         tool_dim_tags = [(2, tag) for tag in cutting_plane_tags]
 
-        # 执行 Boolean Fragment：
-        #   objectDimTags = 3D 实体（目标）
-        #   toolDimTags   = 2D 切片平面（工具）
-        #   removeObject  = True  移除原始实体，保留碎片化结果
-        #   removeTool    = True  移除切割平面（不再需要）
         try:
             out_dim_tags, _ = gmsh.model.occ.fragment(
                 objectDimTags=solids,
@@ -659,7 +684,7 @@ class OCCFragmentMesher:
             raise RuntimeError(
                 f"OCC Boolean Fragment 操作失败: {exc}。"
                 " 可能原因：模型非流形、存在自交面、或几何退化。"
-                " 建议使用 .step B-Rep 格式并检查模型水密性。"
+                " 请检查 STEP 模型的水密性。"
             ) from exc
 
         if not out_dim_tags:
@@ -668,9 +693,136 @@ class OCCFragmentMesher:
                 " 切片平面可能未正确贯穿模型截面。"
             )
 
-        # ── 6. 同步与网格划分 ──
+        # ── 7. 同步与网格划分 ──
         gmsh.model.occ.synchronize()
 
+        return self._mesh_and_extract(
+            layer_thickness_m, z_min_m, n_layers, cfg
+        )
+
+    # ------------------------------------------------------------------
+    # 通道 B：STL 离散面片 GEO/Merge 安全回退
+    # ------------------------------------------------------------------
+    def _build_stl_geo(
+        self,
+        layer_thickness_m: float,
+        cfg: SimulationConfig,
+    ) -> tuple[MeshState, int]:
+        r"""通道 B：使用 Gmsh GEO 内核加载 STL 离散面片。
+
+        **绝不使用 OCC 相关实体操作**。通过 ``gmsh.merge()``
+        直接将 STL 文件加载为离散网格，跳过共形水平切片步骤。
+
+        警告
+        ----
+        STL 是离散三角面片格式，缺乏拓扑信息，无法在几何层面
+        进行精确的布尔切割。网格将以整体非切层模式生成，
+        层归属通过四面体重心 Z 坐标后处理分配。
+
+        流程
+        ----
+        1. ``gmsh.merge(path)`` 直接加载离散网格
+        2. ``gmsh.model.geo.synchronize()`` 同步 GEO 模型
+        3. (可选) ``gmsh.model.geo.addSurfaceLoop`` + ``addVolume``
+           尝试将面片封闭为体，以获得 3D 网格元素
+
+        Parameters
+        ----------
+        layer_thickness_m : float
+            层厚 (m)。
+        cfg : SimulationConfig
+            仿真配置。
+
+        Returns
+        -------
+        tuple[MeshState, int]
+        """
+        warnings.warn(
+            "⚠ 检测到 STL 离散格式，已跳过共形水平切片。"
+            " 网格将以整体非切层模式生成。"
+            " 层归属将通过四面体重心 Z 坐标后处理分配。"
+            " 强烈建议使用 .step B-Rep 格式以获得精确的分层网格。",
+            UserWarning,
+        )
+
+        # ── 1. 使用 gmsh.merge() 直接加载 STL 离散网格 ──
+        gmsh.model.add("STL_GEO_Model")
+        try:
+            gmsh.merge(self.stl_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法加载 STL 文件: {exc}。"
+                " 文件可能已损坏或格式不正确。"
+            ) from exc
+
+        # ── 2. 同步 GEO 模型 ──
+        gmsh.model.geo.synchronize()
+
+        # ── 3. 获取包围盒（用于层数计算）──
+        try:
+            bbox = gmsh.model.occ.getBoundingBox(
+                dim=-1, tag=-1
+            )
+        except Exception:
+            # GEO 模型可能不兼容 OCC getBoundingBox，
+            # 回退：从 mesh 节点获取（先做一次粗网格或直接用 trimesh）
+            bbox = None
+
+        if bbox and len(bbox) >= 6:
+            x_min, y_min, z_min_mm = bbox[0], bbox[1], bbox[2]
+            _x_max, _y_max, z_max_mm = bbox[3], bbox[4], bbox[5]
+            z_min_m = z_min_mm * _STL_UNIT_SCALE
+            z_max_m = z_max_mm * _STL_UNIT_SCALE
+            extent_z_m = z_max_m - z_min_m
+        else:
+            # 回退方案：使用 trimesh 加载 STL 获取包围盒
+            try:
+                import trimesh
+                loaded = trimesh.load(self.stl_path)
+                if isinstance(loaded, trimesh.Scene):
+                    geometries = list(loaded.geometry.values())
+                    if geometries:
+                        loaded = trimesh.util.concatenate(geometries)
+                    else:
+                        raise ValueError("STL 场景中无几何体")
+                if isinstance(loaded, trimesh.Trimesh):
+                    loaded.vertices *= _STL_UNIT_SCALE
+                    z_min_m = float(np.min(loaded.vertices[:, 2]))
+                    z_max_m = float(np.max(loaded.vertices[:, 2]))
+                    extent_z_m = z_max_m - z_min_m
+                else:
+                    raise TypeError("不支持的几何类型")
+            except ImportError:
+                # 没有 trimesh 时的默认高度
+                extent_z_m = 0.001
+                z_min_m = 0.0
+                z_max_m = extent_z_m
+
+        # ── 4. 计算层数 ──
+        n_layers = max(1, int(math.ceil(extent_z_m / layer_thickness_m)))
+
+        # ── 5. (可选) 尝试将 STL 表面封闭为体 ──
+        # 这对于获得 3D 四面体网格至关重要。
+        # 如果 STL 不封闭（有孔洞），此步骤可能失败，
+        # 但不会中断流程——Gmsh 仍可从表面面片生成 2D/3D 网格。
+        try:
+            # 获取所有 2D 表面实体
+            surfaces = gmsh.model.geo.getEntities(dim=2)
+            if surfaces:
+                surface_tags = [tag for _dim, tag in surfaces]
+
+                # 尝试创建表面环（Surface Loop）并封闭为体
+                sl_tag = gmsh.model.geo.addSurfaceLoop(
+                    surface_tags
+                )
+                gmsh.model.geo.addVolume([sl_tag])
+                gmsh.model.geo.synchronize()
+        except Exception:
+            # 表面非封闭（不可封闭为体），静默跳过
+            # Gmsh 仍然可以从表面三角面片生成网格
+            pass
+
+        # ── 6. 统一网格生成 ──
         return self._mesh_and_extract(
             layer_thickness_m, z_min_m, n_layers, cfg
         )

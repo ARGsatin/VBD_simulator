@@ -23,7 +23,7 @@ import csv
 from pathlib import Path
 from typing import Iterable
 
-from hydrogel_vbd.state import LayerResult
+from hydrogel_vbd.core.state import LayerResult
 
 
 def write_metrics_csv(

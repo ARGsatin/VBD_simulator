@@ -25,14 +25,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
-from hydrogel_vbd.forces.czm import CZMState
-from hydrogel_vbd.forces.local_terms import build_local_physics_terms
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.config import SimulationConfig
+from hydrogel_vbd.physics.czm import CZMState
+from hydrogel_vbd.physics.local_terms import build_local_physics_terms
+from hydrogel_vbd.core.state import MeshState
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -193,6 +194,7 @@ class PythonReferenceVBDSolver:
         mesh: MeshState,
         layer_id: int,
         e_z: float,
+        on_iteration: Callable[[int, float], None] | None = None,
     ) -> VBDSolveResult:
         """执行 VBD 隐式迭代直到网格达到静力平衡。
 
@@ -381,6 +383,10 @@ class PythonReferenceVBDSolver:
             if stable_counter >= N_stable:
                 break
 
+            # ── 迭代回调：用于 GUI 事件泵 / 进度更新 ──
+            if on_iteration is not None:
+                on_iteration(iteration, max_dx)
+
         # ── 收敛后处理：更新速度和上一帧坐标 ──
         free = mesh.active_vertex_mask & ~fixed
         mesh.velocities[free] = (
@@ -424,6 +430,7 @@ class PythonReferenceVBDSolver:
         layer_id: int,
         e_z: float,
         lifting_top: np.ndarray,
+        on_iteration: Callable[[int, float], None] | None = None,
     ) -> VBDSolveResult:
         """带平台运动学的剥离-静平衡求解。
 
@@ -475,7 +482,7 @@ class PythonReferenceVBDSolver:
             lift_distance += v_lift * config.dt
 
             # ── 更新 CZM 状态（提离型膜脱粘） ──
-            from hydrogel_vbd.forces.czm import update_czm_states
+            from hydrogel_vbd.physics.czm import update_czm_states
 
             if len(bottom):
                 update_czm_states(
@@ -613,6 +620,10 @@ class PythonReferenceVBDSolver:
 
             if stable_counter >= N_stable:
                 break
+
+            # ── 迭代回调：用于 GUI 事件泵 / 进度更新 ──
+            if on_iteration is not None:
+                on_iteration(iteration, max_dx)
 
         # ── 后处理：更新速度和动能 ──
         free = mesh.active_vertex_mask & ~fixed

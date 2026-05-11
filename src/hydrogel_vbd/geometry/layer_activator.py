@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from hydrogel_vbd.forces.czm import CZMState
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.physics.czm import CZMState
+from hydrogel_vbd.core.state import MeshState
 
 
 class LayerActivator:

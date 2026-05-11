@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 class ModelsSolverControlTests(unittest.TestCase):
     def test_hydrogel_model_computes_lame_parameters_from_curing_degree(self):
-        from hydrogel_vbd.material.hydrogel_model import HydrogelMaterialModel
+        from hydrogel_vbd.physics.hydrogel_model import HydrogelMaterialModel
 
         model = HydrogelMaterialModel(
             density=1000.0,
@@ -31,10 +31,10 @@ class ModelsSolverControlTests(unittest.TestCase):
         np.testing.assert_allclose(material.lam, material.young_modulus * 0.25 / (1.25 * 0.5))
 
     def test_force_models_compute_expected_vectors(self):
-        from hydrogel_vbd.forces.electric import ElectricForceModel
-        from hydrogel_vbd.forces.gravity import gravity_force
-        from hydrogel_vbd.forces.peel import peel_force
-        from hydrogel_vbd.state import FieldCommand, MeshState
+        from hydrogel_vbd.physics.electric import ElectricForceModel
+        from hydrogel_vbd.physics.gravity import gravity_force
+        from hydrogel_vbd.physics.peel import peel_force
+        from hydrogel_vbd.core.state import FieldCommand, MeshState
 
         mesh = MeshState(
             vertices=np.zeros((3, 3)),
@@ -59,7 +59,7 @@ class ModelsSolverControlTests(unittest.TestCase):
     def test_reference_solver_moves_unfixed_active_vertices_under_force(self):
         from hydrogel_vbd.solver.constraints import fixed_z_constraints
         from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
-        from hydrogel_vbd.state import MeshState
+        from hydrogel_vbd.core.state import MeshState
 
         mesh = MeshState(
             vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),

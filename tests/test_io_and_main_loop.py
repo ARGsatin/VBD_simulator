@@ -16,7 +16,7 @@ class IoAndMainLoopTests(unittest.TestCase):
     def test_npz_roundtrip_and_report_writer(self):
         from hydrogel_vbd.io.npz_state import load_layer_state, save_layer_state
         from hydrogel_vbd.io.report_writer import write_metrics_csv
-        from hydrogel_vbd.state import FieldCommand, LayerResult
+        from hydrogel_vbd.core.state import FieldCommand, LayerResult
 
         root = ROOT / "outputs" / "test_tmp_io"
         if root.exists():
@@ -57,7 +57,7 @@ class IoAndMainLoopTests(unittest.TestCase):
 
     def test_gcode_exporter_inserts_field_commands(self):
         from hydrogel_vbd.io.gcode_exporter import insert_field_commands
-        from hydrogel_vbd.state import FieldCommand
+        from hydrogel_vbd.core.state import FieldCommand
 
         source = ";LAYER: 0\nG1 Z0.000\n;LAYER: 1\nG1 Z0.050\n"
         commands = {
@@ -71,7 +71,7 @@ class IoAndMainLoopTests(unittest.TestCase):
         self.assertIn(";E_FIELD: OFF", output)
 
     def test_demo_loop_creates_outputs(self):
-        from hydrogel_vbd.main_loop import run_demo
+        from hydrogel_vbd.core.main_loop import run_demo
 
         output_dir = ROOT / "outputs" / "test_demo"
         if output_dir.exists():

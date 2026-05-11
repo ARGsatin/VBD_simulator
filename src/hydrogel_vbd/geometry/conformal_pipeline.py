@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
+from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.solver.graph_coloring import greedy_vertex_coloring
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.state import MeshState
 
 
 class ConformalMeshPipeline:

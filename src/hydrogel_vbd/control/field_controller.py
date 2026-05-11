@@ -29,9 +29,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
+from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.voltage_optimizer import solve_regularized_voltage
-from hydrogel_vbd.state import FieldCommand
+from hydrogel_vbd.core.state import FieldCommand
 
 
 class FieldController:

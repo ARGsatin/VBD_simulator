@@ -19,7 +19,7 @@ G-code 文件，在每层的打印指令后插入对应的电场控制命令。
 from __future__ import annotations
 
 from hydrogel_vbd.control.field_controller import PIDFieldState
-from hydrogel_vbd.state import FieldCommand
+from hydrogel_vbd.core.state import FieldCommand
 
 
 def insert_field_commands(

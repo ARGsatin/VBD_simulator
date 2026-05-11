@@ -33,9 +33,9 @@ from pathlib import Path
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
+from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.field_controller import PIDFieldController, PIDFieldState
-from hydrogel_vbd.forces.czm import update_czm_states
+from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 from hydrogel_vbd.geometry.layer_activator import LayerActivator
 from hydrogel_vbd.io.gcode_exporter import insert_pid_field_commands
@@ -43,7 +43,7 @@ from hydrogel_vbd.io.npz_state import save_layer_state
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
-from hydrogel_vbd.state import FieldCommand, LayerResult, MeshState
+from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
 
 
 # ---------------------------------------------------------------------------

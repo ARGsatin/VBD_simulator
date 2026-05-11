@@ -28,10 +28,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from hydrogel_vbd.config import SimulationConfig
-from hydrogel_vbd.forces.czm import CZMState
-from hydrogel_vbd.solver.elastic_energy import compute_tet_force_and_hessian_contributions
-from hydrogel_vbd.state import MeshState
+from hydrogel_vbd.core.config import SimulationConfig
+from hydrogel_vbd.physics.czm import CZMState
+from hydrogel_vbd.physics.elastic_energy import compute_tet_force_and_hessian_contributions
+from hydrogel_vbd.core.state import MeshState
 
 
 def _poisson_to_lame(mu: float, kappa: float) -> tuple[float, float]:
@@ -87,6 +87,34 @@ def build_local_physics_terms(
     e_z: float,
     x_prev: np.ndarray,
 ) -> LocalPhysicsTerms:
+    """组装当前时间步的所有局部物理贡献。
+
+    这是每个时间步的**核心力计算函数**，按如下顺序累加各物理项的
+    贡献到节点的力向量和对角块 Hessian：
+
+    1. **体积力**（重力 + 电场力）→ 直接按节点质量 / 电荷累加
+    2. **Neo-Hookean 超弹性** → 遍历所有活动四面体，
+       调用 ``compute_tet_force_and_hessian_contributions``
+       将力与 Hessian 分散到四面体的 4 个节点
+    3. **CZM 粘聚区损伤力** → 对底面 DAMAGING 节点施加软化牵引力
+    4. **流体挤压流拖曳** → 对底面 FREE 节点施加间隙相关阻尼力
+
+    Parameters
+    ----------
+    mesh : MeshState
+        当前网格状态（顶点、四面体、CZM 状态、掩码等）。
+    config : SimulationConfig
+        全局仿真参数（材料常数、CZM 参数、流体参数等）。
+    e_z : float
+        当前 z 方向电场强度（V/m），来自 PID 控制器。
+    x_prev : np.ndarray, shape (N, 3)
+        上一时间步的顶点坐标（用于计算挤压流速度）。
+
+    Returns
+    -------
+    LocalPhysicsTerms
+        组装完成的力向量和 Hessian 对角块。
+    """
     force = np.zeros_like(mesh.vertices)
     hessian = np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float)
     active = mesh.active_vertex_mask

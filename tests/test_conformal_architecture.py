@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 class ConformalArchitectureTests(unittest.TestCase):
     def test_config_yaml_contains_required_physics_and_control_parameters(self):
-        from hydrogel_vbd.config import SimulationConfig
+        from hydrogel_vbd.core.config import SimulationConfig
 
         config = SimulationConfig.from_yaml(ROOT / "configs" / "config.yaml")
 
