@@ -289,17 +289,31 @@ class SimulationWorker(QtCore.QObject):
     # ───────────────────────────────────────────────────────────
 
     def _preprocess(self) -> None:
-        """构建合规网格管线 (ConformalMeshPipeline)。"""
-        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        """前处理：网格已由 OCC 完美切片为最终形态，无需旧管线重建。
 
-        pipeline = ConformalMeshPipeline(self._config, self._output_dir)
-        mesh = pipeline.run(self._mesh)  # 原地修改（返回同一引用）
-        # 建立顶部索引缓存
+        直接使用传入的 ``self._mesh``，仅需自动识别最顶层节点
+        作为拉拔夹持平台（若网格未预设 top_fixed 标志）。
+        """
+        mesh = self._mesh
+
+        # ── 动态识别拉拔夹持平台（最顶层节点）──
+        # 若 is_top_fixed 全为 False，说明网格生成时未设置顶部固定面，
+        # 此时自动将 Z 坐标最高的顶点标记为拉拔夹持节点
+        if mesh.is_top_fixed is None or not mesh.is_top_fixed.any():
+            z_max = float(np.max(mesh.vertices[:, 2]))
+            mesh.is_top_fixed = np.isclose(
+                mesh.vertices[:, 2], z_max, atol=1e-4
+            )
+
+        # ── 建立顶部索引缓存 ──
         mesh.top_ids = np.flatnonzero(mesh.is_top_fixed)
+        n_top_fixed = len(mesh.top_ids)
+
         self.log_message.emit(
             f"📐 [Worker] 前处理完成 — "
             f"{mesh.vertices.shape[0]} 顶点，"
             f"{mesh.tets.shape[0] if mesh.tets is not None else 0} 四面体"
+            f" | 拉拔夹持节点: {n_top_fixed}"
         )
 
     # ───────────────────────────────────────────────────────────
