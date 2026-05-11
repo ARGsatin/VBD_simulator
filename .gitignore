@@ -22,3 +22,11 @@ outputs/
 *.vtu
 
 *.pdf
+
+# IDE
+.vscode/
+
+# 临时调试脚本
+_debug*.py
+test_stl_fix.py
+_check_deps.py

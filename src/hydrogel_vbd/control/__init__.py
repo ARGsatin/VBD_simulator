@@ -1,1 +1,14 @@
-"""Electric-field compensation controllers."""
+# -*- coding: utf-8 -*-
+"""电场控制器模块 —— 基于形状误差反馈的电场补偿。
+
+本模块提供两类电场控制策略，用于在 DLP 打印过程中
+通过调节电极电压来补偿固化变形：
+
+1. **FieldController**：通用映射型控制器
+   基于预计算的力-形状误差映射矩阵，通过 Tikhonov 正则化
+   求解最优电极电压。
+
+2. **PIDFieldController**：PID 型控制器
+   基于宏观形状误差的标量 PID 反馈，输出均匀场强。
+   适用于没有空间分布电场的简化场景。
+"""

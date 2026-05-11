@@ -1,5 +1,5 @@
 {
-  "layer_height": 0.05,
+  "layer_height": 5e-5,
   "exposure_time": 1.0,
   "dt": 0.02,
   "num_layers": 6,

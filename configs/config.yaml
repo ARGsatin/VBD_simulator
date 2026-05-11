@@ -23,7 +23,7 @@ K_i: 20.0
 K_d: 5.0
 q_ion: 1.2e-3
 E_max: 500.0
-layer_thickness: 0.05
+layer_thickness: 5e-5
 z_fep: 0.0
 v_lift: 0.001
 C_0: 1.0

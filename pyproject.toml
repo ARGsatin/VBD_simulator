@@ -7,7 +7,18 @@ name = "hydrogel-vbd"
 version = "0.1.0"
 description = "Python MVP framework for VBD-based hydrogel DLP simulation"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+dependencies = ["numpy", "matplotlib"]
+
+[project.optional-dependencies]
+gui = ["pyside6"]
+all = ["pyside6", "pytest"]
+
+[project.scripts]
+hydrogel-vbd-demo = "hydrogel_vbd.core.main_loop:main"
+hydrogel-vbd-gui = "hydrogel_vbd.gui.main_window:launch_gui"
+
+[tool.setuptools.package-data]
+"hydrogel_vbd" = ["gui/*.py"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
