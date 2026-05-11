@@ -384,12 +384,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._viewer = MeshViewer()
         right.addWidget(self._viewer)
         right.setStretchFactor(0, 1)
-        right.setStretchFactor(1, 2)
+        right.setStretchFactor(1, 5)  # 3D 视图占绝对主体
 
         mid.addWidget(left)
         mid.addWidget(right)
         mid.setStretchFactor(0, 1)
-        mid.setStretchFactor(1, 2)
+        mid.setStretchFactor(1, 4)  # 右侧（含 3D 视图）大幅扩展
         root.addWidget(mid)
 
         # ── 底部状态栏 ──
