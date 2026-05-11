@@ -463,7 +463,9 @@ class OCCFragmentMesher:
     # 主构建流程
     # ------------------------------------------------------------------
     def build_layered_mesh(
-        self, config: SimulationConfig | None = None
+        self,
+        config: SimulationConfig | None = None,
+        algo_type: str = "layered",
     ) -> tuple[MeshState, int]:
         """构建分层四面体网格（双通道：STEP → OCC 切片 / STL → GEO 回退）。
 
@@ -478,10 +480,24 @@ class OCCFragmentMesher:
           使用 ``gmsh.merge()`` 直接加载离散面片，跳过 OCC 实体操作，
           以整体非切层模式生成网格。层归属通过四面体重心 Z 坐标分配。
 
+        网格算法选择
+        ------------
+        通过 ``algo_type`` 参数可在两种网格策略之间切换：
+
+        * ``"layered"`` (默认): 通过 OCC Boolean Fragment 水平切片，
+          保证四面体不跨层，适用于逐层 3D 打印仿真。
+        * ``"standard"``: 跳过切片步骤，直接对模型进行
+          自由四面体网格划分（标准非结构化网格），
+          不保证层间拓扑连续性。
+
         Parameters
         ----------
         config : SimulationConfig | None
             仿真配置。若为 None，使用默认配置。
+        algo_type : str
+            网格算法类型：
+            ``"layered"`` — 规整分层算法（OCC 切片）；
+            ``"standard"`` — 标准非结构化算法（自由四面体）。
 
         Returns
         -------
@@ -509,6 +525,10 @@ class OCCFragmentMesher:
             cfg.layer_thickness = self.layer_thickness
 
         layer_thickness_m = float(cfg.layer_thickness)
+
+        # ── 标准非结构化网格：跳过切片，直接自由四面体剖分 ──
+        if algo_type == "standard":
+            return self._build_standard_unstructured(layer_thickness_m, cfg)
 
         is_step = self._is_step_file(self.stl_path)
 
@@ -983,6 +1003,165 @@ class OCCFragmentMesher:
         mesh.colors = greedy_vertex_coloring(mesh)
 
         return mesh, n_layers
+
+    # ------------------------------------------------------------------
+    # 标准非结构化网格：跳过切片，直接自由四面体剖分
+    # ------------------------------------------------------------------
+    def _build_standard_unstructured(
+        self,
+        layer_thickness_m: float,
+        cfg: SimulationConfig,
+    ) -> tuple[MeshState, int]:
+        """标准非结构化网格生成：跳过 OCC 切片，直接自由四面体剖分。
+
+        流程
+        ----
+        1. 导入模型 (STEP → OCC / STL → GEO/Merge)
+        2. 获取包围盒, 计算名义层数
+        3. 直接调用 Gmsh 3D 自由网格划分 (无 Boolean Fragment)
+        4. 后处理: 按四面体重心 Z 坐标分配 layer_id (仅用于层归属标识,
+           不保证拓扑连续性)
+
+        .. note::
+           此方法生成的网格无层间拓扑约束，四面体可自由跨越多个
+           打印层，适用于对分层刚性无要求的通用非结构化仿真场景。
+
+        Parameters
+        ----------
+        layer_thickness_m : float
+            层厚 (m)。
+        cfg : SimulationConfig
+            仿真配置。
+
+        Returns
+        -------
+        tuple[MeshState, int]
+            网格状态和名义总层数。
+        """
+        if not _GMSH_AVAILABLE:
+            raise ImportError(
+                "标准非结构化网格需要 Gmsh。请运行: pip install gmsh"
+            )
+
+        gmsh.initialize()
+        try:
+            gmsh.option.setNumber("General.Terminal", 0)
+            gmsh.model.add("Standard_Unstr_Model")
+
+            is_step = self._is_step_file(self.stl_path)
+
+            if is_step:
+                # STEP B-Rep → OCC 导入
+                imported = gmsh.model.occ.importShapes(self.stl_path)
+                if not imported:
+                    raise RuntimeError(
+                        f"无法导入 STEP 模型: {self.stl_path}"
+                    )
+                gmsh.model.occ.synchronize()
+            else:
+                # STL → GEO/Merge 导入
+                import warnings as _w
+                _w.warn(
+                    "标准非结构化网格: 使用 STL 格式（缺失拓扑信息）。"
+                    " 建议使用 STEP B-Rep 格式以获得更高质量的四面体网格。",
+                    UserWarning,
+                )
+                gmsh.merge(self.stl_path)
+                gmsh.model.geo.synchronize()
+
+                # 尝试获取包围盒（优先 OCC，失败回退 trimesh）
+                try:
+                    bbox = gmsh.model.occ.getBoundingBox(
+                        dim=-1, tag=-1
+                    )
+                    if bbox and len(bbox) >= 6:
+                        z_min_m = bbox[2] * _STL_UNIT_SCALE
+                        z_max_m = bbox[5] * _STL_UNIT_SCALE
+                        extent_z_m = z_max_m - z_min_m
+                    else:
+                        raise ValueError("BBox 不完整")
+                except Exception:
+                    try:
+                        import trimesh
+
+                        loaded = trimesh.load(self.stl_path)
+                        if isinstance(loaded, trimesh.Scene):
+                            geometries = list(loaded.geometry.values())
+                            if geometries:
+                                loaded = trimesh.util.concatenate(geometries)
+                            else:
+                                raise ValueError("STL 场景中无几何体")
+                        if isinstance(loaded, trimesh.Trimesh):
+                            loaded.vertices *= _STL_UNIT_SCALE
+                            z_min_m = float(np.min(loaded.vertices[:, 2]))
+                            z_max_m = float(np.max(loaded.vertices[:, 2]))
+                            extent_z_m = z_max_m - z_min_m
+                        else:
+                            raise TypeError("不支持的几何类型")
+                    except ImportError:
+                        extent_z_m = 0.001
+                        z_min_m = 0.0
+                        z_max_m = extent_z_m
+
+                # 计算层数
+                n_layers = max(
+                    1,
+                    int(math.ceil(extent_z_m / layer_thickness_m)),
+                )
+
+                # 尝试封闭面片为体
+                try:
+                    surfaces = gmsh.model.geo.getEntities(dim=2)
+                    if surfaces:
+                        surface_tags = [tag for _, tag in surfaces]
+                        sl_tag = gmsh.model.geo.addSurfaceLoop(
+                            surface_tags
+                        )
+                        gmsh.model.geo.addVolume([sl_tag])
+                        gmsh.model.geo.synchronize()
+                except Exception:
+                    pass
+
+                # 直接跳过 Boolean Fragment，进入网格划分
+                return self._mesh_and_extract(
+                    layer_thickness_m,
+                    z_min_m,
+                    n_layers,
+                    cfg,
+                )
+
+            # STEP 路径：获取包围盒
+            bbox = gmsh.model.occ.getBoundingBox(dim=-1, tag=-1)
+            if not bbox or len(bbox) < 6:
+                raise RuntimeError("无法获取 STEP 模型包围盒")
+
+            z_min_m = bbox[2] * _STL_UNIT_SCALE
+            z_max_m = bbox[5] * _STL_UNIT_SCALE
+            extent_z_m = z_max_m - z_min_m
+            n_layers = max(
+                1,
+                int(math.ceil(extent_z_m / layer_thickness_m)),
+            )
+
+            # 直接自由四面体网格划分，无布尔切片
+            return self._mesh_and_extract(
+                layer_thickness_m,
+                z_min_m,
+                n_layers,
+                cfg,
+            )
+
+        except Exception as exc:
+            raise RuntimeError(
+                f"标准非结构化网格生成失败: {exc}"
+            ) from exc
+
+        finally:
+            try:
+                if gmsh.isInitialized():
+                    gmsh.finalize()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # 回退方案：Delaunay 点云剖分

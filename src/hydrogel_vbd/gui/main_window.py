@@ -226,6 +226,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── 自定义分辨率控件引用（在 _init_central 中创建）──
         self._chk_custom_res: QtWidgets.QCheckBox | None = None
         self._lbl_auto_res: QtWidgets.QLabel | None = None
+        # ── 网格算法选择器 ──
+        self._combo_mesh_algo: QtWidgets.QComboBox | None = None
 
         # ── 后处理动画回放状态 ──
         self.animation_frames: list[dict[str, Any]] = []
@@ -350,6 +352,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._chk_custom_res.toggled.connect(self._on_custom_resolution_toggled)
         info_layout.addWidget(self._chk_custom_res)
+
+        # ── 网格算法选择器 ──
+        info_layout.addSpacing(12)
+        info_layout.addWidget(QtWidgets.QLabel("网格算法:"))
+        self._combo_mesh_algo = QtWidgets.QComboBox()
+        self._combo_mesh_algo.addItem("规整分层算法 (OCC 切片)", "layered")
+        self._combo_mesh_algo.addItem("标准非结构化算法 (自由四面体)", "standard")
+        self._combo_mesh_algo.setToolTip(
+            "规整分层算法: 通过 OCC Boolean Fragment 水平切片，"
+            "保证四面体不跨层;\n"
+            "标准非结构化算法: 跳过切片，直接生成自由四面体网格"
+        )
+        info_layout.addWidget(self._combo_mesh_algo)
         info_layout.addStretch()
 
         left_layout.addLayout(info_layout)
@@ -837,12 +852,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 # 生成绝对平齐的分层 Delaunay 四面体网格
                 from hydrogel_vbd.geometry.stl_mesher import OCCFragmentMesher
 
+                algo_type = self._combo_mesh_algo.currentData() if self._combo_mesh_algo else "layered"
                 mesher = OCCFragmentMesher(
                     stl_path=str(self._stl_path),
                     layer_thickness=lt_m,
                     resolution=user_res_mm * 1e-3,
                 )
-                mesh, actual_layers = mesher.build_layered_mesh(config)
+                mesh, actual_layers = mesher.build_layered_mesh(config, algo_type=algo_type)
                 self._actual_layers = actual_layers
                 self._lbl_layers.setText(str(actual_layers))
                 self._log.append_log(
