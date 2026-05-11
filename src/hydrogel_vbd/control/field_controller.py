@@ -175,16 +175,24 @@ class PIDFieldController:
     输出均匀电场强度 E_z。误差死区设置为 ``err_target``：
     仅当 ``err_avg > err_target`` 时才激活反馈。
 
-    控制律：
+    控制律（标准位置式 PID，杜绝双重积分爆炸）：
     .. math::
-        E_z = clip( E_z + K_p·e + K_i·∫e dt + K_d·de/dt, 0, E_max )
+        E_z = clip( K_p·e + K_i·∫e dt + K_d·de/dt, 0, E_max )
+
+    抗积分饱和策略
+    --------------
+    * **限幅前裁剪（Clamping Pre-clip）**：积分项 ``PID_integral`` 累加后
+      立即裁剪到 ``[-E_max/K_i, +E_max/K_i]``，防止积分项指数级发散。
+    * **反计算饱和（Clamping Anti-windup Back-calculation）**：若输出
+      ``target_E`` 被 ``[0, E_max]`` 截断，则根据有效输出反算出校正后的
+      积分项，使积分器始终保持在合理范围内。
+    * **死区抑制**：误差低于 ``err_target`` 时不激活 PID，保持当前场强不变。
 
     特性
     ----
     * **纯正值**：E_z 始终在 [0, E_max] 范围内
-    * **防御积分饱和**：积分项持续累加，但通过 clip 防止无限增长
-    * **无抗积分饱和**：当前版本未实现条件积分或反计算饱和，
-      对于长时间大误差可能存在积分饱和风险
+    * **位置式公式**：直接设定目标场强，不再增量叠加，消除双重积分
+    * **严格抗积分饱和**：上下限裁剪 + 反算回退，双重保护
     """
 
     def __init__(self, config: SimulationConfig) -> None:

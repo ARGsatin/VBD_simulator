@@ -47,7 +47,10 @@ static void update_czm_states_inplace(
     double area, double t_max, double k_czm, double delta_f,
     double z_fep, double dt)
 {
-    for (int node_id : bottom_nodes) {
+    // 使用索引遍历，确保 local index i 仅访问 local 数组 internal_pull_z，
+    // 杜绝全局 node_id 越界访问长度仅为 bottom_nodes.size() 的局部数组。
+    for (size_t i = 0; i < bottom_nodes.size(); ++i) {
+        int node_id = bottom_nodes[i];
         if (!mesh.active_mask(node_id)) continue;
         CZMState state = static_cast<CZMState>(mesh.czm_state(node_id));
         if (state == CZMState::FIXED) {
@@ -62,11 +65,12 @@ static void update_czm_states_inplace(
         }
         else if (state == CZMState::DAMAGING) {
             // DAMAGING 阶段：损伤演化
-            double z = mesh.vertices(node_id, 2);
-            double gap = std::max(z - z_fep, 0.0);
-            double pull = std::abs(internal_pull_z(node_id < static_cast<int>(internal_pull_z.size()) ? node_id : 0));
+            // 使用局部索引 i 安全访问 internal_pull_z（长度 = bottom_nodes.size()）
+            double pull = std::abs(internal_pull_z(static_cast<Eigen::Index>(i)));
             double dmg_rate = pull > 0 ? std::min(1.0, pull * dt / (t_max * delta_f)) : 0.0;
             mesh.damage(node_id) = std::min(1.0, mesh.damage(node_id) + dmg_rate);
+            double z = mesh.vertices(node_id, 2);
+            double gap = std::max(z - z_fep, 0.0);
             if (mesh.damage(node_id) >= 1.0 || gap > 5.0 * delta_f) {
                 mesh.czm_state(node_id) = static_cast<int>(CZMState::FREE);
                 mesh.damage(node_id) = 1.0;

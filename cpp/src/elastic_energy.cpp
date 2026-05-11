@@ -45,9 +45,10 @@ Eigen::Matrix3d neo_hookean_pk1_stress(
     double J = F.determinant();
 
     if (J <= 1e-12) {
-        Eigen::Matrix3d FinvT = F.inverse().transpose();
-        double penalty_factor = -2.0 * inverted_penalty * (1.0 - J) * J;
-        return penalty_factor * FinvT;
+        // 安全惩罚力：J≤1e-12 时 F 近乎奇异，禁止调用 F.inverse()
+        // （会触发除以零→Inf→NaN 毒化整个物理矩阵）。
+        // 直接使用 F 乘以惩罚因子，避免任何求逆操作。
+        return -2.0 * inverted_penalty * (1.0 - J) * F;
     }
 
     Eigen::Matrix3d FinvT = F.inverse().transpose();

@@ -144,17 +144,36 @@ class ParameterPanel(QtWidgets.QGroupBox):
 class ProgressWidget(QtWidgets.QWidget):
     """仿真进度显示条。
 
-    包含一个进度条和一个文本标签，实时显示当前层计算进度。
+    包含外层进度条（层间进度）、一个文本标签，以及
+    一条绿色的细粒度子进度条（层内提升进度）。
     """
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
         self._bar = QtWidgets.QProgressBar()
         self._bar.setRange(0, 100)
+        self._bar.setFixedHeight(16)
+
         self._label = QtWidgets.QLabel("就绪")
+
+        # ── 细粒度子进度条（层内提升进度，绿色、细条）──
+        self._sub_bar = QtWidgets.QProgressBar()
+        self._sub_bar.setRange(0, 100)
+        self._sub_bar.setValue(0)
+        self._sub_bar.setFixedHeight(6)
+        self._sub_bar.setStyleSheet(
+            "QProgressBar { border: none; background: transparent; }"
+            "QProgressBar::chunk { background-color: #4CAF50; border-radius: 2px; }"
+        )
+        self._sub_bar.setToolTip("当前层提升进度 (0–100%)")
+
         layout.addWidget(self._bar)
         layout.addWidget(self._label)
+        layout.addWidget(self._sub_bar)
         self.setLayout(layout)
 
     def set_layer(self, current: int, total: int) -> None:
@@ -172,9 +191,20 @@ class ProgressWidget(QtWidgets.QWidget):
         self._label.setText(f"计算第 {current}/{total} 层 …")
         QtWidgets.QApplication.processEvents()
 
+    def set_sub_progress(self, percentage: int) -> None:
+        """更新层内细粒度子进度（提升百分比）。
+
+        Parameters
+        ----------
+        percentage : int
+            0–100 的整数值，表示当前层内提升进度。
+        """
+        self._sub_bar.setValue(max(0, min(100, percentage)))
+
     def set_done(self) -> None:
-        """标记仿真完成，进度条置为 100%。"""
+        """标记仿真完成，进度条置为 100%，子进度条归零。"""
         self._bar.setValue(100)
+        self._sub_bar.setValue(0)
         self._label.setText("仿真完成 ✓")
         QtWidgets.QApplication.processEvents()
 
@@ -264,6 +294,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_anim_play: QtWidgets.QPushButton | None = None
         self._btn_anim_pause: QtWidgets.QPushButton | None = None
         self._frame_indices: list[int] = []  # 筛选后的帧索引映射
+
+        # ── DVR 实时时间轴状态 ──
+        self._dv_slider: QtWidgets.QSlider | None = None
+        self._dv_label: QtWidgets.QLabel | None = None
+        self._dv_is_slider_down: bool = False
+        self._dv_efield_canvas: Any = None
+        self._dv_efield_fig: Any = None
+        self._dv_efield_layer_data: list[tuple[int, float, float, float]] = (
+            []
+        )  # (layer_id, e_z, max_err, rms_err)
 
         self._init_central()
         self._update_button_states()
@@ -507,6 +547,44 @@ class MainWindow(QtWidgets.QMainWindow):
         mid.setStretchFactor(0, 0)
         mid.setStretchFactor(1, 1)
         root.addWidget(mid)
+
+        # ── DVR 实时时间轴（底部水平栏）──
+        dvr_bar = QtWidgets.QHBoxLayout()
+        dvr_bar.setContentsMargins(6, 2, 6, 4)
+        dvr_bar.setSpacing(8)
+
+        dvr_bar.addWidget(QtWidgets.QLabel("📽 时间轴:"))
+
+        self._dv_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._dv_slider.setRange(0, 0)
+        self._dv_slider.setValue(0)
+        self._dv_slider.setToolTip("拖动定位到已完成的层")
+        self._dv_slider.sliderPressed.connect(self._on_dv_slider_pressed)
+        self._dv_slider.sliderReleased.connect(self._on_dv_slider_released)
+        self._dv_slider.valueChanged.connect(self._on_dv_slider_changed)
+        dvr_bar.addWidget(self._dv_slider, 1)
+
+        self._dv_label = QtWidgets.QLabel("层: —")
+        self._dv_label.setMinimumWidth(80)
+        self._dv_label.setStyleSheet("font-weight: bold; color: #1976D2;")
+        dvr_bar.addWidget(self._dv_label)
+
+        # ── 实时电场图表（迷你 matplotlib 嵌板，约 200×120 px）──
+        if _HAS_MPL:
+            try:
+                self._dv_efield_fig = Figure(figsize=(2.8, 1.6), dpi=80)
+                self._dv_efield_canvas = FigureCanvas(self._dv_efield_fig)
+                self._dv_efield_canvas.setFixedSize(260, 120)
+                self._dv_efield_canvas.setToolTip("实时电场强度 E_z (V/m) 逐层曲线")
+                dvr_bar.addWidget(self._dv_efield_canvas)
+            except Exception:
+                self._dv_efield_fig = None
+                self._dv_efield_canvas = None
+        else:
+            self._dv_efield_fig = None
+            self._dv_efield_canvas = None
+
+        root.addLayout(dvr_bar)
 
         # ── 底部状态栏 ──
         self._status = QtWidgets.QStatusBar()
@@ -1255,12 +1333,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._worker.moveToThread(self._thread)
 
-            # ── 连接 5 个信号 ──
+            # ── 连接 7 个信号 ──
             self._worker.frame_ready.connect(self._on_worker_frame)
             self._worker.progress_update.connect(self._on_worker_progress)
             self._worker.log_message.connect(self._on_worker_log)
             self._worker.finished.connect(self._on_worker_finished)
             self._worker.error.connect(self._on_worker_error)
+            self._worker.sub_progress.connect(self._on_worker_sub_progress)
+            self._worker.layer_finished.connect(self._on_worker_layer_finished)
 
             # ── 线程生命周期管理 ──
             self._thread.started.connect(self._worker.run)
@@ -1297,6 +1377,9 @@ class MainWindow(QtWidgets.QMainWindow):
         同时将帧数据缓存到 ``animation_frames``，供仿真结束后的
         动画回放使用。
 
+        **DVR 时间轴门控**：当用户正在拖动滑块（``_dv_is_slider_down=True``）
+        时，跳过实时 3D 渲染推送，仅保留帧缓存写入。避免拖动冲突。
+
         Parameters
         ----------
         payload : dict
@@ -1311,10 +1394,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._anim_tets is None and tets is not None:
             self._anim_tets = tets.copy()
 
-        # ── 刷新 3D 视图 ──
-        self._viewer.show_deformed_mesh(
-            vertices, tets, active_mask, title=title,
-        )
+        # ── DVR 滑块拖动门控：拖动期间抑制实时渲染 ──
+        if not self._dv_is_slider_down:
+            self._viewer.show_deformed_mesh(
+                vertices, tets, active_mask, title=title,
+            )
 
         # ── 缓存动画帧 ──
         lid = -1
@@ -1719,6 +1803,168 @@ class MainWindow(QtWidgets.QMainWindow):
                 " 请运行: pip install matplotlib"
             )
 
+
+    # ========================================================================
+    # DVR 实时时间轴槽函数
+    # ========================================================================
+
+    @QtCore.Slot(int, int, int)
+    def _on_worker_sub_progress(
+        self, layer_idx: int, percentage: int, step_count: int
+    ) -> None:
+        """接收 Worker 的 ``sub_progress`` 信号，更新细粒度子进度条。
+
+        Parameters
+        ----------
+        layer_idx : int
+            当前层序号（从 0 开始）。
+        percentage : int
+            0–100 的整数，当前层内提升进度。
+        step_count : int
+            总步数计数器。
+        """
+        # ── 更新绿色子进度条 ──
+        self._progress.set_sub_progress(percentage)
+
+        # ── 更新 DVR 时间轴标签 ──
+        if self._dv_label is not None:
+            self._dv_label.setText(
+                f"层 {layer_idx + 1}/{self._actual_layers} — {percentage}%"
+            )
+
+    @QtCore.Slot(object)
+    def _on_worker_layer_finished(self, result: "LayerResult") -> None:
+        """接收 Worker 的 ``layer_finished`` 信号。
+
+        每层完成后更新 DVR 时间轴滑块范围和标签，
+        并实时绘制电场-误差迷你图表。
+
+        Parameters
+        ----------
+        result : LayerResult
+            当前层的结果对象。
+        """
+        layer_id = int(getattr(result, "layer_id", 0))
+        total_layers = self._actual_layers or 1
+
+        # ── 更新 DVR 滑块范围 ──
+        if self._dv_slider is not None:
+            self._dv_slider.blockSignals(True)
+            self._dv_slider.setRange(0, total_layers - 1)
+            self._dv_slider.setValue(layer_id)
+            self._dv_slider.blockSignals(False)
+
+        # ── 实时电场数据采集 ──
+        e_z = (
+            result.error_metrics.get("E_z", 0.0)
+            if hasattr(result, "error_metrics") and result.error_metrics
+            else 0.0
+        )
+        max_err = getattr(result, "max_deformation", 0.0)
+        rms_err = getattr(result, "rms_error", 0.0)
+        self._dv_efield_layer_data.append(
+            (layer_id, float(e_z), float(max_err), float(rms_err))
+        )
+
+        # ── 绘制迷你电场图表 ──
+        self._draw_dv_efield_chart()
+
+    def _draw_dv_efield_chart(self) -> None:
+        """在迷你 matplotlib 嵌板中实时绘制 E_z 逐层折线图。
+
+        仅在 ``matplotlib`` 可用且嵌板已创建时执行。
+        """
+        if self._dv_efield_fig is None or self._dv_efield_canvas is None:
+            return
+        if not self._dv_efield_layer_data:
+            return
+
+        fig = self._dv_efield_fig
+        fig.clear()
+
+        ax = fig.add_subplot(1, 1, 1)
+        layer_ids = [d[0] for d in self._dv_efield_layer_data]
+        e_z_vals = [d[1] for d in self._dv_efield_layer_data]
+
+        ax.plot(
+            layer_ids, e_z_vals,
+            "b-o", markersize=3, linewidth=1.2,
+            label="E_z (V/m)",
+        )
+        ax.set_xlabel("层", fontsize=7)
+        ax.set_ylabel("E_z", fontsize=7, color="b")
+        ax.tick_params(axis="both", labelsize=6)
+        ax.set_title("实时 E_z 逐层", fontsize=8)
+        ax.grid(True, alpha=0.25)
+
+        fig.tight_layout(pad=0.8)
+        fig.canvas.draw_idle()
+
+    # ── DVR 滑块交互槽 ──
+
+    def _on_dv_slider_pressed(self) -> None:
+        """用户开始拖动 DVR 时间轴滑块。"""
+        self._dv_is_slider_down = True
+
+    def _on_dv_slider_released(self) -> None:
+        """用户释放 DVR 时间轴滑块。
+
+        关闭门控并立即渲染当前滑块位置对应的最新帧缓存。
+        """
+        self._dv_is_slider_down = False
+
+        # ── 查找滑块位置 (layer_id) 对应的最新帧 ──
+        if self._dv_slider is None:
+            return
+        target_layer = self._dv_slider.value()
+        self._render_dv_layer_frame(target_layer)
+
+    def _on_dv_slider_changed(self, value: int) -> None:
+        """DVR 滑块值变化时更新标签。"""
+        if self._dv_label is not None:
+            self._dv_label.setText(
+                f"查看: 第 {value + 1}/{self._actual_layers} 层"
+            )
+
+    def _render_dv_layer_frame(self, target_layer: int) -> None:
+        """从 ``animation_frames`` 缓存中查找目标层的最后一帧并渲染。
+
+        Parameters
+        ----------
+        target_layer : int
+            目标层序号（从 0 开始）。
+        """
+        # ── 逆序查找目标层的最新帧 ──
+        best_idx = -1
+        for i in range(len(self.animation_frames) - 1, -1, -1):
+            lid = self.animation_frames[i].get("layer_id", -1)
+            if lid == target_layer:
+                best_idx = i
+                break
+
+        if best_idx < 0:
+            # ── 向前顺向查找最近的一帧 ──
+            for i in range(len(self.animation_frames)):
+                lid = self.animation_frames[i].get("layer_id", -1)
+                if lid >= 0 and lid <= target_layer:
+                    best_idx = i
+                else:
+                    break
+            if best_idx < 0:
+                return
+
+        frame = self.animation_frames[best_idx]
+        tets = self._anim_tets if self._anim_tets is not None else frame.get("tets")
+        self._viewer.show_deformed_mesh(
+            frame["vertices"],
+            tets,
+            frame["active_mask"],
+            title=(
+                f"📽 DVR 定位 — 第 {target_layer + 1} 层"
+                f" — {frame['title']}"
+            ),
+        )
+        QtWidgets.QApplication.processEvents()
 
 class ElectricFieldPlotWindow(QtWidgets.QDialog):
     """电场-误差追踪分析窗口。

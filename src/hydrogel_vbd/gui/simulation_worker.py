@@ -33,7 +33,7 @@ import numpy as np
 from PySide6 import QtCore
 
 from hydrogel_vbd.core.config import SimulationConfig
-from hydrogel_vbd.core.state import LayerResult, MeshState
+from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
 from hydrogel_vbd.physics.czm import CZMState
 
 
@@ -58,6 +58,8 @@ class SimulationWorker(QtCore.QObject):
     # ── 信号定义 ──────────────────────────────────────────────
     frame_ready = QtCore.Signal(dict)
     progress_update = QtCore.Signal(int, int, int, int)  # layer, n_layers, step, iteration
+    layer_finished = QtCore.Signal(object)  # LayerResult — 每层结束时推送
+    sub_progress = QtCore.Signal(int, int, int)  # layer_idx, percentage_0_to_100, step_count
     log_message = QtCore.Signal(str)
     finished = QtCore.Signal(list)  # list[LayerResult]
     error = QtCore.Signal(str)
@@ -407,6 +409,10 @@ class SimulationWorker(QtCore.QObject):
                     if step_counter % 20 == 0 and self._stop_flag:
                         break
 
+                    # ── 细粒度子进度（提升百分比）──
+                    lift_pct = min(100, int(lift_distance / lift_max * 100))
+                    self.sub_progress.emit(layer_id, lift_pct, step_counter)
+
                     # ── 全部脱膜则退出提升循环 ──
                     if result.all_free:
                         break
@@ -463,15 +469,26 @@ class SimulationWorker(QtCore.QObject):
                     )
 
             # ── 收集结果 ──
+            x_final = self._mesh.vertices.copy()
+            v_final = (
+                self._mesh.velocities.copy()
+                if self._mesh.velocities is not None
+                else np.zeros_like(x_final)
+            )
             layer_result = LayerResult(
                 layer_id=layer_id,
-                x=self._mesh.vertices.copy(),
-                iterations=getattr(result, "iterations", 0),
-                max_dx=getattr(result, "max_dx", 0.0),
-                kinetic_energy=getattr(result, "kinetic_energy", 0.0),
-                all_free=getattr(result, "all_free", True),
+                x_sim=x_final,
+                v_sim=v_final,
+                error_metrics={},
+                field_command_next=FieldCommand(np.array([])),
+                max_deformation=getattr(result, "max_dx", 0.0),
+                rms_error=0.0,
+                success=getattr(result, "all_free", True),
             )
             results.append(layer_result)
+
+            # ── 每层结束时推送 layer_finished（主线程用于实时误差分析、DVR 等）──
+            self.layer_finished.emit(layer_result)
 
             self.progress_update.emit(
                 layer_id + 1,
