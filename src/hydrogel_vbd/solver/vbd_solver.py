@@ -32,7 +32,7 @@ import numpy as np
 
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.physics.czm import CZMState
-from hydrogel_vbd.physics.local_terms import build_local_physics_terms
+from hydrogel_vbd.physics.local_terms import update_local_physics_terms
 from hydrogel_vbd.core.state import MeshState
 
 
@@ -206,7 +206,7 @@ class PythonReferenceVBDSolver:
            b. 对每个顶点求解 ``H_total · dx = f_total``
            c. 其中 ``H_total = M/dt² + (1+ζ)·H_elastic + ε·I``
            d. 对损伤节点，将 H_elastic 投影到正定锥
-           e. 步长限制（max 0.01）防止过度外推
+           e. 步长限制（max 0.002）防止过度外推
            f. Chebyshev 加速（迭代 > 5 后启用）
         3. **收敛判定**：连续 N_stable 步 max_dx < epsilon 则退出
 
@@ -228,14 +228,18 @@ class PythonReferenceVBDSolver:
         x_prev = mesh.vertices.copy()           # 本时间步初态
         masses = mesh.masses
 
-        # ── 构建局部物理项（弹性力 + Hessian） ──
-        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+        # ── 预分配物理项缓冲区（每迭代复用，避免重复分配大数组）──
+        n_verts = mesh.vertices.shape[0]
+        _force_buf = np.zeros((n_verts, 3), dtype=float)
+        _hessian_buf = np.zeros((n_verts, 3, 3), dtype=float)
+        update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
+                                   out_force=_force_buf, out_hessian=_hessian_buf)
 
         # ── 自适应加速度（基于初始固化度） ──
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
             config.c_init
-            * terms.force[mesh.active_vertex_mask]
+            * _force_buf[mesh.active_vertex_mask]
             / masses[mesh.active_vertex_mask, None]
         )
 
@@ -279,8 +283,9 @@ class PythonReferenceVBDSolver:
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()   # 记录本迭代初始位置（用于 Chebyshev）
 
-            # ── 重新计算物理项（位置变化后力场变化） ──
-            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+            # ── 重新计算物理项（复用预分配缓冲区）──
+            update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
+                                       out_force=_force_buf, out_hessian=_hessian_buf)
             max_dx = 0.0
 
             # ── 按颜色分组遍历（同色顶点互不影响，可安全并行） ──
@@ -299,17 +304,14 @@ class PythonReferenceVBDSolver:
                             mesh.vertices[node_id, 2] = config.z_fep
 
                     # ── 弹性 Hessian ──
-                    h_elastic = terms.hessian[node_id]
+                    h_elastic = _hessian_buf[node_id]
 
                     # ── 损伤节点 Hessian 正定化 ──
-                    #   当 CZM 处于 DAMAGING 状态时，局部刚度可能为负，
-                    #   导致求解发散。此步骤将 Hessian 特征值裁剪到 ≥0。
+                    #   单次特征值分解（与 C++ SelfAdjointEigenSolver 对齐）
                     if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals = np.linalg.eigvalsh(h_elastic)
+                        eigvals, eigvecs = np.linalg.eigh(h_elastic)
                         if np.min(eigvals) < 0:
-                            # 裁剪负特征值并重构矩阵
                             eigvals_psd = np.maximum(eigvals, 0.0)
-                            eigvecs = np.linalg.eigh(h_elastic)[1]
                             h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
 
                     # ── 总 Hessian：惯性项 + 弹性项 + 阻尼项 + 正则化 ──
@@ -334,17 +336,17 @@ class PythonReferenceVBDSolver:
                     )
 
                     # ── 合力：弹性力 + 惯性力 + 阻尼力 ──
-                    f_total = terms.force[node_id] + f_inertia + f_damp
+                    f_total = _force_buf[node_id] + f_inertia + f_damp
 
                     # ── 求解 3×3 线性系统：H·dx = f ──
                     dx = np.linalg.solve(h_total, f_total)
                     length = float(np.linalg.norm(dx))
 
-                    # ── 步长限制：单步位移不超过 0.01 m ──
-                    #   防止损伤节点或大变形区域过度外推导致发散
-                    if length > 0.01:
-                        dx *= 0.01 / length
-                        length = 0.01
+                    # ── 步长限制：单步位移不超过 0.002 m ──
+                    #   与 C++ solver 对齐，匹配毫米级 DLP 几何尺度
+                    if length > 0.002:
+                        dx *= 0.002 / length
+                        length = 0.002
 
                     # ── 更新顶点位置 ──
                     mesh.vertices[node_id] += dx
@@ -511,11 +513,16 @@ class PythonReferenceVBDSolver:
         )
 
         # ── 与 solve_until_stable 相同的 VBD 核心逻辑 ──
-        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+        #   预分配缓冲区（复用避免每迭代分配大数组）
+        n_verts_lift = mesh.vertices.shape[0]
+        _force_buf = np.zeros((n_verts_lift, 3), dtype=float)
+        _hessian_buf = np.zeros((n_verts_lift, 3, 3), dtype=float)
+        update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
+                                   out_force=_force_buf, out_hessian=_hessian_buf)
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
             config.c_init
-            * terms.force[mesh.active_vertex_mask]
+            * _force_buf[mesh.active_vertex_mask]
             / masses[mesh.active_vertex_mask, None]
         )
         y = (
@@ -547,7 +554,8 @@ class PythonReferenceVBDSolver:
         for iteration in range(1, config.max_iters + 1):
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()
-            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+            update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
+                                       out_force=_force_buf, out_hessian=_hessian_buf)
             max_dx = 0.0
 
             for color in sorted(set(int(c) for c in colors)):
@@ -562,13 +570,12 @@ class PythonReferenceVBDSolver:
                         if mesh.vertices[node_id, 2] < config.z_fep:
                             mesh.vertices[node_id, 2] = config.z_fep
 
-                    h_elastic = terms.hessian[node_id]
+                    h_elastic = _hessian_buf[node_id]
 
                     if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals = np.linalg.eigvalsh(h_elastic)
+                        eigvals, eigvecs = np.linalg.eigh(h_elastic)
                         if np.min(eigvals) < 0:
                             eigvals_psd = np.maximum(eigvals, 0.0)
-                            eigvecs = np.linalg.eigh(h_elastic)[1]
                             h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
 
                     h_total = (
@@ -585,12 +592,12 @@ class PythonReferenceVBDSolver:
                         -(config.k_d / max(config.dt, 1e-12))
                         * h_elastic @ (mesh.vertices[node_id] - x_prev[node_id])
                     )
-                    f_total = terms.force[node_id] + f_inertia + f_damp
+                    f_total = _force_buf[node_id] + f_inertia + f_damp
                     dx = np.linalg.solve(h_total, f_total)
                     length = float(np.linalg.norm(dx))
-                    if length > 0.01:
-                        dx *= 0.01 / length
-                        length = 0.01
+                    if length > 0.002:
+                        dx *= 0.002 / length
+                        length = 0.002
                     mesh.vertices[node_id] += dx
 
                     if (

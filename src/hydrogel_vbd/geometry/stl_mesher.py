@@ -92,6 +92,29 @@ except ImportError:  # pragma: no cover
 
 
 # ============================================================================
+# 构建方向旋转工具
+# ============================================================================
+
+def _apply_build_axis(mesh: MeshState, build_axis: int) -> None:
+    """原地交换顶点坐标列，使构建轴对齐到 Z。
+
+    若 build_axis != 2，交换 ``vertices[:, build_axis]`` 和
+    ``vertices[:, 2]``，使下游求解器统一以 Z 为构建轴工作。
+
+    ``ideal_vertices``、``prev_vertices``、``velocities`` 同步旋转。
+    """
+    if build_axis == 2:
+        return
+    if build_axis not in (0, 1):
+        raise ValueError(f"build_axis 必须为 0, 1, 2, 实际: {build_axis}")
+
+    for arr_name in ("vertices", "ideal_vertices", "prev_vertices", "velocities"):
+        arr = getattr(mesh, arr_name, None)
+        if arr is not None and arr.ndim == 2 and arr.shape[1] == 3:
+            arr[:, [build_axis, 2]] = arr[:, [2, build_axis]]
+
+
+# ============================================================================
 # Poisson 盘采样（Bridson 算法）—— DelaunayTetMesher 回退方案使用
 # ============================================================================
 
@@ -528,7 +551,11 @@ class OCCFragmentMesher:
 
         # ── 标准非结构化网格：跳过切片，直接自由四面体剖分 ──
         if algo_type == "standard":
-            return self._build_standard_unstructured(layer_thickness_m, cfg)
+            mesh_state, n_layers = self._build_standard_unstructured(
+                layer_thickness_m, cfg
+            )
+            _apply_build_axis(mesh_state, cfg.build_axis)
+            return mesh_state, n_layers
 
         is_step = self._is_step_file(self.stl_path)
 
@@ -549,10 +576,22 @@ class OCCFragmentMesher:
                     layer_thickness_m, cfg
                 )
 
+            _apply_build_axis(mesh_state, cfg.build_axis)
             return mesh_state, n_layers
 
         except Exception as exc:
-            # 网格生成失败，尝试回退到 Delaunay 点云剖分
+            # ── 网格生成失败 ──
+            # STEP 文件不能回退到 Delaunay（不支持 B-Rep），直接抛出
+            if is_step:
+                try:
+                    gmsh.finalize()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"STEP 模型网格划分失败: {exc}"
+                ) from exc
+
+            # STL 文件可尝试回退到 Delaunay 点云剖分
             warnings.warn(
                 f"Gmsh 网格生成失败: {exc}。"
                 " 自动回退到 scipy.spatial.Delaunay 点云剖分方案。"
@@ -563,7 +602,9 @@ class OCCFragmentMesher:
             except Exception:
                 pass
 
-            return self._fallback_delaunay(cfg)
+            mesh_state, n_layers = self._fallback_delaunay(cfg)
+            _apply_build_axis(mesh_state, cfg.build_axis)
+            return mesh_state, n_layers
 
         finally:
             # 正常路径确保 Gmsh 已清理
@@ -608,7 +649,15 @@ class OCCFragmentMesher:
         """
         # ── 1. 导入 B-Rep 模型到 OCC 几何内核 ──
         gmsh.model.add("STEP_OCC_Model")
-        imported = gmsh.model.occ.importShapes(self.stl_path)
+        try:
+            imported = gmsh.model.occ.importShapes(self.stl_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Gmsh OCC 无法导入 STEP 模型: {exc}\n"
+                "  文件可能损坏、使用不支持的 STEP 协议，或包含非标准几何。\n"
+                "  请尝试: (1) 在 CAD 中导出为 STEP AP214\n"
+                "         (2) 导出为 STL 格式加载"
+            ) from exc
         if not imported:
             raise RuntimeError(
                 f"无法导入 STEP 模型: {self.stl_path}（格式不支持或文件损坏）"
@@ -616,16 +665,34 @@ class OCCFragmentMesher:
 
         gmsh.model.occ.synchronize()
 
-        # ── 2. 动态筛选 3D 实体（volumes）──
-        all_entities = gmsh.model.occ.getEntities(dim=-1)
-        _dimension_id = 3  # dim=3 表示 3D 体积实体
+        # ── 2. 获取 3D 实体（volumes）──
+        #    先尝试 dim=3 直接查询（兼容性最好），再回退到 dim=-1
+        try:
+            volumes_entities = gmsh.model.occ.getEntities(dim=3)
+        except Exception:
+            try:
+                all_entities = gmsh.model.occ.getEntities(dim=-1)
+                volumes_entities = [e for e in all_entities if e[0] == 3]
+            except Exception as exc2:
+                raise RuntimeError(
+                    f"Gmsh OCC 无法解析 STEP 模型中的几何实体: {exc2}\n"
+                    "  模型可能包含不兼容的曲面类型或损坏的几何数据。\n"
+                    "  请将模型重新导出为 STEP AP214 或 STL 格式。"
+                ) from exc2
 
-        volumes = [
-            e[1] for e in all_entities if e[0] == _dimension_id
-        ]
+        volumes = [e[1] for e in volumes_entities]
         if not volumes:
-            # 如果没有 3D 实体，尝试从所有实体中获取包围盒
-            # （某些 STEP 可能只导入为 shells/faces）
+            # 检查是否有 2D 曲面（非封闭模型）
+            try:
+                surfaces = gmsh.model.occ.getEntities(dim=2)
+            except Exception:
+                surfaces = []
+            if surfaces:
+                raise RuntimeError(
+                    f"STEP 模型仅包含 {len(surfaces)} 个开放曲面，无 3D 实体。\n"
+                    "  无法进行 Boolean Fragment 体网格划分。\n"
+                    "  请将模型导出为封闭的 B-Rep 实体 (.step 格式)。"
+                )
             raise RuntimeError(
                 "STEP 模型中未检测到 3D 实体 (volumes)。"
                 " 模型可能仅包含开放面片，无法进行 Boolean Fragment。"
@@ -633,10 +700,15 @@ class OCCFragmentMesher:
             )
 
         # ── 3. 获取包围盒（mm 单位）──
-        bbox = gmsh.model.occ.getBoundingBox(
-            dim=-1, tag=-1  # 所有实体
-        )
-        if not bbox:
+        #    从已筛选的 3D 实体逐个计算，避免 dim=-1/tag=-1 的兼容性问题
+        bbox = gmsh.model.occ.getBoundingBox(dim=3, tag=volumes[0])
+        for tag in volumes[1:]:
+            bb = gmsh.model.occ.getBoundingBox(dim=3, tag=tag)
+            bbox = [
+                min(bbox[0], bb[0]), min(bbox[1], bb[1]), min(bbox[2], bb[2]),
+                max(bbox[3], bb[3]), max(bbox[4], bb[4]), max(bbox[5], bb[5]),
+            ]
+        if not bbox or len(bbox) < 6:
             raise RuntimeError("无法获取模型包围盒（模型可能为空）")
 
         x_min, y_min, z_min = bbox[0], bbox[1], bbox[2]
@@ -1245,9 +1317,22 @@ class DelaunayTetMesher:
         self._mesh: Any = None  # trimesh 对象
 
     def _load(self) -> None:
-        """加载 STL 并将坐标从 mm 转换为 m。"""
+        """加载 STL 并将坐标从 mm 转换为 m。
+
+        STEP 文件不支持 —— Delaunay 回退路径不适用于 B-Rep 格式。
+        """
         if self._mesh is not None:
             return
+
+        import os as _os
+        _ext = _os.path.splitext(str(self.stl_path))[1].lower()
+        if _ext in ('.step', '.stp', '.igs', '.iges', '.brep'):
+            raise RuntimeError(
+                f"STEP/B-Rep 文件 ({_ext}) 需要 Gmsh OCC 几何内核。\n"
+                "请安装: pip install gmsh\n"
+                "或先将模型转换为 STL 格式再加载。"
+            )
+
         try:
             import trimesh
         except ImportError as exc:
@@ -1332,7 +1417,14 @@ class DelaunayTetMesher:
             return interior_pts
 
         # 过滤：只保留 STL 内部的点
-        inside = self.tri_mesh.contains(interior_pts)
+        try:
+            inside = self.tri_mesh.contains(interior_pts)
+        except ModuleNotFoundError as exc:
+            if 'rtree' in str(exc).lower():
+                raise ModuleNotFoundError(
+                    "Delaunay 回退路径需要 rtree 包。请运行: pip install rtree"
+                ) from exc
+            raise
         return interior_pts[inside]
 
     def _sample_layer_interface_points(

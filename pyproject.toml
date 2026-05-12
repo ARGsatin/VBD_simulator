@@ -7,11 +7,32 @@ name = "hydrogel-vbd"
 version = "0.1.0"
 description = "Python MVP framework for VBD-based hydrogel DLP simulation"
 requires-python = ">=3.10"
-dependencies = ["numpy", "matplotlib"]
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "scipy>=1.9",
+    "trimesh",
+    "rtree",
+]
 
 [project.optional-dependencies]
-gui = ["pyside6"]
-all = ["pyside6", "pytest"]
+gui = [
+    "pyside6",
+]
+gmsh = [
+    "gmsh>=4.11",
+]
+cpp = [
+    # C++ 加速求解器需手动编译（cmake + Eigen + pybind11）
+]
+dev = [
+    "pytest",
+]
+all = [
+    "pyside6",
+    "gmsh>=4.11",
+    "pytest",
+]
 
 [project.scripts]
 hydrogel-vbd-demo = "hydrogel_vbd.core.main_loop:main"

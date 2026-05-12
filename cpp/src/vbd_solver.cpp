@@ -321,8 +321,13 @@ VBDSolveResult solve_with_lift(
     const double inv_dt = 1.0 / std::max(cfg.dt, 1e-12);
     const double inv_dt2 = 1.0 / std::max(dt2, 1e-12);
     const double dx_clip = 0.002;  // 步长截断阈值收紧至 2 mm
-    const double lift_max = 5.0 * cfg.z_fep;
+    const double lift_max = 5.0 * cfg.layer_thickness;  // 最大提升距离 = 5倍层厚
     const double lift_step = cfg.v_lift * cfg.dt;
+
+    // 快速路径：若无需提升（v_lift=0 或层厚为 0），直接执行静平衡
+    if (lift_step <= 0.0 || lift_max <= 0.0) {
+        return solve_until_stable(mesh, cfg, e_z, layer_id);
+    }
 
     // ── 收集底面节点（用于 CZM 状态更新与剥离判定）──
     std::vector<int> bottom;

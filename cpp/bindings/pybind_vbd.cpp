@@ -199,7 +199,7 @@ static py::dict solve_with_lift_py(
 // ============================================================================
 // 模块定义
 // ============================================================================
-PYBIND11_MODULE(vbd_solver_cpp, m) {
+PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
     m.doc() = "C++ accelerated VBD solver for hydrogel DLP simulation";
 
     // 配置结构体
@@ -230,6 +230,7 @@ PYBIND11_MODULE(vbd_solver_cpp, m) {
         .def_readwrite("d_fluid_max", &SolverConfig::d_fluid_max)
         .def_readwrite("t_fluid_max", &SolverConfig::t_fluid_max)
         .def_readwrite("v_lift", &SolverConfig::v_lift)
+        .def_readwrite("layer_thickness", &SolverConfig::layer_thickness)
         .def_readwrite("c_init", &SolverConfig::c_init);
 
     // 求解函数

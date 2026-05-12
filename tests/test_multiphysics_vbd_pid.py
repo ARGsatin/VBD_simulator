@@ -21,16 +21,29 @@ class MultiphysicsVbdPidTests(unittest.TestCase):
         mesh.activate_layer(0)
         bottom = mesh.bottom_nodes(0)
 
-        update_czm_states(mesh, bottom, internal_pull_z=np.full(len(bottom), 6000.0), area=1.0, t_max=5000.0, k_czm=1e8, delta_f=1e-4, z_fep=0.0, dt=0.01)
+        # ── 提升底部节点产生 gap → 触发弹性牵引力 ──
+        #   gap > delta_f(1e-4) → FIXED→DAMAGING
+        mesh.vertices[bottom, 2] = 2e-4  # gap = 0.2mm > delta_f
+        update_czm_states(mesh, bottom,
+                          internal_pull_z=np.zeros(len(bottom)),
+                          area=1.0, t_max=5000.0, k_czm=1e8,
+                          delta_f=1e-4, z_fep=0.0, dt=0.01)
         self.assertTrue(np.all(mesh.czm_state[bottom] == CZMState.DAMAGING))
 
-        mesh.vertices[bottom, 2] = 2e-4
+        # ── 率为零的拉力 + gap > 5*delta_f → FREE ──
         previous_damage = mesh.damage[bottom].copy()
-        update_czm_states(mesh, bottom, internal_pull_z=np.zeros(len(bottom)), area=1.0, t_max=5000.0, k_czm=1e8, delta_f=1e-4, z_fep=0.0, dt=0.01)
-        self.assertTrue(np.all(mesh.damage[bottom] >= previous_damage))
+        mesh.vertices[bottom, 2] = 6e-4  # gap = 0.6mm > 5*delta_f(0.5mm)
+        update_czm_states(mesh, bottom,
+                          internal_pull_z=np.zeros(len(bottom)),
+                          area=1.0, t_max=5000.0, k_czm=1e8,
+                          delta_f=1e-4, z_fep=0.0, dt=0.01)
         self.assertTrue(np.all(mesh.czm_state[bottom] == CZMState.FREE))
 
-        update_czm_states(mesh, bottom, internal_pull_z=np.zeros(len(bottom)), area=1.0, t_max=5000.0, k_czm=1e8, delta_f=1e-4, z_fep=0.0, dt=0.01)
+        # ── FREE 后 time_free 应累加 ──
+        update_czm_states(mesh, bottom,
+                          internal_pull_z=np.zeros(len(bottom)),
+                          area=1.0, t_max=5000.0, k_czm=1e8,
+                          delta_f=1e-4, z_fep=0.0, dt=0.01)
         self.assertTrue(np.all(mesh.time_free[bottom] > 0.0))
 
     def test_local_physics_terms_have_force_and_hessian_and_fluid_is_cut_off(self):

@@ -145,4 +145,9 @@ class ConformalMeshPipeline:
         mesh.node_mass = mesh._build_node_masses(config.rho)  # 节点集中质量
         mesh.colors = greedy_vertex_coloring(mesh)            # 图着色分组
 
+        # ── 构建方向旋转（使构建轴对齐到 Solver Z）──
+        from hydrogel_vbd.geometry.stl_mesher import _apply_build_axis
+
+        _apply_build_axis(mesh, config.build_axis)
+
         return mesh, layers

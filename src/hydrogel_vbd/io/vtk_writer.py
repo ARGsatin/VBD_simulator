@@ -28,6 +28,7 @@ def write_vtu(
     path: str | Path,
     mesh: MeshState,
     point_data: dict[str, np.ndarray] | None = None,
+    field_types: dict[str, str] | None = None,
 ) -> Path:
     """将网格和场数据写入 VTU 文件。
 
@@ -41,10 +42,10 @@ def write_vtu(
     mesh : MeshState
         包含顶点位置、四面体拓扑和活动掩码的网格状态。
     point_data : dict[str, np.ndarray] | None, optional
-        逐顶点的附加数据字典，键为字段名称，值为：
-        - ``shape (N,)`` 的标量数组，或
-        - ``shape (N, components)`` 的向量数组。
-        默认无附加数据。
+        逐顶点的附加数据字典。
+    field_types : dict[str, str] | None, optional
+        每个字段的 VTK 数据类型（"Float32" / "Float64" / "Int32"），
+        未指定则默认 "Float32"。
 
     Returns
     -------
@@ -55,6 +56,7 @@ def write_vtu(
     output.parent.mkdir(parents=True, exist_ok=True)
     active_tets = mesh.tets[mesh.active_tet_mask]
     point_data = point_data or {}
+    field_types = field_types or {}
     with output.open("w", encoding="utf-8") as handle:
         handle.write('<?xml version="1.0"?>\n')
         handle.write(
@@ -69,12 +71,12 @@ def write_vtu(
         # ── 顶点坐标 ──
         handle.write("      <Points>\n")
         handle.write(
-            '        <DataArray type="Float64"'
+            '        <DataArray type="Float32"'
             ' NumberOfComponents="3" format="ascii">\n'
         )
         for vertex in mesh.vertices:
             handle.write(
-                f"          {vertex[0]} {vertex[1]} {vertex[2]}\n"
+                f"          {float(vertex[0])} {float(vertex[1])} {float(vertex[2])}\n"
             )
         handle.write("        </DataArray>\n")
         handle.write("      </Points>\n")
@@ -121,20 +123,23 @@ def write_vtu(
                 components = (
                     1 if array.ndim == 1 else array.shape[1]
                 )
+                vtk_type = field_types.get(name, "Float32")
                 handle.write(
-                    f'        <DataArray type="Float64" Name="{name}"'
+                    f'        <DataArray type="{vtk_type}" Name="{name}"'
                     f' NumberOfComponents="{components}"'
                     ' format="ascii">\n'
                 )
+                if vtk_type.startswith("Int"):
+                    fmt_val = lambda v: str(int(v))
+                else:
+                    fmt_val = lambda v: str(float(v))
                 for value in array:
-                    if np.isscalar(value):
-                        handle.write(f"          {float(value)}\n")
+                    if np.isscalar(value) or isinstance(value, (int, float)):
+                        handle.write(f"          {fmt_val(value)}\n")
                     else:
                         handle.write(
                             "          "
-                            + " ".join(
-                                str(float(item)) for item in value
-                            )
+                            + " ".join(fmt_val(item) for item in value)
                             + "\n"
                         )
                 handle.write("        </DataArray>\n")

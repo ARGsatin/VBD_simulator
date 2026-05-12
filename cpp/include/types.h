@@ -55,6 +55,7 @@ struct SolverConfig {
 
     // 平台提升
     double v_lift = 0.0;
+    double layer_thickness = 5e-5;   // 层厚 (m)，用于提升距离计算
 
     // 自适应加速度
     double c_init = 0.5;

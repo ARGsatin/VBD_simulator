@@ -146,9 +146,30 @@ class SimulationConfig:
 
     # ────────── 打印工艺 ──────────
     layer_thickness: float = 5e-5    # 层厚 / 平台提升距离 (m) = 0.05mm
-    z_fep: float = 0.0              # 离型膜 Z 坐标 (m)
+    z_fep: float = 0.0              # 离型膜 Z 坐标 (m)（Solver 内部 Z = 构建轴）
     v_lift: float = 0.001           # 提升速度 (m/s)，0 则跳过提升
     C_0: float = 1.0                # 固化度比例常数
+
+    # ────────── 构建方向 ──────────
+    build_axis: int = 2             # 构建轴: 0=X, 1=Y, 2=Z（默认 Z）
+
+    # ────────── 生命周期 ──────────
+
+    def __post_init__(self) -> None:
+        """若 build_axis ≠ Z，自动旋转重力向量使物理方向一致。
+
+        网格生成层会做坐标交换使构建轴对齐到 Z，
+        此处提前旋转重力等向量，保持物理一致性。
+        """
+        if self.build_axis == 2:
+            return
+        if self.build_axis not in (0, 1):
+            raise ValueError(f"build_axis 必须为 0(X), 1(Y), 2(Z), 实际: {self.build_axis}")
+
+        # 交换 gravity 的 build_axis 和 Z 分量
+        g = list(self.g)
+        g[self.build_axis], g[2] = g[2], g[self.build_axis]
+        self.g = tuple(g)
 
     # ────────── 类方法 ──────────
 

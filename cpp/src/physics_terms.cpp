@@ -21,7 +21,7 @@ void build_local_physics_terms(
     MeshData& mesh,
     const SolverConfig& cfg,
     double e_z,
-    const Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>>& x_prev,
+    const Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>>& x_prev,
     LocalPhysicsTerms& out)
 {
     const int nV = mesh.num_vertices;
