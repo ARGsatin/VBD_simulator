@@ -268,24 +268,27 @@ class SimulationWorker(QtCore.QObject):
         # ── 文件级崩溃追踪（线程内 Qt 信号可能在 crash 前未送达）──
         _trace_path = Path(self._output_dir) / "worker_trace.log"
         _trace_path.parent.mkdir(parents=True, exist_ok=True)
-        def _trace(msg: str) -> None:
+
+        def _write_trace(msg: str) -> None:
             try:
                 with open(_trace_path, "a", encoding="utf-8") as f:
                     f.write(f"{time.perf_counter():.3f} {msg}\n")
             except Exception:
                 pass
-        _trace("worker_run_start")
+
+        self._trace = _write_trace  # 供 _run_layers 等方法访问
+        self._trace("worker_run_start")
 
         try:
             results: list[LayerResult] = []
             t_start = time.perf_counter()
 
             self.log_message.emit("⚙️ [Worker] 仿真线程已启动…")
-            _trace("worker_log_started")
+            self._trace("worker_log_started")
 
             # ════════════════ 阶段 1：前处理 ════════════════
             self._preprocess()
-            _trace("preprocess_done")
+            self._trace("preprocess_done")
 
             # ════════════════ 阶段 2：逐层仿真 ════════════════
             results = self._run_layers()
