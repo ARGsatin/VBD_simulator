@@ -347,6 +347,10 @@ class SimulationWorker(QtCore.QObject):
         )
 
         _use_cpp = is_cpp_available()
+        if _use_cpp:
+            self.log_message.emit("  [info] 使用 C++ 加速求解器")
+        else:
+            self.log_message.emit("  [info] 使用 Python 参考求解器")
         solver = PythonReferenceVBDSolver(self._config) if not _use_cpp else None
         activator = LayerActivator()
         pid = PIDFieldController(self._config)

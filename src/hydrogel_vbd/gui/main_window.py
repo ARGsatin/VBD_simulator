@@ -1319,7 +1319,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._actual_layers = saved_actual_layers
 
         # ── C++ 求解器可用性检查 / 自动编译 ──
-        if not is_cpp_available():
+        _cpp_ready = is_cpp_available()
+        if not _cpp_ready:
             builder = CppBuilder()
             if builder.pyd_exists():
                 self._log.append_log("  [build] 检测到旧版 .pyd，重新编译 ...")
@@ -1336,6 +1337,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log.append_log("  [build] 前置条件就绪，正在后台编译 ...")
                 self._start_cpp_build(builder, config)
                 return
+        # 编译线程 return 后，_on_cpp_build_finished 会重新调用 _on_run()，
+        # 届时 _cpp_ready 为 True 直接进入此分支
+        if _cpp_ready:
+            self._log.append_log("  [info] 使用 C++ 加速求解器")
 
         try:
             # ── 创建异步 Worker 并移入 QThread ──
