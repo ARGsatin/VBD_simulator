@@ -32,8 +32,39 @@ import numpy as np
 
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.physics.czm import CZMState
+from hydrogel_vbd.physics.elastic_energy import (
+    compute_tet_deformation_gradient,
+    neo_hookean_energy_density,
+)
 from hydrogel_vbd.physics.local_terms import build_local_physics_terms
 from hydrogel_vbd.core.state import MeshState
+
+
+def _poisson_to_lame(mu: float, kappa: float) -> tuple[float, float]:
+    """Lamé 参数转换."""
+    lam = kappa - (2.0 / 3.0) * mu
+    return mu, lam
+
+
+def _vertex_local_elastic_energy(
+    mesh: MeshState,
+    node_id: int,
+    mu: float,
+    lam: float,
+) -> float:
+    """计算单个顶点关联的所有 tet 的弹性能之和。
+
+    用于 backtracking line search 的能量下降验证。
+    """
+    energy = 0.0
+    for tet_id in mesh.vertex2tets[node_id]:
+        if not mesh.active_tet_mask[tet_id]:
+            continue
+        v = mesh.vertices[mesh.tets[tet_id]]
+        dmi = mesh.dm_inv[tet_id]
+        F = compute_tet_deformation_gradient(v, dmi)
+        energy += mesh.tet_volumes[tet_id] * neo_hookean_energy_density(F, mu, lam)
+    return energy
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -287,82 +318,121 @@ class PythonReferenceVBDSolver:
             terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
             max_dx = 0.0
 
-            # ── 按颜色分组遍历（同色顶点互不影响，可安全并行） ──
+            # ── 按颜色分组遍历 ──
+            # 同色顶点互不相邻，可安全批量求解。
+            # 批量装配 H_total、合力、3×3 solve（numpy 自动并行），
+            # 只保留 line search 逐节点（需要评估局部能量）。
+            dt2 = config.dt ** 2
+            inv_dt2 = 1.0 / max(dt2, 1e-24)
+            damp_factor = config.k_d / max(config.dt, 1e-12)
+            mu_lame, lam_lame = _poisson_to_lame(config.mu, config.kappa)
+            eye3 = np.eye(3, dtype=np.float64)
+
             for color in sorted(set(int(c) for c in colors)):
-                for node_id in np.flatnonzero(colors == color):
-                    # 跳过固定节点
-                    if fixed[node_id]:
-                        continue
+                # ── 提取同色节点并过滤固定节点 ──
+                color_nodes = np.flatnonzero(colors == color)
+                if len(color_nodes) == 0:
+                    continue
+                active_mask_c = ~fixed[color_nodes]
+                if not np.any(active_mask_c):
+                    continue
+                active_nodes = color_nodes[active_mask_c]            # (K,)
+                K = len(active_nodes)
 
-                    # ── 离型膜（FEP）穿透约束：底面节点不能低于 FEP 平面 ──
-                    if (
-                        not mesh.is_top_fixed[node_id]
-                        and mesh.is_bottom_surface[node_id]
-                    ):
-                        if mesh.vertices[node_id, 2] < config.z_fep:
-                            mesh.vertices[node_id, 2] = config.z_fep
+                # ── FEP 穿透批量修正 ──
+                not_top = ~mesh.is_top_fixed[active_nodes]
+                is_bottom = mesh.is_bottom_surface[active_nodes]
+                fep_fix = not_top & is_bottom & (
+                    mesh.vertices[active_nodes, 2] < config.z_fep
+                )
+                mesh.vertices[active_nodes[fep_fix], 2] = config.z_fep
 
-                    # ── 弹性 Hessian ──
-                    h_elastic = terms.hessian[node_id]
+                # ── 批量提取 Hessian ──
+                h_elastic_batch = terms.hessian[active_nodes].copy()  # (K, 3, 3)
 
-                    # ── 损伤节点 Hessian 正定化 ──
-                    #   当 CZM 处于 DAMAGING 状态时，局部刚度可能为负，
-                    #   导致求解发散。此步骤将 Hessian 特征值裁剪到 ≥0。
-                    if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals = np.linalg.eigvalsh(h_elastic)
+                # ── DAMAGING 节点 PSD 批量修正 ──
+                damaging = mesh.czm_state[active_nodes] == CZMState.DAMAGING
+                if np.any(damaging):
+                    for idx in np.flatnonzero(damaging):
+                        h_e = h_elastic_batch[idx]
+                        eigvals = np.linalg.eigvalsh(h_e)
                         if np.min(eigvals) < 0:
-                            # 裁剪负特征值并重构矩阵
+                            eigvecs = np.linalg.eigh(h_e)[1]
                             eigvals_psd = np.maximum(eigvals, 0.0)
-                            eigvecs = np.linalg.eigh(h_elastic)[1]
-                            h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
+                            h_elastic_batch[idx] = (
+                                eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
+                            )
 
-                    # ── 总 Hessian：惯性项 + 弹性项 + 阻尼项 + 正则化 ──
-                    #   H_total = M/dt² · I + (1 + k_d/dt) · H_elastic + ε·I
-                    h_total = (
-                        (masses[node_id] / (config.dt ** 2)) * np.eye(3)  # 惯性项
-                        + h_elastic                                        # 弹性项
-                        + (config.k_d / max(config.dt, 1e-12)) * h_elastic # 阻尼项
-                        + 1e-9 * np.eye(3)                                # 正则化（防奇异）
+                # ── 批量装配 H_total: M/dt²·I + (1 + k_d/dt)·H_elastic + ε·I ──
+                mass_batch = masses[active_nodes]                       # (K,)
+                h_total_batch = (
+                    inv_dt2 * mass_batch[:, None, None] * eye3[None, :, :]
+                    + (1.0 + damp_factor) * h_elastic_batch
+                    + 1e-9 * eye3[None, :, :]
+                )                                                        # (K, 3, 3)
+
+                # ── 批量装配惯性力：-M/dt² · (x - y) ──
+                f_inertia_batch = (
+                    -inv_dt2 * mass_batch[:, None]
+                    * (mesh.vertices[active_nodes] - y[active_nodes])
+                )                                                        # (K, 3)
+
+                # ── 批量装配阻尼力：-k_d/dt · H_elastic · (x - x_prev) ──
+                dx_prev_batch = (
+                    mesh.vertices[active_nodes] - x_prev[active_nodes]
+                )                                                        # (K, 3)
+                f_damp_batch = -damp_factor * np.einsum(
+                    'kij,kj->ki', h_elastic_batch, dx_prev_batch
+                )                                                        # (K, 3)
+
+                # ── 合力 + 批量 3×3 solve ──
+                f_total_batch = (
+                    terms.force[active_nodes]
+                    + f_inertia_batch
+                    + f_damp_batch
+                )                                                        # (K, 3)
+                # NumPy 2.0: f_total_batch (K,3) 需 reshape 为 (K,3,1)
+                dx_batch = np.linalg.solve(
+                    h_total_batch, f_total_batch[..., None]
+                ).squeeze(-1)  # (K, 3)
+
+                # ── Per-node line search（能量评估无法批量） ──
+                x_saved_batch = mesh.vertices[active_nodes].copy()       # (K, 3)
+
+                for i in range(K):
+                    node_id = int(active_nodes[i])
+                    dx = dx_batch[i]
+                    x_saved = x_saved_batch[i]
+
+                    e_before = _vertex_local_elastic_energy(
+                        mesh, node_id, mu_lame, lam_lame
                     )
+                    alpha = 1.0
+                    accepted = False
+                    for _ in range(12):
+                        mesh.vertices[node_id] = x_saved + alpha * dx
+                        if (
+                            not mesh.is_top_fixed[node_id]
+                            and mesh.is_bottom_surface[node_id]
+                        ):
+                            if mesh.vertices[node_id, 2] < config.z_fep:
+                                mesh.vertices[node_id, 2] = config.z_fep
 
-                    # ── 惯性力：F_inertia = -M/dt² · (x - y) ──
-                    f_inertia = (
-                        -(masses[node_id] / (config.dt ** 2))
-                        * (mesh.vertices[node_id] - y[node_id])
-                    )
+                        e_after = _vertex_local_elastic_energy(
+                            mesh, node_id, mu_lame, lam_lame
+                        )
+                        if e_after <= e_before + 1e-10 or alpha < 1e-6:
+                            accepted = True
+                            break
+                        alpha *= 0.5
 
-                    # ── 阻尼力：F_damp = -k_d/dt · H_elastic · (x - x_prev) ──
-                    f_damp = (
-                        -(config.k_d / max(config.dt, 1e-12))
-                        * h_elastic @ (mesh.vertices[node_id] - x_prev[node_id])
-                    )
+                    if not accepted:
+                        mesh.vertices[node_id] = x_saved
 
-                    # ── 合力：弹性力 + 惯性力 + 阻尼力 ──
-                    f_total = terms.force[node_id] + f_inertia + f_damp
-
-                    # ── 求解 3×3 线性系统：H·dx = f ──
-                    dx = np.linalg.solve(h_total, f_total)
-                    length = float(np.linalg.norm(dx))
-
-                    # ── 步长限制：单步位移不超过 0.01 m ──
-                    #   防止损伤节点或大变形区域过度外推导致发散
-                    if length > 0.01:
-                        dx *= 0.01 / length
-                        length = 0.01
-
-                    # ── 更新顶点位置 ──
-                    mesh.vertices[node_id] += dx
-
-                    # ── 再次检查 FEP 穿透 ──
-                    if (
-                        not mesh.is_top_fixed[node_id]
-                        and mesh.is_bottom_surface[node_id]
-                    ):
-                        if mesh.vertices[node_id, 2] < config.z_fep:
-                            mesh.vertices[node_id, 2] = config.z_fep
-
-                    # 跟踪本次迭代的最大位移
-                    max_dx = max(max_dx, length)
+                    actual_dx = mesh.vertices[node_id] - x_saved
+                    length = float(np.linalg.norm(actual_dx))
+                    if length > max_dx:
+                        max_dx = length
 
             # ── Chebyshev 半隐式加速（迭代 > 5 后启用） ──
             #   基于 Chebyshev 多项式的外推，加速收敛。
@@ -577,11 +647,39 @@ class PythonReferenceVBDSolver:
                     )
                     f_total = terms.force[node_id] + f_inertia + f_damp
                     dx = np.linalg.solve(h_total, f_total)
-                    length = float(np.linalg.norm(dx))
-                    if length > 0.01:
-                        dx *= 0.01 / length
-                        length = 0.01
-                    mesh.vertices[node_id] += dx
+
+                    # ── Backtracking line search ──
+                    mu_lame, lam_lame = _poisson_to_lame(
+                        config.mu, config.kappa
+                    )
+                    x_saved = mesh.vertices[node_id].copy()
+                    e_before = _vertex_local_elastic_energy(
+                        mesh, node_id, mu_lame, lam_lame
+                    )
+
+                    alpha = 1.0
+                    accepted = False
+                    for _ in range(12):
+                        mesh.vertices[node_id] = x_saved + alpha * dx
+                        if (
+                            not mesh.is_top_fixed[node_id]
+                            and mesh.is_bottom_surface[node_id]
+                        ):
+                            if mesh.vertices[node_id, 2] < config.z_fep:
+                                mesh.vertices[node_id, 2] = config.z_fep
+                        e_after = _vertex_local_elastic_energy(
+                            mesh, node_id, mu_lame, lam_lame
+                        )
+                        if e_after <= e_before + 1e-10 or alpha < 1e-6:
+                            accepted = True
+                            break
+                        alpha *= 0.5
+
+                    if not accepted:
+                        mesh.vertices[node_id] = x_saved
+
+                    actual_dx = mesh.vertices[node_id] - x_saved
+                    length = float(np.linalg.norm(actual_dx))
 
                     if (
                         not mesh.is_top_fixed[node_id]
