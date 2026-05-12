@@ -255,16 +255,6 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Hydrogel VBD Simulator")
         self.resize(1500, 950)
-        self.setStyleSheet("""
-            QMainWindow { background-color: #FAFAFA; }
-            QPushButton { padding: 4px 12px; border-radius: 3px; }
-            QGroupBox { font-weight: bold; margin-top: 4px; padding-top: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; padding: 0 6px; }
-            QLabel { padding: 0px; }
-            QSpinBox, QDoubleSpinBox, QComboBox { padding: 1px 3px; }
-            QProgressBar { height: 14px; border-radius: 3px; }
-            QTextEdit { border: 1px solid #ddd; border-radius: 3px; }
-        """)
 
         self._config = SimulationConfig()
         self._last_results: list[LayerResult] = []
