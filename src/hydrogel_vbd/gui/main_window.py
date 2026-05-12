@@ -118,7 +118,7 @@ class ParameterPanel(QtWidgets.QGroupBox):
                 sb = QtWidgets.QSpinBox()
                 sb.setRange(meta["min"], meta["max"])
                 sb.setValue(int(default))
-            sb.setMaximumWidth(120)
+            sb.setMaximumWidth(140)
             sb.valueChanged.connect(self._collect_params)  # type: ignore[arg-type]
             self._spin_map[meta["key"]] = sb
             layout.addRow(meta["label"], sb)
@@ -360,6 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._btn_stop_anim = QtWidgets.QPushButton("停止回放")
         self._btn_stop_anim.setFixedHeight(28)
+        self._btn_stop_anim.setFixedWidth(80)
         self._btn_stop_anim.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #f44336; "
             "color: white; border-radius: 3px; }"
@@ -371,6 +372,10 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self._btn_load)
         top_bar.addWidget(self._btn_clear)
         top_bar.addWidget(self._lbl_model, 1)
+        _sep = QtWidgets.QFrame()
+        _sep.setFrameShape(QtWidgets.QFrame.VLine)
+        _sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        top_bar.addWidget(_sep)
         top_bar.addWidget(self._btn_mesh)
         top_bar.addWidget(self._btn_run)
         top_bar.addWidget(self._btn_stop_anim)
@@ -384,92 +389,93 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 左侧面板
         left = QtWidgets.QWidget()
-        left.setMinimumWidth(440)
-        left.setMaximumWidth(520)
+        left.setMinimumWidth(480)
+        left.setMaximumWidth(620)
         left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(2, 2, 2, 2)
-        left_layout.setSpacing(4)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
         self._param_panel = ParameterPanel()
         self._param_panel.params_changed.connect(self._on_params)
 
-        # ── 第一行：层厚 / 层数 / 分辨率 / 自定义分辨率 ──
-        info_layout_1 = QtWidgets.QHBoxLayout()
-
-        info_layout_1.addWidget(QtWidgets.QLabel("层厚 (mm):"))
+        # ── 第 1 行：层厚 / 层数 / 分辨率 ──
+        info_1 = QtWidgets.QHBoxLayout()
+        info_1.addWidget(QtWidgets.QLabel("层厚 (mm):"))
         self._lbl_thickness = QtWidgets.QLabel("0.05")
         self._lbl_thickness.setStyleSheet("font-weight: bold; color: #1976D2;")
-        info_layout_1.addWidget(self._lbl_thickness)
-        info_layout_1.addSpacing(15)
+        info_1.addWidget(self._lbl_thickness)
+        info_1.addSpacing(12)
 
-        info_layout_1.addWidget(QtWidgets.QLabel("层数:"))
+        info_1.addWidget(QtWidgets.QLabel("层数:"))
         self._lbl_layers = QtWidgets.QLabel("—")
         self._lbl_layers.setStyleSheet("font-weight: bold;")
-        info_layout_1.addWidget(self._lbl_layers)
+        info_1.addWidget(self._lbl_layers)
         self._spin_layers = QtWidgets.QSpinBox()
         self._spin_layers.setRange(1, 100)
         self._spin_layers.setValue(3)
+        self._spin_layers.setMaximumWidth(70)
         self._spin_layers.setToolTip("Demo 模式层数")
         self._spin_layers.valueChanged.connect(self._on_demo_layers_changed)
-        info_layout_1.addWidget(self._spin_layers)
+        info_1.addWidget(self._spin_layers)
+        info_1.addSpacing(12)
 
-        info_layout_1.addSpacing(15)
-        info_layout_1.addWidget(QtWidgets.QLabel("分辨率 (mm):"))
+        info_1.addWidget(QtWidgets.QLabel("分辨率 (mm):"))
         self._lbl_resolution = QtWidgets.QLabel("—")
         self._lbl_resolution.setStyleSheet("font-weight: bold;")
-        info_layout_1.addWidget(self._lbl_resolution)
+        info_1.addWidget(self._lbl_resolution)
         self._spin_resolution = QtWidgets.QDoubleSpinBox()
         self._spin_resolution.setRange(0.5, 500.0)
         self._spin_resolution.setDecimals(1)
         self._spin_resolution.setValue(20.0)
         self._spin_resolution.setSingleStep(1.0)
         self._spin_resolution.setSuffix(" mm")
+        self._spin_resolution.setMaximumWidth(90)
         self._spin_resolution.setToolTip("Demo 模式 XY 网格间距 (mm)")
         self._spin_resolution.valueChanged.connect(self._on_demo_params_changed)
-        info_layout_1.addWidget(self._spin_resolution)
+        info_1.addWidget(self._spin_resolution)
 
-        info_layout_1.addSpacing(15)
-        # ── 自动推荐分辨率提示标签 ──
         self._lbl_auto_res = QtWidgets.QLabel("")
         self._lbl_auto_res.setStyleSheet("color: #888; font-size: 9pt;")
-        info_layout_1.addWidget(self._lbl_auto_res)
+        info_1.addWidget(self._lbl_auto_res)
+        info_1.addStretch()
+        left_layout.addLayout(info_1)
 
-        info_layout_1.addSpacing(15)
-        # ── 自定义分辨率复选框 ──
+        # ── 第 2 行：自定义分辨率 + 网格算法 ──
+        info_2 = QtWidgets.QHBoxLayout()
         self._chk_custom_res = QtWidgets.QCheckBox("自定义分辨率")
         self._chk_custom_res.setToolTip(
             "勾选后可手动调节网格分辨率；\n"
             "不勾选则根据模型尺寸自动计算最佳分辨率"
         )
         self._chk_custom_res.toggled.connect(self._on_custom_resolution_toggled)
-        info_layout_1.addWidget(self._chk_custom_res)
-        info_layout_1.addSpacing(15)
+        info_2.addWidget(self._chk_custom_res)
+        info_2.addSpacing(12)
 
-        # ── 网格算法选择器 ──
-        info_layout_1.addWidget(QtWidgets.QLabel("网格算法:"))
+        info_2.addWidget(QtWidgets.QLabel("网格算法:"))
         self._combo_mesh_algo = QtWidgets.QComboBox()
-        self._combo_mesh_algo.addItem("规整分层算法 (OCC 切片)", "layered")
-        self._combo_mesh_algo.addItem("标准非结构化算法 (自由四面体)", "standard")
+        self._combo_mesh_algo.addItem("规整分层 (OCC 切片)", "layered")
+        self._combo_mesh_algo.addItem("标准非结构化", "standard")
         self._combo_mesh_algo.setToolTip(
             "规整分层算法: 通过 OCC Boolean Fragment 水平切片，"
             "保证四面体不跨层;\n"
             "标准非结构化算法: 跳过切片，直接生成自由四面体网格"
         )
-        info_layout_1.addWidget(self._combo_mesh_algo)
+        info_2.addWidget(self._combo_mesh_algo)
+        info_2.addStretch()
+        left_layout.addLayout(info_2)
 
-        # ── C++ 求解器开关 ──
-        info_layout_1.addSpacing(12)
+        # ── 第 3 行：C++ 求解器开关 ──
+        info_3 = QtWidgets.QHBoxLayout()
         self._chk_use_cpp = QtWidgets.QCheckBox("使用 C++ 加速求解器 (实验性)")
         self._chk_use_cpp.setChecked(False)
         self._chk_use_cpp.setToolTip(
             "勾选后优先使用 C++ 加速求解器；\n"
             "⚠ 实验性功能：在 QThread 中可能不稳定，默认关闭"
         )
-        info_layout_1.addWidget(self._chk_use_cpp)
-        info_layout_1.addStretch()
+        info_3.addWidget(self._chk_use_cpp)
+        info_3.addStretch()
+        left_layout.addLayout(info_3)
 
-        left_layout.addLayout(info_layout_1)
-
-        # ── QScrollArea 包裹参数面板，防止窗口高度不足时控件被挤压 ──
+        # ── QScrollArea 包裹参数面板 ──
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -2320,6 +2326,12 @@ def launch_gui() -> None:
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # CJK 字体
+    _qt_font = QtGui.QFont()
+    _qt_font.setFamilies(["Microsoft YaHei", "SimHei", "Microsoft JhengHei", "SimSun"])
+    app.setFont(_qt_font)
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

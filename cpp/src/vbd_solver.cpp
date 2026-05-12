@@ -6,6 +6,12 @@
 #include <cmath>
 #include <utility>
 
+// GUI 安全模式：编译时强制禁用 OpenMP，避免 QThread 中 vcomp.dll
+// 创建的 Win32 工作线程与 Qt 线程管理冲突导致 segfault。
+#ifdef VBD_NO_OPENMP
+#  undef _OPENMP
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif

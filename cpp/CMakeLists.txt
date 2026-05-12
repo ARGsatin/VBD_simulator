@@ -26,7 +26,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Eigen)
 
 # ── pybind11（优先用 pip 安装的，其次用国内镜像）──
-set(PYBIND11_FINDPYTHON ON)  # 使用现代 FindPython（适配 Python 3.13+）
+set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 2.11 QUIET)
 if(NOT pybind11_FOUND)
     message(STATUS "pybind11 未通过 find_package 找到，从 Gitee 镜像下载 …")
@@ -42,20 +42,33 @@ endif()
 # ── 头文件目录 ──
 set(CPP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# ── 源文件 ──
+# ── 共享源文件 ──
 set(VBD_SOURCES
     src/elastic_energy.cpp
     src/physics_terms.cpp
     src/vbd_solver.cpp
-    bindings/pybind_vbd.cpp
+)
+set(VBD_HEADERS
+    include/types.h
+    include/vbd_solver.h
+    include/elastic_energy.h
+    include/physics_terms.h
 )
 
-# ── pybind11 模块 ──
-pybind11_add_module(hydrogel_vbd_cpp ${VBD_SOURCES})
-
+# ═══════════════════════════════════════════════════════════════════════
+# 标准目标（OpenMP 多线程，用于 CLI/批处理）
+# ═══════════════════════════════════════════════════════════════════════
+pybind11_add_module(hydrogel_vbd_cpp ${VBD_SOURCES} bindings/pybind_vbd.cpp)
 target_include_directories(hydrogel_vbd_cpp PRIVATE ${CPP_INCLUDE_DIR})
-
 target_link_libraries(hydrogel_vbd_cpp PRIVATE Eigen3::Eigen OpenMP::OpenMP_CXX)
-
-# 安装到源目录（以便 Python 导入）
 install(TARGETS hydrogel_vbd_cpp DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+# ═══════════════════════════════════════════════════════════════════════
+# Qt/GUI 安全目标（无 OpenMP，避免 QThread + vcomp.dll segfault）
+# ═══════════════════════════════════════════════════════════════════════
+pybind11_add_module(hydrogel_vbd_cpp_qt ${VBD_SOURCES} bindings/pybind_vbd.cpp)
+target_include_directories(hydrogel_vbd_cpp_qt PRIVATE ${CPP_INCLUDE_DIR})
+target_compile_definitions(hydrogel_vbd_cpp_qt PRIVATE VBD_NO_OPENMP)
+target_link_libraries(hydrogel_vbd_cpp_qt PRIVATE Eigen3::Eigen)
+# 注意：不链接 OpenMP，不加 /openmp 标志
+install(TARGETS hydrogel_vbd_cpp_qt DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src)

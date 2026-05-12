@@ -30,3 +30,6 @@ outputs/
 _debug*.py
 test_stl_fix.py
 _check_deps.py
+
+.claude/
+

@@ -29,6 +29,7 @@ import atexit
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PySide6 import QtCore
@@ -75,6 +76,7 @@ class SimulationWorker(QtCore.QObject):
         use_cpp: bool = True,
     ) -> None:
         super().__init__()
+        self._mesh_original = mesh
         self._mesh = self._deep_copy_mesh(mesh)
         self._config = config
         self._n_layers = int(n_layers)
@@ -273,6 +275,7 @@ class SimulationWorker(QtCore.QObject):
             try:
                 with open(_trace_path, "a", encoding="utf-8") as f:
                     f.write(f"{time.perf_counter():.3f} {msg}\n")
+                    f.flush()
             except Exception:
                 pass
 
@@ -341,6 +344,85 @@ class SimulationWorker(QtCore.QObject):
     # 逐层仿真
     # ───────────────────────────────────────────────────────────
 
+    def _run_cpp_subprocess(self) -> list[LayerResult]:
+        """在子进程中运行 C++ 仿真，逐层返回结果。"""
+        from hydrogel_vbd.solver.cpp_subprocess import (
+            CppSubprocessSolver, _ProgressMsg, _LogMsg,
+            _FrameMsg, _DoneMsg, _ErrorMsg,
+        )
+
+        mesh_dict: dict[str, Any] = {}
+        for attr in (
+            "vertices", "velocities", "prev_vertices", "ideal_vertices",
+            "node_mass", "active_vertex_mask", "is_top_fixed",
+            "is_bottom_surface", "czm_state", "damage", "time_free",
+            "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+            "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+            "is_top_surface_of_layer", "top_ids",
+        ):
+            val = getattr(self._mesh, attr, None)
+            if val is not None:
+                mesh_dict[attr] = val
+
+        config_dict: dict[str, Any] = {}
+        for attr in (
+            "dt", "max_iters", "N_stable", "epsilon", "k_d", "rho_cheb",
+            "mu", "kappa", "c_shrink", "q_ion", "g",
+            "T_max", "K_czm", "delta_f", "node_area",
+            "z_fep", "C_0", "eta", "fluid_radius",
+            "d_min", "d_fluid_max", "t_fluid_max",
+            "v_lift", "layer_thickness", "c_init",
+        ):
+            val = getattr(self._config, attr, None)
+            if val is not None:
+                config_dict[attr] = val
+
+        proc = CppSubprocessSolver(
+            mesh_dict, config_dict,
+            self._n_layers, str(self._output_dir),
+        )
+        proc.start()
+        self._trace("cpp_subprocess_started")
+
+        results: list[LayerResult] = []
+        last_layer = 0
+        try:
+            for msg in proc.iter_messages(timeout=0.2):
+                if isinstance(msg, _LogMsg):
+                    self.log_message.emit(msg.text)
+                elif isinstance(msg, _ProgressMsg):
+                    self.sub_progress.emit(msg.layer, msg.percentage, msg.step)
+                    last_layer = msg.layer
+                elif isinstance(msg, _FrameMsg):
+                    self.frame_ready.emit({
+                        "vertices": msg.vertices,
+                        "tets": msg.tets,
+                        "active_mask": msg.active_mask,
+                        "title": msg.title,
+                    })
+                elif isinstance(msg, _ErrorMsg):
+                    raise RuntimeError(msg.error)
+                elif isinstance(msg, _DoneMsg):
+                    self._trace(f"cpp_done layers={len(msg.results)}")
+                    for r in msg.results:
+                        results.append(LayerResult(
+                            layer_id=r["layer_id"],
+                            total_steps=r["total_steps"],
+                            final_max_dx=r.get("final_max_dx", 0.0),
+                            vertices=None, tets=None, dm_inv=None,
+                        ))
+                    return results
+        except Exception:
+            self._trace(f"cpp_crash_at_layer_{last_layer}")
+            raise
+        finally:
+            proc.terminate()
+
+        raise RuntimeError("C++ 子进程意外结束")
+
+    def _restore_mesh_copy(self) -> None:
+        self._mesh = self._deep_copy_mesh(self._mesh_original)
+
     def _run_layers(self) -> list[LayerResult]:
         """逐层执行 VBD 仿真，渲染降频推送帧数据。
 
@@ -365,9 +447,19 @@ class SimulationWorker(QtCore.QObject):
         )
 
         if self._use_cpp:
-            self.log_message.emit("  [info] 使用 C++ 加速求解器")
-        else:
-            self.log_message.emit("  [info] 使用 Python 参考求解器")
+            self.log_message.emit("  [info] 使用 C++ 加速求解器 (子进程)")
+            self._trace("cpp_subprocess_start")
+            try:
+                results = self._run_cpp_subprocess()
+                self._trace("cpp_subprocess_done")
+                return results
+            except Exception as exc:
+                self._trace(f"cpp_subprocess_failed: {exc}")
+                self.log_message.emit(f"  [warn] C++ 回退 Python: {exc}")
+                self._use_cpp = False
+                self._restore_mesh_copy()
+
+        self.log_message.emit("  [info] 使用 Python 参考求解器")
         solver = PythonReferenceVBDSolver(self._config) if not self._use_cpp else None
         activator = LayerActivator()
         pid = PIDFieldController(self._config)

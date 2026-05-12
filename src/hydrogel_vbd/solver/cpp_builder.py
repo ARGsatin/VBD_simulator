@@ -210,7 +210,7 @@ class CppBuilder:
             result.elapsed_seconds = time.perf_counter() - t0
             return result
 
-        # ── 5. 部署 .pyd 到 src/ ──
+        # ── 5. 部署 .pyd 到 src/（两个目标：标准 + GUI 安全版）──
         emit("[build] 部署 .pyd -> src/ ...")
         pyd_files = list(build_dir.glob("Release/*.pyd"))
         if not pyd_files:
@@ -219,19 +219,19 @@ class CppBuilder:
             result.elapsed_seconds = time.perf_counter() - t0
             return result
 
-        pyd_path = pyd_files[0]
-        dest = self.SRC_DIR / pyd_path.name
-        # 删除旧版本（如有）
-        for old in self.SRC_DIR.glob("hydrogel_vbd_cpp.*.pyd"):
-            try:
-                old.unlink()
-            except OSError:
-                pass
-        shutil.copy2(pyd_path, dest)
-        emit(f"[build]   {pyd_path.name} -> {dest}")
+        for pyd_path in pyd_files:
+            dest = self.SRC_DIR / pyd_path.name
+            # 删除同名旧版本
+            for old in self.SRC_DIR.glob(pyd_path.name):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            shutil.copy2(pyd_path, dest)
+            emit(f"[build]   {pyd_path.name} -> {dest}")
 
         result.success = True
-        result.pyd_path = dest
+        result.pyd_path = self.SRC_DIR / pyd_files[0].name
         result.elapsed_seconds = time.perf_counter() - t0
         emit(f"[build] [OK] 编译成功 ({result.elapsed_seconds:.1f}s)")
         return result

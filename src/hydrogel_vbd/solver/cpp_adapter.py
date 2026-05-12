@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Any
 
@@ -21,12 +22,40 @@ from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
 _CPP_AVAILABLE = False
 _CPP_IMPORT_ERROR: str | None = None
 
-try:
-    import hydrogel_vbd_cpp  # type: ignore[import-untyped]
+# ── QThread 安全：在加载 C++ 模块前禁用 OpenMP 多线程 ──
+# MSVC 的 vcomp.dll 在 QThread 内创建 Win32 工作线程会导致 segfault。
+# OMP_NUM_THREADS 必须在 vcomp.dll 加载前设置（DLL 加载时缓存此值）。
+# 设置 HYDROGEL_VBD_OMP=1 可恢复多线程（CLI/批处理场景）。
+# 默认加载 _qt 变体（无 OpenMP），仅当 HYDROGEL_VBD_OMP=1 时加载标准变体。
+_USE_OMP = os.environ.get("HYDROGEL_VBD_OMP") == "1"
+if not _USE_OMP:
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-    _CPP_AVAILABLE = True
-except ImportError as exc:
-    _CPP_IMPORT_ERROR = str(exc)
+_CPP_AVAILABLE = False
+_CPP_IMPORT_ERROR: str | None = None
+
+if _USE_OMP:
+    # CLI/批处理：加载标准 OpenMP 多线程版本
+    try:
+        import hydrogel_vbd_cpp  # type: ignore[import-untyped]
+        _CPP_AVAILABLE = True
+        _CPP_MODULE_NAME = "hydrogel_vbd_cpp"
+    except ImportError as exc:
+        _CPP_IMPORT_ERROR = str(exc)
+else:
+    # GUI：优先加载无 OpenMP 版本（QThread 安全），回退到标准版本
+    try:
+        import hydrogel_vbd_cpp_qt as _cpp_mod  # type: ignore[import-untyped]
+        hydrogel_vbd_cpp = _cpp_mod  # 统一别名
+        _CPP_AVAILABLE = True
+        _CPP_MODULE_NAME = "hydrogel_vbd_cpp_qt"
+    except ImportError:
+        try:
+            import hydrogel_vbd_cpp  # type: ignore[import-untyped]
+            _CPP_AVAILABLE = True
+            _CPP_MODULE_NAME = "hydrogel_vbd_cpp"
+        except ImportError as exc:
+            _CPP_IMPORT_ERROR = str(exc)
 
 
 def is_cpp_available() -> bool:
@@ -50,19 +79,40 @@ def refresh_availability() -> bool:
     bool
         True 表示 C++ 模块当前可用。
     """
-    global _CPP_AVAILABLE, _CPP_IMPORT_ERROR
+    global _CPP_AVAILABLE, _CPP_IMPORT_ERROR, hydrogel_vbd_cpp
     import importlib
 
-    try:
-        if "hydrogel_vbd_cpp" in sys.modules:
-            importlib.reload(sys.modules["hydrogel_vbd_cpp"])
-        else:
-            import hydrogel_vbd_cpp  # type: ignore[import-untyped]
-        _CPP_AVAILABLE = True
-        _CPP_IMPORT_ERROR = None
-    except ImportError as exc:
-        _CPP_AVAILABLE = False
-        _CPP_IMPORT_ERROR = str(exc)
+    if _USE_OMP:
+        try:
+            if "hydrogel_vbd_cpp" in sys.modules:
+                importlib.reload(sys.modules["hydrogel_vbd_cpp"])
+            else:
+                import hydrogel_vbd_cpp
+            _CPP_AVAILABLE = True
+            _CPP_IMPORT_ERROR = None
+            _CPP_MODULE_NAME = "hydrogel_vbd_cpp"
+        except ImportError as exc:
+            _CPP_AVAILABLE = False
+            _CPP_IMPORT_ERROR = str(exc)
+    else:
+        try:
+            if "hydrogel_vbd_cpp_qt" in sys.modules:
+                importlib.reload(sys.modules["hydrogel_vbd_cpp_qt"])
+            else:
+                import hydrogel_vbd_cpp_qt as _cpp_mod
+            hydrogel_vbd_cpp = _cpp_mod  # 统一别名
+            _CPP_AVAILABLE = True
+            _CPP_IMPORT_ERROR = None
+            _CPP_MODULE_NAME = "hydrogel_vbd_cpp_qt"
+        except ImportError:
+            try:
+                import hydrogel_vbd_cpp
+                _CPP_AVAILABLE = True
+                _CPP_IMPORT_ERROR = None
+                _CPP_MODULE_NAME = "hydrogel_vbd_cpp"
+            except ImportError as exc:
+                _CPP_AVAILABLE = False
+                _CPP_IMPORT_ERROR = str(exc)
     return _CPP_AVAILABLE
 
 
@@ -99,6 +149,92 @@ def _build_cpp_config(cfg: SimulationConfig) -> Any:
     return cpp_cfg
 
 
+# ── 数组校验（在传给 C++ Eigen::Map 前检查，防止静默崩溃）──
+
+def _check_shape(name: str, arr: np.ndarray, expected: tuple) -> None:
+    if arr.shape != expected:
+        raise ValueError(f"{name}: expected shape {expected}, got {arr.shape}")
+
+
+def _check_contiguous(name: str, arr: np.ndarray) -> None:
+    if not arr.flags["C_CONTIGUOUS"]:
+        raise ValueError(
+            f"{name} is not C-contiguous (strides={arr.strides}). "
+            f"Use np.ascontiguousarray() before passing to C++."
+        )
+
+
+def _validate_arrays(
+    vertices: np.ndarray,
+    velocities: np.ndarray,
+    masses: np.ndarray,
+    active_vertex_mask: np.ndarray,
+    is_top_fixed: np.ndarray,
+    is_bottom_surface: np.ndarray,
+    czm_state: np.ndarray,
+    damage: np.ndarray,
+    time_free: np.ndarray,
+    tets: np.ndarray,
+    active_tet_mask: np.ndarray,
+    dm_inv: np.ndarray,
+    tet_volumes: np.ndarray,
+    colors: np.ndarray,
+) -> tuple[int, int]:
+    """校验所有传入 C++ 的数组，防止 Eigen::Map 静默崩溃。
+
+    Returns (nV, nT) on success.
+    """
+    nV = vertices.shape[0]
+    nT = tets.shape[0]
+
+    # ── 形状一致性 ──
+    _check_shape("vertices", vertices, (nV, 3))
+    _check_shape("velocities", velocities, (nV, 3))
+    _check_shape("masses", masses, (nV,))
+    _check_shape("active_vertex_mask", active_vertex_mask, (nV,))
+    _check_shape("is_top_fixed", is_top_fixed, (nV,))
+    _check_shape("is_bottom_surface", is_bottom_surface, (nV,))
+    _check_shape("czm_state", czm_state, (nV,))
+    _check_shape("damage", damage, (nV,))
+    _check_shape("time_free", time_free, (nV,))
+    _check_shape("tets", tets, (nT, 4))
+    _check_shape("active_tet_mask", active_tet_mask, (nT,))
+    _check_shape("tet_volumes", tet_volumes, (nT,))
+    _check_shape("colors", colors, (nV,))
+    # dm_inv: (T,3,3) 和 (T,9) 内存布局等价，都接受
+    if dm_inv.ndim == 3:
+        if dm_inv.shape != (nT, 3, 3):
+            raise ValueError(f"dm_inv shape must be ({nT}, 3, 3), got {dm_inv.shape}")
+    elif dm_inv.ndim == 2:
+        if dm_inv.shape != (nT, 9):
+            raise ValueError(f"dm_inv shape must be ({nT}, 9), got {dm_inv.shape}")
+    else:
+        raise ValueError(f"dm_inv must be 2D or 3D, got {dm_inv.ndim}D")
+
+    # ── C 连续检查（Eigen::Map<..., RowMajor> 要求）──
+    for name, arr in [
+        ("vertices", vertices), ("velocities", velocities),
+        ("masses", masses), ("active_vertex_mask", active_vertex_mask),
+        ("is_top_fixed", is_top_fixed), ("is_bottom_surface", is_bottom_surface),
+        ("czm_state", czm_state), ("damage", damage),
+        ("time_free", time_free), ("tets", tets),
+        ("active_tet_mask", active_tet_mask),
+        ("dm_inv", dm_inv), ("tet_volumes", tet_volumes),
+        ("colors", colors),
+    ]:
+        _check_contiguous(name, arr)
+
+    # 可写 float64 数组（C++ 原地修改，dtype 不可静默转换）
+    for name, arr in [
+        ("vertices", vertices), ("velocities", velocities),
+        ("damage", damage), ("time_free", time_free),
+    ]:
+        if arr.dtype != np.float64:
+            raise TypeError(f"{name} must be float64 (C++ writes in-place), got {arr.dtype}")
+
+    return nV, nT
+
+
 def solve_until_stable(
     mesh: MeshState,
     config: SimulationConfig,
@@ -128,6 +264,22 @@ def solve_until_stable(
             f"导入错误: {_CPP_IMPORT_ERROR}"
         )
 
+    # ── 预检：数组 shape/contiguity ──
+    _validate_arrays(
+        mesh.vertices, mesh.velocities, mesh.masses,
+        mesh.active_vertex_mask, mesh.is_top_fixed,
+        mesh.is_bottom_surface.astype(bool),
+        mesh.czm_state, mesh.damage, mesh.time_free,
+        mesh.tets, mesh.active_tet_mask,
+        mesh.dm_inv, mesh.tet_volumes, mesh.colors,
+    )
+
+    # ── Dtype 标准化（numpy 默认 int64，但 C++ 需要 int32/bool）──
+    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
+    _czm = np.ascontiguousarray(mesh.czm_state, dtype=np.int32)
+    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
+    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
+
     cpp_cfg = _build_cpp_config(config)
 
     result_dict = hydrogel_vbd_cpp.solve_until_stable(
@@ -137,15 +289,15 @@ def solve_until_stable(
         mesh.masses,
         mesh.active_vertex_mask,
         mesh.is_top_fixed,
-        mesh.is_bottom_surface.astype(bool),
-        mesh.czm_state,
+        _bs,
+        _czm,
         mesh.damage,
         mesh.time_free,
-        mesh.tets,
+        _tets,
         mesh.active_tet_mask,
         mesh.dm_inv,
         mesh.tet_volumes,
-        mesh.colors,
+        _colors,
         cpp_cfg,
         e_z,
         layer_id,
@@ -195,8 +347,24 @@ def solve_lift_and_relax(
             f"导入错误: {_CPP_IMPORT_ERROR}"
         )
 
+    # ── 预检：数组 shape/contiguity ──
+    _validate_arrays(
+        mesh.vertices, mesh.velocities, mesh.masses,
+        mesh.active_vertex_mask, mesh.is_top_fixed,
+        mesh.is_bottom_surface.astype(bool),
+        mesh.czm_state, mesh.damage, mesh.time_free,
+        mesh.tets, mesh.active_tet_mask,
+        mesh.dm_inv, mesh.tet_volumes, mesh.colors,
+    )
+
+    # ── Dtype 标准化（numpy 默认 int64，C++ 需要 int32/bool）──
+    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
+    _czm = np.ascontiguousarray(mesh.czm_state, dtype=np.int32)
+    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
+    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
+
     cpp_cfg = _build_cpp_config(config)
-    lifting_top_list = lifting_top.astype(int).tolist()
+    lifting_top_list = [int(x) for x in lifting_top]
 
     result_dict = hydrogel_vbd_cpp.solve_lift_and_relax(
         mesh.vertices,
@@ -205,15 +373,15 @@ def solve_lift_and_relax(
         mesh.masses,
         mesh.active_vertex_mask,
         mesh.is_top_fixed,
-        mesh.is_bottom_surface.astype(bool),
-        mesh.czm_state,
+        _bs,
+        _czm,
         mesh.damage,
         mesh.time_free,
-        mesh.tets,
+        _tets,
         mesh.active_tet_mask,
         mesh.dm_inv,
         mesh.tet_volumes,
-        mesh.colors,
+        _colors,
         cpp_cfg,
         e_z,
         layer_id,

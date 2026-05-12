@@ -22,19 +22,19 @@ try:
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    # ── 中文字体配置 ──
-    _CJK_FONT = None
-    for _fp in font_manager.fontManager.ttflist:
-        if "YaHei" in _fp.name or "SimHei" in _fp.name:
-            _CJK_FONT = _fp.name
-            break
-    if _CJK_FONT is None:
-        for _fp in font_manager.fontManager.ttflist:
-            if "Hei" in _fp.name or "Song" in _fp.name or "Ming" in _fp.name:
-                _CJK_FONT = _fp.name
-                break
-    if _CJK_FONT is not None:
-        matplotlib.rcParams["font.family"] = _CJK_FONT
+    # ── 中文字体配置（按文件路径注册）──
+    import pathlib as _pl
+    for _fp in (
+        _pl.Path("C:/Windows/Fonts/msyh.ttc"),
+        _pl.Path("C:/Windows/Fonts/simhei.ttf"),
+        _pl.Path("C:/Windows/Fonts/simsun.ttc"),
+    ):
+        if _fp.exists():
+            font_manager.fontManager.addfont(str(_fp))
+    matplotlib.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei", "SimHei",
+    ] + matplotlib.rcParams["font.sans-serif"]
+    matplotlib.rcParams["font.family"] = "sans-serif"
     matplotlib.rcParams["axes.unicode_minus"] = False
 except ImportError:
     raise ImportError(
