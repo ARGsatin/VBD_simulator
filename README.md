@@ -75,8 +75,8 @@ VBD_simulator/
 │   │   └── tet_mesher.py              # STL → 四面体网格（TetGen，轻量替代方案）
 │   │
 │   ├── gui/                           # 图形界面（PySide6）
-│   │   ├── main_window.py             # 主窗口
-│   │   ├── mesh_viewer.py             # 网格可视化组件
+│   │   ├── main_window.py             # 主窗口（4 步工作流 + 自动编译集成）
+│   │   ├── mesh_viewer.py             # 3D 网格可视化（matplotlib 工具栏 + 边界面提取）
 │   │   └── simulation_worker.py       # 仿真工作线程（QThread）
 │   │
 │   ├── io/                            # 输入输出模块
@@ -87,6 +87,8 @@ VBD_simulator/
 │   │
 │   └── solver/                        # 求解器模块
 │       ├── constraints.py             # 约束处理（狄利克雷边界）
+│       ├── cpp_adapter.py             # C++ 求解器适配层（自动检测/降级）
+│       ├── cpp_builder.py             # C++ 自动编译模块（一键构建）
 │       ├── graph_coloring.py          # 图着色（VBD 顶点分组）
 │       └── vbd_solver.py              # VBD 主求解器（Chebyshev 半隐式）
 │
@@ -113,6 +115,7 @@ VBD_simulator/
 │   ├── test_lift_and_gui.py
 │   ├── test_models_solver_control.py
 │   ├── test_multiphysics_vbd_pid.py
+│   ├── test_numerical_guards.py        # 数值鲁棒性测试（NaN/Inf 防护）
 │   ├── test_package_and_configs.py
 │   └── test_state_and_activation.py
 │
@@ -146,7 +149,7 @@ VBD_simulator/
 | **求解器** | `dt`, `epsilon`, `max_iters`, `N_stable` | 时间步长、收敛容差、最大迭代 |
 | **PID 控制** | `c_init`, `err_target`, `K_p`, `K_i`, `K_d` | 初始固化度、目标误差、PID 增益 |
 | **电场** | `q_ion`, `E_max` | 离子电荷密度、最大电场强度 |
-| **打印工艺** | `layer_thickness`, `z_fep`, `v_lift` | 层厚、离型膜位置、提升速度 |
+| **打印工艺** | `layer_thickness`, `z_fep`, `v_lift`, `build_axis` | 层厚、离型膜位置、提升速度、构建方向（0=X/1=Y/2=Z） |
 
 ---
 
@@ -155,7 +158,10 @@ VBD_simulator/
 ### 环境要求
 
 - Python **3.10+**
-- 依赖包：`numpy`, `scipy`, `trimesh`, `pyvista`, `pyside6`, `pyyaml`, `pytest`
+- 核心依赖：`numpy`, `matplotlib`, `scipy>=1.9`, `trimesh`, `rtree`
+- GUI（可选）：`pyside6`
+- 网格生成（可选）：`gmsh>=4.11`
+- C++ 加速（可选）：MSVC 2022 + CMake ≥ 3.18 + pybind11
 
 ### 安装
 
@@ -229,18 +235,80 @@ layer_id, err_avg, E_z, PID_integral, kinetic_energy, stable_steps, max_dx, all_
 ## 🔌 C++ 加速模块
 
 项目包含可选的 C++17/Eigen/pybind11 加速核心，可将关键计算路径加速数十倍。
+编译后的 `.pyd` 模块会被 Python 自动加载；若未编译则透明回退到纯 Python 实现。
 
-### 编译
+### 环境依赖（编译所需）
 
-```powershell
-cd cpp
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-cmake --install .
+| 工具 | 版本要求 | 安装方式 |
+|------|----------|----------|
+| **MSVC 编译器** | VS 2022 (v19.4+) | [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)，勾选"使用 C++ 的桌面开发"工作负载 |
+| **CMake** | ≥ 3.18 | `winget install Kitware.CMake` 或 [cmake.org](https://cmake.org/download/) |
+| **Python 开发库** | 3.10+ | 随 Python 安装包自带（`python.org` 版本已包含 `python3.lib`） |
+| **pybind11** | ≥ 2.11 | `pip install pybind11`（编译前会自动安装） |
+| **Eigen** | 3.4.0 | CMake 自动从 GitLab 下载（无需手动安装） |
+| **OpenMP** | 随 MSVC 附带 | MSVC 编译器自带的 `/openmp` 支持 |
+
+> **注意**：使用 `python.org` 安装的 Python 即可正常编译。避免使用 Microsoft Store 版 Python（缺少 `python3.lib` 可能导致链接失败）。
+
+### 自动编译（推荐）
+
+点击 GUI 的 **"运行仿真"** 按钮时，系统会自动检测 C++ 模块是否已编译：
+
+1. **若 .pyd 存在** → 直接加载 C++ 加速求解器，日志显示 `[info] 使用 C++ 加速求解器`
+2. **若 .pyd 不存在但编译工具就绪** → 自动在后台线程执行 `cmake configure + build`，日志实时输出编译进度，完成后自动继续仿真
+3. **若缺少编译工具** → 日志提示缺失项（如 "未找到 MSVC 编译器"），回退到 Python 参考求解器
+
+```text
+# 自动编译时的 GUI 日志示例
+[build] C++ 求解器未编译，开始自动编译 …
+[build] 前置条件就绪，正在后台编译 …
+[build]   检查 pybind11 ... [OK]
+[build]   cmake configure ... [OK]
+[build]   cmake build (Release) ...
+[build]   部署 .pyd -> src/ ...
+[build] ✓ 编译成功 (37.0s)
+[info] 使用 C++ 加速求解器
 ```
 
-编译后，Python 端会自动检测并使用 C++ 加速版本；若未检测到则回退到纯 Python 实现。
+### 手动编译
+
+如需手动编译（例如调试构建或更换编译器），执行以下命令：
+
+```powershell
+# 确保已在项目 venv 中
+venv\Scripts\activate
+pip install pybind11
+
+# 进入 cpp 目录，创建 build 子目录
+cd cpp
+rm -r -force build          # 清理旧构建（如有）
+mkdir build && cd build
+
+# CMake 配置（指定 Visual Studio 2022 生成器 + x64 架构）
+cmake .. -G "Visual Studio 17 2022" -A x64 `
+  -Dpybind11_DIR="$env:VIRTUAL_ENV\Lib\site-packages\pybind11\share\cmake\pybind11" `
+  -DPython_ROOT_DIR="$env:VIRTUAL_ENV"
+
+# 编译 Release 版本
+cmake --build . --config Release
+
+# 将产物复制到 src/ 目录（Python 自动发现）
+copy Release\hydrogel_vbd_cpp.*.pyd ..\src\
+```
+
+编译成功后，产物为 `src/hydrogel_vbd_cpp.cp3XX-win_amd64.pyd`（`cp3XX` 对应 Python 版本）。
+
+### 踩坑记录
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| pybind11 下载超时 | GitHub `git clone` 在墙内不稳定 | CMakeLists 已配置 Gitee 镜像 + `find_package` 回退 |
+| SHA256 哈希不匹配 | GitLab 重新生成 tarball | 去掉 `URL_HASH` 校验 |
+| `Eigen::Map` 类型错误 | 函数签名要求 `Map` 但传入 `Matrix` | 改用 `Eigen::Ref`（兼容 Matrix/Map） |
+| CMake 找到 MSYS2 Python | PATH 中 MSYS2 优先级高于 venv | 显式指定 `-DPython_ROOT_DIR` |
+| Python 库未找到 | pybind11 旧版 `FindPythonLibs` 不支持 3.13 | 设置 `PYBIND11_FINDPYTHON ON` 使用现代 FindPython |
+| `.pyd` 无法导入 | 模块名 `vbd_solver_cpp` 与 Python 端 `hydrogel_vbd_cpp` 不一致 | 统一使用 `hydrogel_vbd_cpp` |
+| Unicode 编码错误 | cmake 输出含中文，GBK 无法解码 | subprocess 显式 `encoding="utf-8", errors="replace"` |
 
 ---
 
@@ -251,7 +319,11 @@ cmake --install .
 - **模块化**：每个物理效应为独立的力模块，易于扩展和替换
 - **配置驱动**：所有参数集中于 `config.yaml`，便于调参和复现
 - **Python 优先**：参考实现用 Python 编写，接口为 C++ 移植预留
+<<<<<<< HEAD
 - **测试覆盖**：测试覆盖核心路径（状态管理、求解收敛、力向量、IO 往返）
+=======
+- **测试覆盖**：31 个测试覆盖核心路径（状态管理、求解收敛、力向量、IO 往返、数值稳定性）
+>>>>>>> origin/main
 
 ### 关键类
 
@@ -270,10 +342,17 @@ cmake --install .
 
 - **语言**：Python 3.10+（核心），C++17（加速）
 - **数值计算**：NumPy, SciPy
+<<<<<<< HEAD
 - **网格处理**：trimesh, PyVista, Gmsh, TetGen
 - **GUI**：PySide6（Qt for Python）
 - **C++ 绑定**：pybind11
+=======
+- **网格处理**：trimesh, PyVista
+- **GUI**：PySide6（Qt for Python），含自动编译集成
+- **C++ 绑定**：pybind11，支持编译后热加载
+>>>>>>> origin/main
 - **线性代数**：Eigen 3.4（C++ 端）
+- **构建系统**：CMake + MSBuild，GUI 内一键自动编译
 - **测试**：pytest
 
 ---

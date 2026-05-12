@@ -109,9 +109,17 @@ def neo_hookean_energy_density(
     I_c = float(np.trace(F.T @ F))  # 右 Cauchy-Green 第一不变量
     J = float(np.linalg.det(F))     # 体积比
 
-    # 翻转单元 → 二次惩罚
-    if J <= 1e-12:
+    # 翻转/近零体积 → 二次惩罚（提高阈值到 1e-10 提前捕获）
+    if J <= 1e-10:
         return inverted_penalty * (1.0 - J) ** 2
+
+    # 低 J 区域 smooth blend，消除能量梯度不连续
+    if J < 1e-8:
+        t = J / 1e-8  # 0→1 的 blend 因子
+        log_J_safe = float(np.log(1e-8))
+        psi_physical = 0.5 * mu * (I_c - 3.0) - mu * log_J_safe + 0.5 * lam * log_J_safe ** 2
+        psi_penalty = inverted_penalty * (1.0 - J) ** 2
+        return t * psi_physical + (1.0 - t) * psi_penalty
 
     log_J = float(np.log(J))
     return 0.5 * mu * (I_c - 3.0) - mu * log_J + 0.5 * lam * log_J ** 2
@@ -220,30 +228,21 @@ def neo_hookean_material_tangent_9x9(
     log_J = float(np.log(J))
     coeff = lam * log_J - mu     # (λ ln(J) - μ)
 
-    C = np.zeros((9, 9), dtype=np.float64)
+    # ── 向量化 9×9 材料切线模量 ──
+    # C_{(i,j),(k,l)} = term1 + term2 + term3
+    #   term1: μ · δ_{ik} · δ_{jl}
+    #   term2: (λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
+    #   term3: λ · F^{-T}_{ij} · F^{-T}_{kl}
+    C = mu * np.eye(9, dtype=np.float64)
 
-    # 嵌套循环构建 9×9 矩阵
-    # row = i*3 + j  → F 的 (i,j) 分量
-    # col = k*3 + l_ → F 的 (k,l_) 分量
-    for i in range(3):
-        for j in range(3):
-            row = i * 3 + j
-            for k in range(3):
-                for l_ in range(3):
-                    col = k * 3 + l_
-                    val = 0.0
+    # term2: coeff * FinvT[i,l] * FinvT[k,j] = coeff * FinvT[i,l] * FinvT^T[j,k]
+    # 使用 broadcasting 构建 4D tensor [i,j,k,l] 后 reshape 为 9×9
+    C_4d_t2 = coeff * FinvT[:, None, None, :] * FinvT.T[None, :, :, None]
+    C += C_4d_t2.reshape(9, 9)
 
-                    # 项 1：μ · δ_{ik} · δ_{jl}
-                    if i == k and j == l_:
-                        val += mu
-
-                    # 项 2：(λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
-                    val += coeff * FinvT[i, l_] * FinvT[k, j]
-
-                    # 项 3：λ · F^{-T}_{ij} · F^{-T}_{kl}
-                    val += lam * FinvT[i, j] * FinvT[k, l_]
-
-                    C[row, col] = val
+    # term3: lam * FinvT[i,j] * FinvT[k,l] = lam * outer(vec(F^{-T}), vec(F^{-T}))
+    a_flat = FinvT.ravel()
+    C += lam * np.outer(a_flat, a_flat)
 
     return C
 
@@ -324,18 +323,13 @@ def compute_tet_force_and_hessian_contributions(
 
     # ── 步骤 4：组装局部 Hessian 对角块 ──
     # H_aa[p,q] = V₀ · Σ_{n,s} C_{(p,n),(q,s)} · g_a^n · g_a^s
-    # 只保留每个顶点的 3×3 对角块（VBD Gauss-Seidel 框架所需）
+    # 将 C_9x9 重塑为 (3,3,3,3) [p, n, q, s]，用 einsum 向量化
+    C_reshaped = C_9x9.reshape(3, 3, 3, 3)  # [p, n, q, s]
     hessian = np.zeros((4, 3, 3), dtype=np.float64)
     for a in range(4):
-        for p in range(3):
-            for q in range(3):
-                val = 0.0
-                for n in range(3):
-                    for s in range(3):
-                        row_idx = p * 3 + n  # C 矩阵的 (p,n) 行
-                        col_idx = q * 3 + s  # C 矩阵的 (q,s) 列
-                        val += C_9x9[row_idx, col_idx] * g[a, n] * g[a, s]
-                hessian[a, p, q] = rest_volume * val
+        hessian[a] = rest_volume * np.einsum(
+            'n,pnsq,s->pq', g[a], C_reshaped, g[a]
+        )
 
     return forces, hessian
 

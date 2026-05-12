@@ -134,26 +134,28 @@ def update_czm_states(
         state = CZMState(int(mesh.czm_state[node_id]))
 
         if state == CZMState.FIXED:
-            # ── 检查是否达到强度极限 ──
-            # 应力 = pull_z / area，超过 T_max 进入损伤
-            if pulls[local_idx] / max(float(area), 1e-12) >= float(t_max):
+            # ── 弹性牵引力准则（与 C++ 对齐）──
+            # FIXED→DAMAGING 当 gap > delta_f 或弹性牵引力 > 强度
+            gap = max(float(mesh.vertices[node_id, 2] - z_fep), 0.0)
+            traction = k_czm * gap
+            if gap > delta_f or traction > t_max:
                 mesh.czm_state[node_id] = CZMState.DAMAGING
+                mesh.damage[node_id] = 0.0
 
         elif state == CZMState.DAMAGING:
-            # ── 损伤演化 ──
+            # ── 率相关损伤累积（与 C++ 对齐）──
             gap = max(float(mesh.vertices[node_id, 2] - z_fep), 0.0)
-            # 线性损伤累积：D ∝ gap · T_max / (δ_f · k_czm)
-            damage = max(
-                float(mesh.damage[node_id]),
-                (gap / max(delta_f, 1e-12)) * (t_max / max(k_czm, 1e-12)),
-            )
-            if gap >= delta_f:
-                damage = 1.0  # 超过完全破坏位移，直接完全损伤
-            mesh.damage[node_id] = float(np.clip(damage, 0.0, 1.0))
+            pull = abs(float(pulls[local_idx]))
+            dmg_rate = min(1.0, pull * dt / (t_max * delta_f)) if pull > 0 else 0.0
+            mesh.damage[node_id] = float(min(
+                1.0, float(mesh.damage[node_id]) + dmg_rate
+            ))
 
-            # ── 完全脱粘判定 ──
-            if gap >= delta_f or mesh.damage[node_id] >= 1.0:
+            # ── 完全脱粘判定（与 C++ 对齐：gap > 5·δ_f）──
+            if mesh.damage[node_id] >= 1.0 or gap > 5.0 * delta_f:
                 mesh.czm_state[node_id] = CZMState.FREE
+                mesh.damage[node_id] = 1.0
+                mesh.time_free[node_id] = 0.0
 
         elif state == CZMState.FREE:
             # ── 累计自由状态存活时间 ──

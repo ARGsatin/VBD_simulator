@@ -87,36 +87,54 @@ def build_local_physics_terms(
     e_z: float,
     x_prev: np.ndarray,
 ) -> LocalPhysicsTerms:
-    """组装当前时间步的所有局部物理贡献。
+    """组装当前时间步的所有局部物理贡献（每次分配新数组）。"""
+    force = np.zeros_like(mesh.vertices)
+    hessian = np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float)
+    _assemble_physics_terms(mesh, config, e_z, x_prev, force, hessian)
+    return LocalPhysicsTerms(force=force, hessian=hessian)
 
-    这是每个时间步的**核心力计算函数**，按如下顺序累加各物理项的
-    贡献到节点的力向量和对角块 Hessian：
 
-    1. **体积力**（重力 + 电场力）→ 直接按节点质量 / 电荷累加
-    2. **Neo-Hookean 超弹性** → 遍历所有活动四面体，
-       调用 ``compute_tet_force_and_hessian_contributions``
-       将力与 Hessian 分散到四面体的 4 个节点
-    3. **CZM 粘聚区损伤力** → 对底面 DAMAGING 节点施加软化牵引力
-    4. **流体挤压流拖曳** → 对底面 FREE 节点施加间隙相关阻尼力
+def update_local_physics_terms(
+    mesh: MeshState,
+    config: SimulationConfig,
+    e_z: float,
+    x_prev: np.ndarray,
+    out_force: np.ndarray,
+    out_hessian: np.ndarray,
+) -> None:
+    """组装物理贡献到预分配的输出数组中（零新分配）。
+
+    与 ``build_local_physics_terms`` 功能相同，但复用已分配的数组，
+    避免每迭代一次就分配一次大数组。
 
     Parameters
     ----------
     mesh : MeshState
-        当前网格状态（顶点、四面体、CZM 状态、掩码等）。
     config : SimulationConfig
-        全局仿真参数（材料常数、CZM 参数、流体参数等）。
     e_z : float
-        当前 z 方向电场强度（V/m），来自 PID 控制器。
-    x_prev : np.ndarray, shape (N, 3)
-        上一时间步的顶点坐标（用于计算挤压流速度）。
-
-    Returns
-    -------
-    LocalPhysicsTerms
-        组装完成的力向量和 Hessian 对角块。
+    x_prev : np.ndarray
+    out_force : np.ndarray, shape (N, 3)
+        预分配的力数组，原地修改。
+    out_hessian : np.ndarray, shape (N, 3, 3)
+        预分配的 Hessian 数组，原地修改。
     """
-    force = np.zeros_like(mesh.vertices)
-    hessian = np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float)
+    out_force.fill(0.0)
+    out_hessian.fill(0.0)
+    _assemble_physics_terms(mesh, config, e_z, x_prev, out_force, out_hessian)
+
+
+def _assemble_physics_terms(
+    mesh: MeshState,
+    config: SimulationConfig,
+    e_z: float,
+    x_prev: np.ndarray,
+    force: np.ndarray,
+    hessian: np.ndarray,
+) -> None:
+    """组装当前时间步的所有局部物理贡献到预分配的数组中。
+
+    这是每个时间步的**核心力计算函数**。
+    """
     active = mesh.active_vertex_mask
     masses = mesh.masses
     g = np.asarray(config.g, dtype=float)
@@ -178,8 +196,9 @@ def build_local_physics_terms(
             gap = max(float(mesh.vertices[node_id, 2] - config.z_fep), config.d_min)
             if gap < config.d_fluid_max and mesh.time_free[node_id] < config.t_fluid_max:
                 v_z_imp = float(mesh.vertices[node_id, 2] - x_prev[node_id, 2]) / max(config.dt, 1e-12)
-                coeff = config.C_0 * config.eta * (config.fluid_radius**4) / (gap**3)
+                coeff = min(
+                    config.C_0 * config.eta * (config.fluid_radius**4) / (gap**3),
+                    1e12  # 防止 squeeze-film 1/gap³ 奇点溢出
+                )
                 force[node_id, 2] -= coeff * v_z_imp
                 hessian[node_id, 2, 2] += coeff / max(config.dt, 1e-12)
-
-    return LocalPhysicsTerms(force=force, hessian=hessian)

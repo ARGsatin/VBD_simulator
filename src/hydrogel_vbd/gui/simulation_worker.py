@@ -340,8 +340,18 @@ class SimulationWorker(QtCore.QObject):
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
         from hydrogel_vbd.control.field_controller import PIDFieldController
         from hydrogel_vbd.physics.czm import update_czm_states
+        from hydrogel_vbd.solver.cpp_adapter import (
+            is_cpp_available,
+            solve_until_stable as cpp_solve_until_stable,
+            solve_lift_and_relax as cpp_solve_lift_and_relax,
+        )
 
-        solver = PythonReferenceVBDSolver(self._config)
+        _use_cpp = is_cpp_available()
+        if _use_cpp:
+            self.log_message.emit("  [info] 使用 C++ 加速求解器")
+        else:
+            self.log_message.emit("  [info] 使用 Python 参考求解器")
+        solver = PythonReferenceVBDSolver(self._config) if not _use_cpp else None
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
 
@@ -376,18 +386,20 @@ class SimulationWorker(QtCore.QObject):
             if top_ids is not None and len(top_ids) > 0:
                 # ── 带提升的控制反转循环 ──
                 while lift_distance < lift_max and not self._stop_flag:
-                    # 调用 Python 求解器的 solve_with_lift（单次提升 + 静平衡）
-                    # 注：若使用 C++ 加速，此处改为调用
-                    #     vbd_solver_cpp.solve_lift_and_relax(...)
-                    result = solver.solve_with_lift(
-                        self._mesh,
-                        layer_id=layer_id,
-                        e_z=e_z,
-                        lifting_top=top_ids,
-                        on_iteration=lambda it, dx: self._on_solver_iteration(
-                            layer_id, it, dx, step_counter
-                        ),
-                    )
+                    if _use_cpp:
+                        result = cpp_solve_lift_and_relax(
+                            self._mesh, self._config, e_z, layer_id, top_ids
+                        )
+                    else:
+                        result = solver.solve_with_lift(
+                            self._mesh,
+                            layer_id=layer_id,
+                            e_z=e_z,
+                            lifting_top=top_ids,
+                            on_iteration=lambda it, dx: self._on_solver_iteration(
+                                layer_id, it, dx, step_counter
+                            ),
+                        )
 
                     step_counter += result.iterations
                     lift_distance += self._config.v_lift * self._config.dt
@@ -441,14 +453,19 @@ class SimulationWorker(QtCore.QObject):
                     )
             else:
                 # ── 无提升：直接静平衡求解 ──
-                result = solver.solve_until_stable(
-                    self._mesh,
-                    layer_id=layer_id,
-                    e_z=e_z,
-                    on_iteration=lambda it, dx: self._on_solver_iteration(
-                        layer_id, it, dx, step_counter
-                    ),
-                )
+                if _use_cpp:
+                    result = cpp_solve_until_stable(
+                        self._mesh, self._config, e_z, layer_id
+                    )
+                else:
+                    result = solver.solve_until_stable(
+                        self._mesh,
+                        layer_id=layer_id,
+                        e_z=e_z,
+                        on_iteration=lambda it, dx: self._on_solver_iteration(
+                            layer_id, it, dx, step_counter
+                        ),
+                    )
                 step_counter += result.iterations
 
                 # ── 更新 CZM ──
