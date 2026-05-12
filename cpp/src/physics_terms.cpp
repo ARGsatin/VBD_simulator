@@ -64,7 +64,10 @@ void build_local_physics_terms(
                       mesh.dm_inv(tet_id, 3), mesh.dm_inv(tet_id, 4), mesh.dm_inv(tet_id, 5),
                       mesh.dm_inv(tet_id, 6), mesh.dm_inv(tet_id, 7), mesh.dm_inv(tet_id, 8);
 
-        double rest_vol = mesh.tet_volumes(tet_id) * std::pow(cfg.c_shrink, 3);
+        // 主动收缩：将 dm_inv 整体除以 c_shrink，使 F = Ds·(Dm^{-1}/c_shrink)
+        // 从而在变形梯度中产生基准收缩预应力（而非仅修改体积）
+        dm_inv_tet /= cfg.c_shrink;
+        double rest_vol = mesh.tet_volumes(tet_id);
 
         try {
             compute_tet_force_and_hessian_contributions(

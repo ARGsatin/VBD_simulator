@@ -105,8 +105,8 @@ static py::dict solve_until_stable_py(
     return out;
 }
 
-// solve_with_lift 包装
-static py::dict solve_with_lift_py(
+// solve_lift_and_relax 包装（单步提升 + 单次静平衡）
+static py::dict solve_lift_and_relax_py(
     py::array_t<double> vertices_in,
     py::array_t<double> velocities,
     py::array_t<double> ideal_vertices,
@@ -184,7 +184,7 @@ static py::dict solve_with_lift_py(
         tet_map, at_map, dmi_map, tv_map,
         col_map);
 
-    VBDSolveResult result = vbd::solve_with_lift(mesh, cfg, e_z, layer_id, lifting_top);
+    VBDSolveResult result = vbd::solve_lift_and_relax(mesh, cfg, e_z, layer_id, lifting_top);
 
     py::dict out;
     out["max_dx"] = result.max_dx;
@@ -243,7 +243,7 @@ PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
           py::arg("config"), py::arg("e_z"), py::arg("layer_id"),
           "Solve VBD until static equilibrium");
 
-    m.def("solve_with_lift", &solve_with_lift_py,
+    m.def("solve_lift_and_relax", &solve_lift_and_relax_py,
           py::arg("vertices"), py::arg("velocities"), py::arg("ideal_vertices"),
           py::arg("masses"), py::arg("active_mask"), py::arg("is_top_fixed"),
           py::arg("is_bottom_surface"), py::arg("czm_state"), py::arg("damage"),
@@ -251,5 +251,5 @@ PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
           py::arg("dm_inv"), py::arg("tet_volumes"), py::arg("colors"),
           py::arg("config"), py::arg("e_z"), py::arg("layer_id"),
           py::arg("lifting_top"),
-          "Solve VBD with platform lift peeling + static equilibrium");
+          "Single-step lift + relax (Python side controls time loop)");
 }

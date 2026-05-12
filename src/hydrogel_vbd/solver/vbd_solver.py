@@ -32,7 +32,7 @@ import numpy as np
 
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.physics.czm import CZMState
-from hydrogel_vbd.physics.local_terms import update_local_physics_terms
+from hydrogel_vbd.physics.local_terms import build_local_physics_terms
 from hydrogel_vbd.core.state import MeshState
 
 
@@ -206,7 +206,7 @@ class PythonReferenceVBDSolver:
            b. 对每个顶点求解 ``H_total · dx = f_total``
            c. 其中 ``H_total = M/dt² + (1+ζ)·H_elastic + ε·I``
            d. 对损伤节点，将 H_elastic 投影到正定锥
-           e. 步长限制（max 0.002）防止过度外推
+           e. 步长限制（max 0.01）防止过度外推
            f. Chebyshev 加速（迭代 > 5 后启用）
         3. **收敛判定**：连续 N_stable 步 max_dx < epsilon 则退出
 
@@ -228,18 +228,14 @@ class PythonReferenceVBDSolver:
         x_prev = mesh.vertices.copy()           # 本时间步初态
         masses = mesh.masses
 
-        # ── 预分配物理项缓冲区（每迭代复用，避免重复分配大数组）──
-        n_verts = mesh.vertices.shape[0]
-        _force_buf = np.zeros((n_verts, 3), dtype=float)
-        _hessian_buf = np.zeros((n_verts, 3, 3), dtype=float)
-        update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
-                                   out_force=_force_buf, out_hessian=_hessian_buf)
+        # ── 构建局部物理项（弹性力 + Hessian） ──
+        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
 
         # ── 自适应加速度（基于初始固化度） ──
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
             config.c_init
-            * _force_buf[mesh.active_vertex_mask]
+            * terms.force[mesh.active_vertex_mask]
             / masses[mesh.active_vertex_mask, None]
         )
 
@@ -283,9 +279,12 @@ class PythonReferenceVBDSolver:
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()   # 记录本迭代初始位置（用于 Chebyshev）
 
-            # ── 重新计算物理项（复用预分配缓冲区）──
-            update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
-                                       out_force=_force_buf, out_hessian=_hessian_buf)
+            # TODO: 未来重构需将弹力与Hessian计算下沉移入着色循环的最内层，
+            #       以恢复真正的Gauss-Seidel性能。当前在着色循环外部统一计算全局
+            #       物理力（基于上一轮旧坐标），使Gauss-Seidel跌落为Jacobi迭代，
+            #       降低了收敛速度，也使"图着色"失去了其核心加速意义。
+            # ── 重新计算物理项（位置变化后力场变化） ──
+            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
             max_dx = 0.0
 
             # ── 按颜色分组遍历（同色顶点互不影响，可安全并行） ──
@@ -304,14 +303,17 @@ class PythonReferenceVBDSolver:
                             mesh.vertices[node_id, 2] = config.z_fep
 
                     # ── 弹性 Hessian ──
-                    h_elastic = _hessian_buf[node_id]
+                    h_elastic = terms.hessian[node_id]
 
                     # ── 损伤节点 Hessian 正定化 ──
-                    #   单次特征值分解（与 C++ SelfAdjointEigenSolver 对齐）
+                    #   当 CZM 处于 DAMAGING 状态时，局部刚度可能为负，
+                    #   导致求解发散。此步骤将 Hessian 特征值裁剪到 ≥0。
                     if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals, eigvecs = np.linalg.eigh(h_elastic)
+                        eigvals = np.linalg.eigvalsh(h_elastic)
                         if np.min(eigvals) < 0:
+                            # 裁剪负特征值并重构矩阵
                             eigvals_psd = np.maximum(eigvals, 0.0)
+                            eigvecs = np.linalg.eigh(h_elastic)[1]
                             h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
 
                     # ── 总 Hessian：惯性项 + 弹性项 + 阻尼项 + 正则化 ──
@@ -336,17 +338,17 @@ class PythonReferenceVBDSolver:
                     )
 
                     # ── 合力：弹性力 + 惯性力 + 阻尼力 ──
-                    f_total = _force_buf[node_id] + f_inertia + f_damp
+                    f_total = terms.force[node_id] + f_inertia + f_damp
 
                     # ── 求解 3×3 线性系统：H·dx = f ──
                     dx = np.linalg.solve(h_total, f_total)
                     length = float(np.linalg.norm(dx))
 
-                    # ── 步长限制：单步位移不超过 0.002 m ──
-                    #   与 C++ solver 对齐，匹配毫米级 DLP 几何尺度
-                    if length > 0.002:
-                        dx *= 0.002 / length
-                        length = 0.002
+                    # ── 步长限制：单步位移不超过 0.01 m ──
+                    #   防止损伤节点或大变形区域过度外推导致发散
+                    if length > 0.01:
+                        dx *= 0.01 / length
+                        length = 0.01
 
                     # ── 更新顶点位置 ──
                     mesh.vertices[node_id] += dx
@@ -434,19 +436,17 @@ class PythonReferenceVBDSolver:
         lifting_top: np.ndarray,
         on_iteration: Callable[[int, float], None] | None = None,
     ) -> VBDSolveResult:
-        """带平台运动学的剥离-静平衡求解。
+        """单步"提升 + 静平衡"求解（供 Python 控制循环调用）。
 
-        真实 DLP 打印中，每层曝光后平台会抬升将固化层从离型膜剥离。
-        本方法分两阶段模拟该过程：
+        控制反转（Inversion of Control）架构：
+        本函数已降级为"单步求解器"，仅执行**一次**微小提升
+        和**一次** VBD 静平衡迭代循环。不含任何 while 循环
+        控制提升距离，时间流逝由 Python 端循环接管。
 
-        **阶段 1 — 平台提升剥离**
-        - 以 ``v_lift`` 速度抬升顶部（平台夹持）节点
-        - 实时更新 CZM 状态（内聚力判据→损伤演化→失效）
-        - 直到底部所有节点进入 FREE 状态或达到最大提升距离
-
-        **阶段 2 — 静平衡**
-        - 平台停稳后执行 VBD 隐式迭代
-        - 让网格在重力、弹性、残余应力下达到静力平衡
+        每一调用步：
+        1. 刚性抬升顶部节点 Z 坐标 ``v_lift * dt`` 米
+        2. 更新 CZM 内聚力状态
+        3. 调用核心 VBD 隐式迭代直到静平衡
 
         Parameters
         ----------
@@ -472,57 +472,41 @@ class PythonReferenceVBDSolver:
             | ~mesh.active_vertex_mask
         )
 
-        # ════════════════════ 阶段 1：平台提升剥离 ════════════════════
+        # ════════════════════ 单步提升 ════════════════════
         v_lift = float(config.v_lift)
-        lift_distance = 0.0
-        lift_max = 5.0 * config.layer_thickness  # 最大提升距离 = 5倍层厚
         bottom = mesh.bottom_nodes(layer_id)
 
-        while lift_distance < lift_max:
-            # ── 刚性抬升顶部节点（仅 Z 方向） ──
-            mesh.vertices[lifting_top, 2] += v_lift * config.dt
-            lift_distance += v_lift * config.dt
+        # 刚性抬升顶部节点（仅 Z 方向）— 单步 v_lift * dt
+        mesh.vertices[lifting_top, 2] += v_lift * config.dt
 
-            # ── 更新 CZM 状态（提离型膜脱粘） ──
-            from hydrogel_vbd.physics.czm import update_czm_states
+        # ── 更新 CZM 状态（提离型膜脱粘）──
+        from hydrogel_vbd.physics.czm import update_czm_states
 
-            if len(bottom):
-                update_czm_states(
-                    mesh,
-                    bottom,
-                    # 施加略高于内聚强度的拉力以模拟剥离
-                    internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
-                    area=config.node_area,
-                    t_max=config.T_max,
-                    k_czm=config.K_czm,
-                    delta_f=config.delta_f,
-                    z_fep=config.z_fep,
-                    dt=config.dt,
-                )
+        if len(bottom):
+            update_czm_states(
+                mesh,
+                bottom,
+                internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
+                area=config.node_area,
+                t_max=config.T_max,
+                k_czm=config.K_czm,
+                delta_f=config.delta_f,
+                z_fep=config.z_fep,
+                dt=config.dt,
+            )
 
-            # ── 全部脱膜则退出提升循环 ──
-            if len(bottom) == 0 or np.all(mesh.czm_state[bottom] == CZMState.FREE):
-                break
-
-        # ════════════════════ 阶段 2：静平衡迭代 ════════════════════
-        #   重新计算固定掩码（CZM 状态已变更）
+        # ════════════════════ 静平衡迭代 ════════════════════
         fixed[:] = (
             mesh.is_top_fixed
             | (mesh.czm_state == CZMState.FIXED)
             | ~mesh.active_vertex_mask
         )
 
-        # ── 与 solve_until_stable 相同的 VBD 核心逻辑 ──
-        #   预分配缓冲区（复用避免每迭代分配大数组）
-        n_verts_lift = mesh.vertices.shape[0]
-        _force_buf = np.zeros((n_verts_lift, 3), dtype=float)
-        _hessian_buf = np.zeros((n_verts_lift, 3, 3), dtype=float)
-        update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
-                                   out_force=_force_buf, out_hessian=_hessian_buf)
+        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
             config.c_init
-            * _force_buf[mesh.active_vertex_mask]
+            * terms.force[mesh.active_vertex_mask]
             / masses[mesh.active_vertex_mask, None]
         )
         y = (
@@ -550,12 +534,10 @@ class PythonReferenceVBDSolver:
         N_stable = int(config.N_stable)
         target_epsilon = float(config.epsilon)
 
-        # ── 静平衡主循环（与 solve_until_stable 相同） ──
         for iteration in range(1, config.max_iters + 1):
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()
-            update_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev,
-                                       out_force=_force_buf, out_hessian=_hessian_buf)
+            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
             max_dx = 0.0
 
             for color in sorted(set(int(c) for c in colors)):
@@ -570,12 +552,13 @@ class PythonReferenceVBDSolver:
                         if mesh.vertices[node_id, 2] < config.z_fep:
                             mesh.vertices[node_id, 2] = config.z_fep
 
-                    h_elastic = _hessian_buf[node_id]
+                    h_elastic = terms.hessian[node_id]
 
                     if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals, eigvecs = np.linalg.eigh(h_elastic)
+                        eigvals = np.linalg.eigvalsh(h_elastic)
                         if np.min(eigvals) < 0:
                             eigvals_psd = np.maximum(eigvals, 0.0)
+                            eigvecs = np.linalg.eigh(h_elastic)[1]
                             h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
 
                     h_total = (
@@ -592,12 +575,12 @@ class PythonReferenceVBDSolver:
                         -(config.k_d / max(config.dt, 1e-12))
                         * h_elastic @ (mesh.vertices[node_id] - x_prev[node_id])
                     )
-                    f_total = _force_buf[node_id] + f_inertia + f_damp
+                    f_total = terms.force[node_id] + f_inertia + f_damp
                     dx = np.linalg.solve(h_total, f_total)
                     length = float(np.linalg.norm(dx))
-                    if length > 0.002:
-                        dx *= 0.002 / length
-                        length = 0.002
+                    if length > 0.01:
+                        dx *= 0.01 / length
+                        length = 0.01
                     mesh.vertices[node_id] += dx
 
                     if (
@@ -628,11 +611,10 @@ class PythonReferenceVBDSolver:
             if stable_counter >= N_stable:
                 break
 
-            # ── 迭代回调：用于 GUI 事件泵 / 进度更新 ──
             if on_iteration is not None:
                 on_iteration(iteration, max_dx)
 
-        # ── 后处理：更新速度和动能 ──
+        # ── 后处理 ──
         free = mesh.active_vertex_mask & ~fixed
         mesh.velocities[free] = (
             mesh.vertices[free] - x_prev[free]

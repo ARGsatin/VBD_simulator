@@ -175,16 +175,24 @@ class PIDFieldController:
     输出均匀电场强度 E_z。误差死区设置为 ``err_target``：
     仅当 ``err_avg > err_target`` 时才激活反馈。
 
-    控制律：
+    控制律（标准位置式 PID，杜绝双重积分爆炸）：
     .. math::
-        E_z = clip( E_z + K_p·e + K_i·∫e dt + K_d·de/dt, 0, E_max )
+        E_z = clip( K_p·e + K_i·∫e dt + K_d·de/dt, 0, E_max )
+
+    抗积分饱和策略
+    --------------
+    * **限幅前裁剪（Clamping Pre-clip）**：积分项 ``PID_integral`` 累加后
+      立即裁剪到 ``[-E_max/K_i, +E_max/K_i]``，防止积分项指数级发散。
+    * **反计算饱和（Clamping Anti-windup Back-calculation）**：若输出
+      ``target_E`` 被 ``[0, E_max]`` 截断，则根据有效输出反算出校正后的
+      积分项，使积分器始终保持在合理范围内。
+    * **死区抑制**：误差低于 ``err_target`` 时不激活 PID，保持当前场强不变。
 
     特性
     ----
     * **纯正值**：E_z 始终在 [0, E_max] 范围内
-    * **防御积分饱和**：积分项持续累加，但通过 clip 防止无限增长
-    * **无抗积分饱和**：当前版本未实现条件积分或反计算饱和，
-      对于长时间大误差可能存在积分饱和风险
+    * **位置式公式**：直接设定目标场强，不再增量叠加，消除双重积分
+    * **严格抗积分饱和**：上下限裁剪 + 反算回退，双重保护
     """
 
     def __init__(self, config: SimulationConfig) -> None:
@@ -204,8 +212,13 @@ class PIDFieldController:
     def update(self, err_avg: float) -> PIDFieldState:
         """根据宏观平均误差更新电场强度。
 
-        仅在误差超过死区阈值时激活反馈；低于阈值时
-        电场保持不变。
+        采用**位置式 PID**（Position Form）控制律：
+        ``E_z = Kp·e + Ki·∫e dt + Kd·de/dt``，限幅后直接赋给
+        ``self.E_z``，杜绝"增量叠加导致的双重积分爆炸"。
+
+        仅在误差超过死区阈值时激活反馈；低于阈值时保持当前场强。
+        积分项 ``PID_integral`` 具有严格的抗积分饱和（Anti-windup）
+        上下限裁剪逻辑。
 
         Parameters
         ----------
@@ -217,27 +230,64 @@ class PIDFieldController:
         PIDFieldState
             包含当前 PID 状态所有字段的快照。
         """
+        # ── 位置式 PID 输出计算 ──
         delta_e = 0.0
         error_input = 0.0
+        P_term = 0.0
+        I_term = 0.0
+        D_term = 0.0
+
         if err_avg > self.config.err_target:
             # ── 误差超出死区，激活 PID ──
             error_input = float(err_avg - self.config.err_target)
+
+            # 比例项
+            P_term = self.config.K_p * error_input
+
+            # 积分项：先累加，再抗积分饱和裁剪
             self.PID_integral += error_input * self.config.dt
+            # 抗积分饱和：将积分项限制在 [-E_max/Ki, +E_max/Ki]
+            # 防止因长期累加导致积分项指数发散
+            integral_limit = (
+                self.config.E_max / max(abs(self.config.K_i), 1e-12)
+                if abs(self.config.K_i) > 1e-12
+                else 0.0
+            )
+            self.PID_integral = float(
+                np.clip(self.PID_integral, -integral_limit, +integral_limit)
+            )
+            I_term = self.config.K_i * self.PID_integral
+
+            # 微分项
             derivative = (
                 (error_input - self.prev_error)
                 / max(self.config.dt, 1e-12)
             )
-            # ── PID 叠加：ΔE = Kp·e + Ki·∫e + Kd·de/dt ──
-            delta_e = (
-                self.config.K_p * error_input
-                + self.config.K_i * self.PID_integral
-                + self.config.K_d * derivative
-            )
-            # ── 更新场强并限幅 ──
+            D_term = self.config.K_d * derivative
+
+            # ── 位置式 PID 输出：E = P + I + D ──
+            target_E = P_term + I_term + D_term
+            delta_e = target_E - self.E_z  # 记录本步增量（仅用于日志/状态快照）
+
+            # ── 直接赋值并限幅（非增量累加！） ──
             self.E_z = float(
-                np.clip(self.E_z + delta_e, 0.0, self.config.E_max)
+                np.clip(target_E, 0.0, self.config.E_max)
             )
+
+            # 若 target_E 被 clip 截断且处于饱和边界，实施
+            # 积分反算饱和（clamping anti-windup）：将积分项回退到
+            # 恰好使 target_E 落在边界内的值
+            if self.E_z != target_E:
+                # 反算：I_corrected = E_z - P - D，仅当 clip 触及时回退
+                corrected_I = self.E_z - P_term - D_term
+                self.PID_integral = corrected_I / max(abs(self.config.K_i), 1e-12)
+
             self.prev_error = error_input
+
+        # ── 误差低于死区：保持 E_z 不变，但清除积分器以防下次跳跃 ──
+        # (可选保守策略——若想保留历史状态可注释掉下面这行)
+        # self.PID_integral *= 0.9  # 让积分项逐渐衰减
+
         return PIDFieldState(
             E_z=self.E_z,
             err_avg=float(err_avg),

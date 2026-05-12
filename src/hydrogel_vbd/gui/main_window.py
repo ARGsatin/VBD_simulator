@@ -44,30 +44,36 @@ from hydrogel_vbd.geometry.stl_mesher import create_demo_or_stl, STLMesher
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
-from hydrogel_vbd.solver.cpp_adapter import is_cpp_available, refresh_availability
-from hydrogel_vbd.solver.cpp_builder import CppBuilder, CppBuildResult
 from hydrogel_vbd.core.state import LayerResult, MeshState
 from hydrogel_vbd.gui.mesh_viewer import MeshViewer
+from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+try:
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
 
 
 # 参数元数据列表：定义每个参数在 GUI 中的显示标签、默认值、取值范围
 _PARAM_META: list[dict[str, Any]] = [
     {"key": "mu", "label": "剪切模量 μ (Pa)", "default": 5000.0, "min": 500.0, "max": 1e6},
-    {"key": "kappa", "label": "体积模量 κ (Pa)", "default": 20000.0, "min": 2000.0, "max": 1e7},
-    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.5, "min": 0.0, "max": 1.0},
+    {"key": "kappa", "label": "体积模量 κ (Pa)", "default": 25000.0, "min": 2000.0, "max": 1e7},
+    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.8, "min": 0.0, "max": 1.0},
     {"key": "c_shrink", "label": "收缩因子 c_shrink", "default": 0.98, "min": 0.8, "max": 1.0},
-    {"key": "T_max", "label": "最大附着力 T_max (Pa)", "default": 5000.0, "min": 100.0, "max": 50000.0},
-    {"key": "K_czm", "label": "CZM 刚度 K_czm (Pa/m)", "default": 1.0e8, "min": 1e6, "max": 1e10},
-    {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 1.0e-4, "min": 1e-6, "max": 1e-2},
+    {"key": "T_max", "label": "最大附着力 T_max (Pa)", "default": 3000.0, "min": 100.0, "max": 50000.0},
+    {"key": "K_czm", "label": "CZM 刚度 (Pa/m)", "default": 1.0e7, "min": 1e6, "max": 1e10},
+    {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 5.0e-4, "min": 1e-6, "max": 1e-2},
     {"key": "dt", "label": "时间步长 dt (s)", "default": 0.001, "min": 0.0001, "max": 0.05},
     {"key": "max_iters", "label": "最大迭代次数", "default": 20, "min": 5, "max": 200},
     {"key": "N_stable", "label": "稳定步数判决", "default": 10, "min": 2, "max": 50},
-    {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.05, "min": 0.01, "max": 10000.0},
-    {"key": "v_lift", "label": "平台提升速度 (m/s)", "default": 0.001, "min": 0.0, "max": 0.01},
+    {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.10, "min": 0.01, "max": 10.0},
+    {"key": "v_lift", "label": "提升速度 (m/s)", "default": 0.001, "min": 0.0, "max": 0.01},
     {"key": "K_p", "label": "PID K_p", "default": 150.0, "min": 0.0, "max": 1000.0},
     {"key": "K_i", "label": "PID K_i", "default": 20.0, "min": 0.0, "max": 200.0},
     {"key": "K_d", "label": "PID K_d", "default": 5.0, "min": 0.0, "max": 100.0},
-    {"key": "E_max", "label": "最大电场 E_max (V/m)", "default": 500.0, "min": 10.0, "max": 5000.0},
+    {"key": "E_max", "label": "最大电场 (V/m)", "default": 500.0, "min": 10.0, "max": 5000.0},
 ]
 
 
@@ -85,12 +91,9 @@ class ParameterPanel(QtWidgets.QGroupBox):
 
     params_changed = QtCore.Signal(dict)
 
-    _BUILD_AXIS_LABELS = {0: "X 轴", 1: "Y 轴", 2: "Z 轴（默认）"}
-
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__("仿真参数", parent)
         self._spin_map: dict[str, QtWidgets.QDoubleSpinBox | QtWidgets.QSpinBox] = {}
-        self._combo_build_axis: QtWidgets.QComboBox | None = None
         self._build_ui()
         self._params: dict[str, Any] = {}
         self._collect_params()
@@ -98,13 +101,9 @@ class ParameterPanel(QtWidgets.QGroupBox):
     def _build_ui(self) -> None:
         """根据参数元数据列表构建表单布局。"""
         layout = QtWidgets.QFormLayout(self)
-        # ── 构建方向下拉框 ──
-        self._combo_build_axis = QtWidgets.QComboBox()
-        self._combo_build_axis.addItems(self._BUILD_AXIS_LABELS.values())
-        self._combo_build_axis.setCurrentIndex(2)  # 默认 Z
-        self._combo_build_axis.currentIndexChanged.connect(self._collect_params)
-        layout.addRow("构建方向", self._combo_build_axis)
-
+        layout.setContentsMargins(10, 10, 15, 10)
+        layout.setVerticalSpacing(4)
+        layout.setSpacing(4)
         for meta in _PARAM_META:
             default = meta["default"]
             if isinstance(default, float):
@@ -117,6 +116,7 @@ class ParameterPanel(QtWidgets.QGroupBox):
                 sb = QtWidgets.QSpinBox()
                 sb.setRange(meta["min"], meta["max"])
                 sb.setValue(int(default))
+            sb.setMaximumWidth(120)
             sb.valueChanged.connect(self._collect_params)  # type: ignore[arg-type]
             self._spin_map[meta["key"]] = sb
             layout.addRow(meta["label"], sb)
@@ -127,8 +127,6 @@ class ParameterPanel(QtWidgets.QGroupBox):
         self._params = {
             key: widget.value() for key, widget in self._spin_map.items()
         }
-        if self._combo_build_axis is not None:
-            self._params["build_axis"] = self._combo_build_axis.currentIndex()
         self.params_changed.emit(self._params)
 
     def get_config(self) -> SimulationConfig:
@@ -146,17 +144,36 @@ class ParameterPanel(QtWidgets.QGroupBox):
 class ProgressWidget(QtWidgets.QWidget):
     """仿真进度显示条。
 
-    包含一个进度条和一个文本标签，实时显示当前层计算进度。
+    包含外层进度条（层间进度）、一个文本标签，以及
+    一条绿色的细粒度子进度条（层内提升进度）。
     """
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
         self._bar = QtWidgets.QProgressBar()
         self._bar.setRange(0, 100)
+        self._bar.setFixedHeight(16)
+
         self._label = QtWidgets.QLabel("就绪")
+
+        # ── 细粒度子进度条（层内提升进度，绿色、细条）──
+        self._sub_bar = QtWidgets.QProgressBar()
+        self._sub_bar.setRange(0, 100)
+        self._sub_bar.setValue(0)
+        self._sub_bar.setFixedHeight(6)
+        self._sub_bar.setStyleSheet(
+            "QProgressBar { border: none; background: transparent; }"
+            "QProgressBar::chunk { background-color: #4CAF50; border-radius: 2px; }"
+        )
+        self._sub_bar.setToolTip("当前层提升进度 (0–100%)")
+
         layout.addWidget(self._bar)
         layout.addWidget(self._label)
+        layout.addWidget(self._sub_bar)
         self.setLayout(layout)
 
     def set_layer(self, current: int, total: int) -> None:
@@ -174,9 +191,20 @@ class ProgressWidget(QtWidgets.QWidget):
         self._label.setText(f"计算第 {current}/{total} 层 …")
         QtWidgets.QApplication.processEvents()
 
+    def set_sub_progress(self, percentage: int) -> None:
+        """更新层内细粒度子进度（提升百分比）。
+
+        Parameters
+        ----------
+        percentage : int
+            0–100 的整数值，表示当前层内提升进度。
+        """
+        self._sub_bar.setValue(max(0, min(100, percentage)))
+
     def set_done(self) -> None:
-        """标记仿真完成，进度条置为 100%。"""
+        """标记仿真完成，进度条置为 100%，子进度条归零。"""
         self._bar.setValue(100)
+        self._sub_bar.setValue(0)
         self._label.setText("仿真完成 ✓")
         QtWidgets.QApplication.processEvents()
 
@@ -224,7 +252,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Hydrogel VBD Simulator")
-        self.resize(1100, 750)
+        self.resize(1500, 950)
+        self.setStyleSheet("""
+            QMainWindow { background-color: #FAFAFA; }
+            QPushButton { padding: 4px 12px; border-radius: 3px; }
+            QGroupBox { font-weight: bold; margin-top: 4px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; padding: 0 6px; }
+            QLabel { padding: 0px; }
+            QSpinBox, QDoubleSpinBox, QComboBox { padding: 1px 3px; }
+            QProgressBar { height: 14px; border-radius: 3px; }
+            QTextEdit { border: 1px solid #ddd; border-radius: 3px; }
+        """)
 
         self._config = SimulationConfig()
         self._last_results: list[LayerResult] = []
@@ -248,27 +286,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim_tets: np.ndarray | None = None
         self._anim_timer: QtCore.QTimer | None = None
         self.current_frame_idx: int = 0
+        self._anim_paused: bool = False
+        self._anim_layer_filter: int | None = None  # None = 全部层
+        self._anim_slider: QtWidgets.QSlider | None = None
+        self._anim_frame_label: QtWidgets.QLabel | None = None
+        self._anim_layer_combo: QtWidgets.QComboBox | None = None
+        self._btn_anim_play: QtWidgets.QPushButton | None = None
+        self._btn_anim_pause: QtWidgets.QPushButton | None = None
+        self._frame_indices: list[int] = []  # 筛选后的帧索引映射
 
-        # ── 可视化着色模式 ──
-        self._color_mode: str = "active"  # active | layer | damage | displacement | czm
-
-        # ── C++ 自动编译状态 ──
-        self._build_thread: QtCore.QThread | None = None
-        self._build_worker: QtCore.QObject | None = None
-        self._pending_build_config: SimulationConfig | None = None
+        # ── DVR 实时时间轴状态 ──
+        self._dv_slider: QtWidgets.QSlider | None = None
+        self._dv_label: QtWidgets.QLabel | None = None
+        self._dv_is_slider_down: bool = False
+        self._dv_efield_canvas: Any = None
+        self._dv_efield_fig: Any = None
+        self._dv_efield_layer_data: list[tuple[int, float, float, float]] = (
+            []
+        )  # (layer_id, e_z, max_err, rms_err)
 
         self._init_central()
         self._update_button_states()
 
         # 确保初始配置与参数面板默认值一致
         self._config = self._param_panel.get_config()
-
-        # ── 启动时检测 Gmsh 可用性并更新状态栏 ──
-        try:
-            import gmsh  # noqa: F401
-            self._status.showMessage("就绪 | Gmsh OCC: 可用 | 支持 STEP/STL", 5000)
-        except ImportError:
-            self._status.showMessage("就绪 | Gmsh OCC: 不可用 (仅 STL)", 5000)
 
     # ========================================================================
     # UI 搭建
@@ -281,93 +322,98 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── 顶部工具栏 ──
         top_bar = QtWidgets.QHBoxLayout()
+        top_bar.setContentsMargins(2, 2, 2, 2)
+        top_bar.setSpacing(4)
 
-        self._btn_load = QtWidgets.QPushButton("📂 加载 CAD 模型")
+        self._btn_load = QtWidgets.QPushButton("📂 加载模型")
+        self._btn_load.setFixedHeight(28)
         self._btn_load.clicked.connect(self._on_load_stl)
 
-        self._btn_clear = QtWidgets.QPushButton("✕ 清除模型")
+        self._btn_clear = QtWidgets.QPushButton("✕ 清除")
+        self._btn_clear.setFixedHeight(28)
         self._btn_clear.clicked.connect(self._on_clear_stl)
 
         self._lbl_model = QtWidgets.QLabel("无模型 (使用 Demo 网格)")
 
         self._btn_mesh = QtWidgets.QPushButton("🔄 划分网格")
+        self._btn_mesh.setFixedHeight(28)
         self._btn_mesh.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #2196F3; "
-            "color: white; padding: 6px 20px; border-radius: 4px; }"
+            "color: white; border-radius: 3px; }"
             "QPushButton:hover { background-color: #1976D2; }"
             "QPushButton:disabled { background-color: #BDBDBD; color: #757575; }"
         )
         self._btn_mesh.clicked.connect(self._on_generate_mesh)
 
         self._btn_run = QtWidgets.QPushButton("▶ 运行仿真")
+        self._btn_run.setFixedHeight(28)
         self._btn_run.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #4CAF50; "
-            "color: white; padding: 6px 20px; border-radius: 4px; }"
+            "color: white; border-radius: 3px; }"
             "QPushButton:hover { background-color: #45a049; }"
             "QPushButton:disabled { background-color: #BDBDBD; color: #757575; }"
         )
         self._btn_run.clicked.connect(self._on_run)
 
         self._btn_stop_anim = QtWidgets.QPushButton("⏹ 停止回放")
+        self._btn_stop_anim.setFixedHeight(28)
         self._btn_stop_anim.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #f44336; "
-            "color: white; padding: 6px 20px; border-radius: 4px; }"
+            "color: white; border-radius: 3px; }"
             "QPushButton:hover { background-color: #d32f2f; }"
         )
         self._btn_stop_anim.clicked.connect(self._on_stop_animation)
         self._btn_stop_anim.setVisible(False)
 
-        # ── 着色模式下拉框 ──
-        self._combo_color = QtWidgets.QComboBox()
-        self._combo_color.addItems([
-            "激活/未激活", "按层 ID", "损伤值", "位移幅值", "CZM 状态"
-        ])
-        self._combo_color.setToolTip("3D 视图着色模式")
-        self._combo_color.currentIndexChanged.connect(self._on_color_mode_changed)
-
         top_bar.addWidget(self._btn_load)
         top_bar.addWidget(self._btn_clear)
         top_bar.addWidget(self._lbl_model, 1)
-        top_bar.addWidget(QtWidgets.QLabel("着色:"))
-        top_bar.addWidget(self._combo_color)
         top_bar.addWidget(self._btn_mesh)
         top_bar.addWidget(self._btn_run)
         top_bar.addWidget(self._btn_stop_anim)
         root.addLayout(top_bar)
+        root.setSpacing(2)
+        root.setContentsMargins(4, 4, 4, 4)
 
         # ── 中部：参数 + 进度/日志 + 3D 视图 ──
         mid = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        mid.setHandleWidth(3)
 
         # 左侧面板
         left = QtWidgets.QWidget()
+        left.setMinimumWidth(400)
+        left.setMaximumWidth(450)
         left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(2, 2, 2, 2)
+        left_layout.setSpacing(4)
         self._param_panel = ParameterPanel()
         self._param_panel.params_changed.connect(self._on_params)
 
-        # ── 层数 / 分辨率信息行 ──
-        info_layout = QtWidgets.QHBoxLayout()
-        info_layout.addWidget(QtWidgets.QLabel("层厚 (mm):"))
+        # ── 第一行：层厚 / 层数 / 分辨率 / 自定义分辨率 ──
+        info_layout_1 = QtWidgets.QHBoxLayout()
+
+        info_layout_1.addWidget(QtWidgets.QLabel("层厚 (mm):"))
         self._lbl_thickness = QtWidgets.QLabel("0.05")
         self._lbl_thickness.setStyleSheet("font-weight: bold; color: #1976D2;")
-        info_layout.addWidget(self._lbl_thickness)
-        info_layout.addSpacing(16)
+        info_layout_1.addWidget(self._lbl_thickness)
+        info_layout_1.addSpacing(15)
 
-        info_layout.addWidget(QtWidgets.QLabel("层数:"))
+        info_layout_1.addWidget(QtWidgets.QLabel("层数:"))
         self._lbl_layers = QtWidgets.QLabel("—")
         self._lbl_layers.setStyleSheet("font-weight: bold;")
-        info_layout.addWidget(self._lbl_layers)
+        info_layout_1.addWidget(self._lbl_layers)
         self._spin_layers = QtWidgets.QSpinBox()
         self._spin_layers.setRange(1, 100)
         self._spin_layers.setValue(3)
         self._spin_layers.setToolTip("Demo 模式层数")
         self._spin_layers.valueChanged.connect(self._on_demo_layers_changed)
-        info_layout.addWidget(self._spin_layers)
+        info_layout_1.addWidget(self._spin_layers)
 
-        info_layout.addSpacing(16)
-        info_layout.addWidget(QtWidgets.QLabel("分辨率 (mm):"))
+        info_layout_1.addSpacing(15)
+        info_layout_1.addWidget(QtWidgets.QLabel("分辨率 (mm):"))
         self._lbl_resolution = QtWidgets.QLabel("—")
         self._lbl_resolution.setStyleSheet("font-weight: bold;")
-        info_layout.addWidget(self._lbl_resolution)
+        info_layout_1.addWidget(self._lbl_resolution)
         self._spin_resolution = QtWidgets.QDoubleSpinBox()
         self._spin_resolution.setRange(0.5, 500.0)
         self._spin_resolution.setDecimals(1)
@@ -376,13 +422,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spin_resolution.setSuffix(" mm")
         self._spin_resolution.setToolTip("Demo 模式 XY 网格间距 (mm)")
         self._spin_resolution.valueChanged.connect(self._on_demo_params_changed)
-        info_layout.addWidget(self._spin_resolution)
+        info_layout_1.addWidget(self._spin_resolution)
 
+        info_layout_1.addSpacing(15)
         # ── 自动推荐分辨率提示标签 ──
         self._lbl_auto_res = QtWidgets.QLabel("")
         self._lbl_auto_res.setStyleSheet("color: #888; font-size: 9pt;")
-        info_layout.addWidget(self._lbl_auto_res)
+        info_layout_1.addWidget(self._lbl_auto_res)
 
+        info_layout_1.addSpacing(15)
         # ── 自定义分辨率复选框 ──
         self._chk_custom_res = QtWidgets.QCheckBox("自定义分辨率")
         self._chk_custom_res.setToolTip(
@@ -390,11 +438,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "不勾选则根据模型尺寸自动计算最佳分辨率"
         )
         self._chk_custom_res.toggled.connect(self._on_custom_resolution_toggled)
-        info_layout.addWidget(self._chk_custom_res)
+        info_layout_1.addWidget(self._chk_custom_res)
+        info_layout_1.addSpacing(15)
 
         # ── 网格算法选择器 ──
-        info_layout.addSpacing(12)
-        info_layout.addWidget(QtWidgets.QLabel("网格算法:"))
+        info_layout_1.addWidget(QtWidgets.QLabel("网格算法:"))
         self._combo_mesh_algo = QtWidgets.QComboBox()
         self._combo_mesh_algo.addItem("规整分层算法 (OCC 切片)", "layered")
         self._combo_mesh_algo.addItem("标准非结构化算法 (自由四面体)", "standard")
@@ -403,33 +451,140 @@ class MainWindow(QtWidgets.QMainWindow):
             "保证四面体不跨层;\n"
             "标准非结构化算法: 跳过切片，直接生成自由四面体网格"
         )
-        info_layout.addWidget(self._combo_mesh_algo)
-        info_layout.addStretch()
+        info_layout_1.addWidget(self._combo_mesh_algo)
+        info_layout_1.addStretch()
 
-        left_layout.addLayout(info_layout)
-        left_layout.addWidget(self._param_panel)
+        left_layout.addLayout(info_layout_1)
+
+        # ── QScrollArea 包裹参数面板，防止窗口高度不足时控件被挤压 ──
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll_area.setWidget(self._param_panel)
+        left_layout.addWidget(scroll_area)
         left_layout.addStretch()
 
         # 右侧面板
         right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        right.setHandleWidth(3)
         upper_right = QtWidgets.QWidget()
         upper_layout = QtWidgets.QVBoxLayout(upper_right)
+        upper_layout.setContentsMargins(0, 0, 0, 2)
+        upper_layout.setSpacing(2)
         self._progress = ProgressWidget()
         self._log = LogWidget()
         upper_layout.addWidget(self._progress)
-        upper_layout.addWidget(self._log)
+        upper_layout.addWidget(self._log, 1)
         right.addWidget(upper_right)
 
         self._viewer = MeshViewer()
         right.addWidget(self._viewer)
+
+        # ── 动画播放控制面板（3D 视图下方）──
+        anim_panel = QtWidgets.QWidget()
+        anim_panel_layout = QtWidgets.QHBoxLayout(anim_panel)
+        anim_panel_layout.setContentsMargins(4, 2, 4, 2)
+        anim_panel_layout.setSpacing(6)
+
+        self._btn_anim_play = QtWidgets.QPushButton("▶ 播放")
+        self._btn_anim_play.setFixedHeight(26)
+        self._btn_anim_play.setFixedWidth(70)
+        self._btn_anim_play.setToolTip("从头开始播放动画")
+        self._btn_anim_play.clicked.connect(self._on_anim_play_clicked)
+        self._btn_anim_play.setVisible(False)
+
+        self._btn_anim_pause = QtWidgets.QPushButton("⏸ 暂停")
+        self._btn_anim_pause.setFixedHeight(26)
+        self._btn_anim_pause.setFixedWidth(70)
+        self._btn_anim_pause.setToolTip("暂停/继续动画回放")
+        self._btn_anim_pause.clicked.connect(self._on_anim_pause_clicked)
+        self._btn_anim_pause.setVisible(False)
+
+        self._btn_stop_anim_from_panel = QtWidgets.QPushButton("⏹ 停止")
+        self._btn_stop_anim_from_panel.setFixedHeight(26)
+        self._btn_stop_anim_from_panel.setFixedWidth(70)
+        self._btn_stop_anim_from_panel.setToolTip("停止回放并恢复初始网格")
+        self._btn_stop_anim_from_panel.clicked.connect(self._on_stop_animation)
+        self._btn_stop_anim_from_panel.setVisible(False)
+
+        self._anim_frame_label = QtWidgets.QLabel("帧: 0 / 0")
+        self._anim_frame_label.setMinimumWidth(80)
+        self._anim_frame_label.setVisible(False)
+
+        # 层筛选下拉框
+        self._anim_layer_combo = QtWidgets.QComboBox()
+        self._anim_layer_combo.addItem("全部层", -1)
+        self._anim_layer_combo.setToolTip("按层筛选动画帧")
+        self._anim_layer_combo.currentIndexChanged.connect(self._on_anim_layer_filter_changed)
+        self._anim_layer_combo.setVisible(False)
+        self._anim_layer_combo.setMinimumWidth(100)
+
+        # 帧滑块（水平拖动定位）
+        self._anim_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._anim_slider.setRange(0, 0)
+        self._anim_slider.setValue(0)
+        self._anim_slider.setToolTip("拖动定位到指定帧")
+        self._anim_slider.valueChanged.connect(self._on_anim_slider_changed)
+        self._anim_slider.setVisible(False)
+
+        anim_panel_layout.addWidget(self._btn_anim_play)
+        anim_panel_layout.addWidget(self._btn_anim_pause)
+        anim_panel_layout.addWidget(self._btn_stop_anim_from_panel)
+        anim_panel_layout.addWidget(self._anim_frame_label)
+        anim_panel_layout.addWidget(QtWidgets.QLabel("层筛选:"))
+        anim_panel_layout.addWidget(self._anim_layer_combo)
+        anim_panel_layout.addWidget(self._anim_slider, 1)
+
+        right.addWidget(anim_panel)
+
         right.setStretchFactor(0, 1)
-        right.setStretchFactor(1, 5)  # 3D 视图占绝对主体
+        right.setStretchFactor(1, 4)  # 3D 视图占据 4/5 垂直空间
+        right.setStretchFactor(2, 0)  # 控制面板保持最小高度
 
         mid.addWidget(left)
         mid.addWidget(right)
-        mid.setStretchFactor(0, 1)
-        mid.setStretchFactor(1, 4)  # 右侧（含 3D 视图）大幅扩展
+        # 水平拉伸策略：左侧保持紧凑不拉伸，右侧吸纳所有剩余空间
+        mid.setStretchFactor(0, 0)
+        mid.setStretchFactor(1, 1)
         root.addWidget(mid)
+
+        # ── DVR 实时时间轴（底部水平栏）──
+        dvr_bar = QtWidgets.QHBoxLayout()
+        dvr_bar.setContentsMargins(6, 2, 6, 4)
+        dvr_bar.setSpacing(8)
+
+        dvr_bar.addWidget(QtWidgets.QLabel("📽 时间轴:"))
+
+        self._dv_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._dv_slider.setRange(0, 0)
+        self._dv_slider.setValue(0)
+        self._dv_slider.setToolTip("拖动定位到已完成的层")
+        self._dv_slider.sliderPressed.connect(self._on_dv_slider_pressed)
+        self._dv_slider.sliderReleased.connect(self._on_dv_slider_released)
+        self._dv_slider.valueChanged.connect(self._on_dv_slider_changed)
+        dvr_bar.addWidget(self._dv_slider, 1)
+
+        self._dv_label = QtWidgets.QLabel("层: —")
+        self._dv_label.setMinimumWidth(80)
+        self._dv_label.setStyleSheet("font-weight: bold; color: #1976D2;")
+        dvr_bar.addWidget(self._dv_label)
+
+        # ── 实时电场图表（迷你 matplotlib 嵌板，约 200×120 px）──
+        if _HAS_MPL:
+            try:
+                self._dv_efield_fig = Figure(figsize=(2.8, 1.6), dpi=80)
+                self._dv_efield_canvas = FigureCanvas(self._dv_efield_fig)
+                self._dv_efield_canvas.setFixedSize(260, 120)
+                self._dv_efield_canvas.setToolTip("实时电场强度 E_z (V/m) 逐层曲线")
+                dvr_bar.addWidget(self._dv_efield_canvas)
+            except Exception:
+                self._dv_efield_fig = None
+                self._dv_efield_canvas = None
+        else:
+            self._dv_efield_fig = None
+            self._dv_efield_canvas = None
+
+        root.addLayout(dvr_bar)
 
         # ── 底部状态栏 ──
         self._status = QtWidgets.QStatusBar()
@@ -497,6 +652,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ========================================================================
     # 按钮状态管理
     # ========================================================================
+    def _reset_window_size(self) -> None:
+        """重置主窗口为默认推荐尺寸并居中显示。"""
+        self.resize(1500, 950)
+        # 居中显示
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            center = screen.availableGeometry().center()
+            frame = self.frameGeometry()
+            frame.moveCenter(center)
+            self.move(frame.topLeft())
+
     def _update_button_states(self) -> None:
         """根据当前状态启用/禁用按钮。"""
         has_mesh = self._generated_mesh is not None
@@ -642,26 +808,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mesh = None
         self._actual_layers = 0
 
-        # ── STEP 文件：检查 Gmsh 是否可用 ──
-        _ext = self._stl_path.suffix.lower()
-        if _ext in ('.step', '.stp', '.igs', '.iges', '.brep'):
-            try:
-                import gmsh  # noqa: F401
-            except ImportError:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "缺少依赖",
-                    "STEP/STP 文件需要 Gmsh OCC 几何内核。\n\n"
-                    "请安装: pip install gmsh\n"
-                    "或先将模型转换为 STL 格式再加载。\n\n"
-                    "当前将回退到 Demo 网格。"
-                )
-                self._stl_path = None
-                self._lbl_model.setText("无模型 (使用 Demo 网格)")
-                self._set_demo_mode()
-                self._update_button_states()
-                return
-
         # ── 加载 trimesh 并自动计算参数 ──
         try:
             self._auto_calculate_mesh_params()
@@ -679,21 +825,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_model.setText(f"模型: {self._stl_path.name}")
         self._log.clear()
         self._log.append_log(f"已加载 CAD 模型: {self._stl_path}")
-        ba = self._config.build_axis
-        axis_labels = ["X", "Y", "Z"]
-        axis_label_build = axis_labels[ba] + "↑"
-        extents = [
-            (axis_labels[0], self._bbox_x),
-            (axis_labels[1], self._bbox_y),
-            (axis_labels[2], self._bbox_z),
-        ]
-        extents[ba] = (axis_label_build, extents[ba][1])
-        bbox_str = " ".join(
-            f"{lbl}[{r[0]:.3f}~{r[1]:.3f}]" for lbl, r in extents
-        )
-        self._log.append_log(f"  · 模型包围盒: {bbox_str} m")
         self._log.append_log(
-            f"  · 自动计算: {self._actual_layers} 层 (构建方向: {axis_labels[ba]}), "
+            f"  · 模型包围盒: "
+            f"X[{self._bbox_x[0]:.3f}~{self._bbox_x[1]:.3f}] "
+            f"Y[{self._bbox_y[0]:.3f}~{self._bbox_y[1]:.3f}] "
+            f"Z[{self._bbox_z[0]:.3f}~{self._bbox_z[1]:.3f}] m"
+        )
+        self._log.append_log(
+            f"  · 自动计算: {self._actual_layers} 层, "
             f"分辨率 {self._auto_resolution*1000:.2f} mm"
         )
         self._log.append_log("  · 请点击「划分网格」生成四面体网格")
@@ -743,23 +882,17 @@ class MainWindow(QtWidgets.QMainWindow):
             y_min, y_max = float(bounds[0, 1]), float(bounds[1, 1])
             z_min, z_max = float(bounds[0, 2]), float(bounds[1, 2])
 
-        # ── 根据构建方向计算模型高度（用于层数）──
-        ba = self._config.build_axis
-        bbox_extents = [x_max - x_min, y_max - y_min, z_max - z_min]
-        bbox_mins = [x_min, y_min, z_min]
-        bbox_maxs = [x_max, y_max, z_max]
-        model_height = bbox_extents[ba]
+        model_height = z_max - z_min
         lt_m = self._layer_thickness_m
         self._actual_layers = max(1, int(np.ceil(model_height / lt_m)))
 
-        # 分辨率自适应：根据非构建轴包围盒面积
-        non_ba_dims = [i for i in (0, 1, 2) if i != ba]
-        in_plane_area = bbox_extents[non_ba_dims[0]] * bbox_extents[non_ba_dims[1]]
-        model_w = bbox_extents[non_ba_dims[0]]
-        model_h = bbox_extents[non_ba_dims[1]]
+        # 分辨率自适应：根据 XY 包围盒面积，目标单层 max_points=50000
+        xy_area = (x_max - x_min) * (y_max - y_min)
+        model_w = x_max - x_min
+        model_h = y_max - y_min
         max_points = 50000
-        auto_res = max(0.005, float(np.sqrt(in_plane_area / max_points)))
-        # 确保面内各方向至少 3 个网格点（以支持 2×2 quad → 四面体）
+        auto_res = max(0.005, float(np.sqrt(xy_area / max_points)))
+        # 确保 XY 各方向至少 3 个网格点（以支持 2×2 quad → 四面体）
         min_grid_points = 3
         max_r_for_grid = min(model_w, model_h) / max(min_grid_points - 0.5, 0.1)
         if auto_res > max_r_for_grid:
@@ -819,59 +952,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             _gmsh.model.occ.synchronize()
 
-            # ── 先获取实际存在的实体，避免空模型报错 ──
-            entities = _gmsh.model.occ.getEntities(dim=-1)
-            if not entities:
-                raise RuntimeError(
-                    "STEP 模型导入成功但未检测到任何几何实体。\n"
-                    "  可能原因: 文件仅包含参考几何/空装配体。"
-                )
-            # 统计各维度实体数量
-            dims_found = {}
-            for e in entities:
-                dims_found[e[0]] = dims_found.get(e[0], 0) + 1
-            entity_desc = ", ".join(
-                f"dim={d}: {c}个" for d, c in sorted(dims_found.items())
-            )
+            # ── 遍历所有导入的 OCC 实体，分别获取包围盒后合并 ──
+            # 避免 dim=-1, tag=-1 全局查询对某些 STEP 拓扑的兼容性问题
+            xmin = float("inf")
+            ymin = float("inf")
+            zmin = float("inf")
+            xmax = float("-inf")
+            ymax = float("-inf")
+            zmax = float("-inf")
 
-            # 过滤 3D 实体计算包围盒
-            volumes = [e[1] for e in entities if e[0] == 3]
-            if volumes:
-                bbox = _gmsh.model.occ.getBoundingBox(dim=3, tag=volumes[0])
-                for tag in volumes[1:]:
-                    bb = _gmsh.model.occ.getBoundingBox(dim=3, tag=tag)
-                    bbox = [
-                        min(bbox[0], bb[0]), min(bbox[1], bb[1]), min(bbox[2], bb[2]),
-                        max(bbox[3], bb[3]), max(bbox[4], bb[4]), max(bbox[5], bb[5]),
-                    ]
-            elif any(e[0] == 2 for e in entities):
-                # 只有曲面，尝试从 dim=2 实体获取
-                surfaces = [e[1] for e in entities if e[0] == 2]
-                bbox = _gmsh.model.occ.getBoundingBox(dim=2, tag=surfaces[0])
-                for tag in surfaces[1:]:
-                    bb = _gmsh.model.occ.getBoundingBox(dim=2, tag=tag)
-                    bbox = [
-                        min(bbox[0], bb[0]), min(bbox[1], bb[1]), min(bbox[2], bb[2]),
-                        max(bbox[3], bb[3]), max(bbox[4], bb[4]), max(bbox[5], bb[5]),
-                    ]
-            else:
-                raise RuntimeError(
-                    f"STEP 模型缺少 3D 实体或 2D 曲面。\n"
-                    f"  检测到: {entity_desc}\n"
-                    "  请将 CAD 模型导出为封闭的 B-Rep 实体 (.step 格式)"
-                )
+            for dim, tag in imported:
+                try:
+                    bbox = _gmsh.model.occ.getBoundingBox(dim, tag)
+                except Exception:
+                    # 某些低维实体（如点/线）可能无法获取包围盒，跳过
+                    continue
+                if not bbox or len(bbox) < 6:
+                    continue
 
-            if not bbox or len(bbox) < 6:
-                raise RuntimeError("无法获取 STEP 模型包围盒")
+                xmin = min(xmin, float(bbox[0]))
+                ymin = min(ymin, float(bbox[1]))
+                zmin = min(zmin, float(bbox[2]))
+                xmax = max(xmax, float(bbox[3]))
+                ymax = max(ymax, float(bbox[4]))
+                zmax = max(zmax, float(bbox[5]))
+
+            if not np.isfinite(xmin) or not np.isfinite(xmax):
+                raise RuntimeError(
+                    "无法获取 STEP 模型包围盒 — "
+                    "所有 OCC 实体均未返回有效包围盒"
+                )
 
             # Gmsh 返回 mm 单位，转为 m
-            x_min_m = float(bbox[0]) * 0.001
-            y_min_m = float(bbox[1]) * 0.001
-            z_min_m = float(bbox[2]) * 0.001
-            x_max_m = float(bbox[3]) * 0.001
-            y_max_m = float(bbox[4]) * 0.001
-            z_max_m = float(bbox[5]) * 0.001
-            return x_min_m, x_max_m, y_min_m, y_max_m, z_min_m, z_max_m
+            return (
+                xmin * 0.001, xmax * 0.001,
+                ymin * 0.001, ymax * 0.001,
+                zmin * 0.001, zmax * 0.001,
+            )
         finally:
             try:
                 if _gmsh.isInitialized():
@@ -882,32 +999,145 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_stl_preview(self) -> None:
         """在 3D 视图中展示模型的原始表面。
 
-        对 STL 格式使用 trimesh 三角面预览；
-        对 STEP 格式（无可直接渲染的三角面）仅显示包围盒信息。
+        - **STL 格式**：直接使用 trimesh 三角面渲染。
+        - **STEP 格式**：启动临时 Gmsh 流程，生成极粗 2D 表面网格
+          作为"快速表面代理（Surface Proxy）"。仅生成面网格
+          （``gmsh.model.mesh.generate(2)``），跳过昂贵的 3D 体划分，
+          使用 Delaunay 算法确保秒开预览。
         """
         import os as _os
+
         try:
             stl = self._stl_trimesh
             if stl is not None:
-                # STL 格式：渲染三角面
+                # ── STL 格式：已有三角面，直接渲染 ──
                 self._viewer.show_stl_surface(
                     stl.vertices,
                     stl.faces,
                     title=f"STL 模型 — {self._stl_path.name}",
                 )
-            else:
-                # STEP 格式：无可渲染三角面，显示包围盒线框
-                ext = _os.path.splitext(str(self._stl_path))[1].lower() if self._stl_path else ""
-                is_step = ext in ('.step', '.stp', '.igs', '.iges', '.brep')
-                if is_step and hasattr(self, '_bbox_x'):
-                    self._viewer.show_bounding_box(
-                        self._bbox_x,
-                        self._bbox_y,
-                        self._bbox_z,
-                        title=f"STEP 模型包围盒 — {self._stl_path.name}",
-                    )
+                return
+
+            # ── STEP 格式：快速表面代理 ──
+            ext = _os.path.splitext(str(self._stl_path))[1].lower() if self._stl_path else ""
+            is_step = ext in ('.step', '.stp', '.igs', '.iges', '.brep')
+            if not (is_step and hasattr(self, '_bbox_x')):
+                return
+
+            self._status.showMessage("正在生成几何预览 …")
+            QtWidgets.QApplication.processEvents()
+
+            # 计算包围盒对角线长度（m）
+            dx = self._bbox_x[1] - self._bbox_x[0]
+            dy = self._bbox_y[1] - self._bbox_y[0]
+            dz = self._bbox_z[1] - self._bbox_z[0]
+            diag_m = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+
+            # Gmsh 使用 mm 单位 → 转为 mm
+            diag_mm = diag_m * 1000.0
+
+            try:
+                import gmsh as _gmsh
+            except ImportError:
+                self._log.append_log(
+                    "  (Gmsh 未安装，回退到包围盒预览)"
+                )
+                self._viewer.show_bounding_box(
+                    self._bbox_x, self._bbox_y, self._bbox_z,
+                    title=f"STEP 模型包围盒 — {self._stl_path.name}",
+                )
+                self._status.showMessage(
+                    f"已加载 {self._stl_path.name} | "
+                    f"{self._actual_layers} 层"
+                )
+                return
+
+            _gmsh.initialize()
+            try:
+                _gmsh.option.setNumber("General.Terminal", 0)
+                _gmsh.model.add("_surface_preview")
+
+                # 导入 STEP 几何
+                imported = _gmsh.model.occ.importShapes(str(self._stl_path))
+                if not imported:
+                    raise RuntimeError("Gmsh OCC 无法导入 STEP 模型")
+                _gmsh.model.occ.synchronize()
+
+                # ── 极粗网格尺寸：包围盒对角线的 1/20 ──
+                coarse_size = max(diag_mm / 20.0, 0.1)
+                _gmsh.option.setNumber("Mesh.CharacteristicLengthMin", coarse_size)
+                _gmsh.option.setNumber("Mesh.CharacteristicLengthMax", coarse_size * 2.0)
+
+                # ── Delaunay 表面网格（不进行 3D 体划分）──
+                _gmsh.option.setNumber("Mesh.Algorithm", 5)          # Delaunay
+                _gmsh.option.setNumber("Mesh.Algorithm3D", 1)        # 不影响 2D
+                _gmsh.option.setNumber("Mesh.Optimize", 1)           # 基础优化
+                _gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)     # 禁用 Netgen
+
+                # 仅生成 2D 表面网格
+                _gmsh.model.mesh.generate(2)
+
+                # ── 提取表面三角面片 ──
+                node_tags, coords, _ = _gmsh.model.mesh.getNodes()
+                coords = np.array(coords).reshape(-1, 3)  # (N, 3) in mm
+                vertices_preview = coords * 0.001  # mm → m
+
+                # 获取 2D 单元（三角形）
+                elem_types, elem_tags, elem_node_tags = _gmsh.model.mesh.getElements(dim=2)
+                faces_preview = None
+                for et, ent in zip(elem_types, elem_node_tags):
+                    if et == 2:  # 2 = 3-node triangle
+                        faces_preview = np.array(ent, dtype=int).reshape(-1, 3)
+                        break
+                    if et == 3:  # 3 = 4-node quad → 拆分为 2 个三角形
+                        quads = np.array(ent, dtype=int).reshape(-1, 4)
+                        t1 = quads[:, [0, 1, 2]]
+                        t2 = quads[:, [0, 2, 3]]
+                        faces_preview = np.vstack([t1, t2])
+                        break
+
+                if faces_preview is None or faces_preview.size == 0:
+                    raise RuntimeError("未能提取表面三角面片")
+
+                # ── Gmsh 返回 1-based 索引 → 0-based ──
+                faces_preview = faces_preview - 1
+
+                # ── 渲染表面代理 ──
+                self._viewer.show_stl_surface(
+                    vertices_preview,
+                    faces_preview,
+                    title=f"STEP 几何预览 — {self._stl_path.name}",
+                )
+
+            finally:
+                try:
+                    if _gmsh.isInitialized():
+                        _gmsh.finalize()
+                except Exception:
+                    pass
+
+            self._status.showMessage(
+                f"已加载 {self._stl_path.name} | "
+                f"{self._actual_layers} 层 | "
+                f"表面预览 ✓"
+            )
+
         except Exception as exc:
             self._log.append_log(f"  (预览失败: {exc})")
+            # 最终回退：包围盒
+            if hasattr(self, '_bbox_x'):
+                try:
+                    self._viewer.show_bounding_box(
+                        self._bbox_x, self._bbox_y, self._bbox_z,
+                        title=f"STEP 模型包围盒 — {self._stl_path.name}",
+                    )
+                except Exception:
+                    pass
+            self._status.showMessage(
+                f"已加载 {self._stl_path.name} | "
+                f"{self._actual_layers} 层 | "
+                f"预览失败（包围盒回退）"
+            )
 
     def _on_clear_stl(self) -> None:
         """清除 STL 模型，恢复到 Demo 模式。"""
@@ -1042,9 +1272,14 @@ class MainWindow(QtWidgets.QMainWindow):
     # 槽函数 — 运行仿真
     # ========================================================================
     def _on_run(self) -> None:
-        """运行仿真按钮槽函数。"""
-        # ── 防御性编程：检查 self.mesh 数据完整性 ──
-        if self._generated_mesh is None or self.mesh is None:
+        """运行仿真按钮槽函数 —— 异步 Worker 线程版。
+
+        创建 ``SimulationWorker`` 实例并移入 ``QThread`` 执行。
+        所有密集的 VBD 物理计算在 Worker 线程中完成，主线程仅负责
+        接收信号并刷新 3D 渲染，从根本上消除"未响应"问题。
+        """
+        # ── 防御性编程：检查 self._generated_mesh 数据完整性 ──
+        if self._generated_mesh is None:
             self._log.append_log(
                 "<span style='color:orange;font-weight:bold;'>"
                 "[错误] 网格数据为空，请先点击「划分网格」</span>"
@@ -1054,21 +1289,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "错误：网格数据为空，请先点击【划分网格】生成网格后再运行仿真。"
             )
             return
-        if self.mesh.ideal_vertices is None or self.mesh.elements is None:
-            self._log.append_log(
-                "<span style='color:orange;font-weight:bold;'>"
-                "[错误] 网格关键数据 (ideal_vertices / elements) 缺失，请重新点击「划分网格」</span>"
-            )
-            QtWidgets.QMessageBox.warning(
-                self, "网格数据不完整",
-                "错误：网格的关键数据（理想顶点坐标 / 四面体索引）缺失，\n"
-                "请重新点击【划分网格】生成完整网格后再运行仿真。"
-            )
-            return
 
-        # ── 深拷贝关键数据，防止 get_config() 触发的 _on_params 清空 self.mesh ──
-        saved_ideal_vertices = self.mesh.ideal_vertices.copy()
-        saved_elements = self.mesh.elements.copy()
+        # ── 深拷贝关键数据，防止 get_config() 触发的 _on_params 清空 self._generated_mesh ──
         saved_generated_mesh = self._generated_mesh
         saved_actual_layers = self._actual_layers
 
@@ -1092,433 +1314,190 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._status.showMessage("仿真运行中 …")
 
-        # get_config() 会触发 _on_params → 清空 self._generated_mesh / self.mesh
+        # get_config() 会触发 _on_params，其内部可能清空 self._generated_mesh
         config = self._param_panel.get_config()
 
-        # ── 恢复网格数据到 self.mesh，供后续 _run_simulation 使用 ──
+        # ── 恢复网格数据，确保 Worker 构造函数获取到完整 MeshState ──
         self._generated_mesh = saved_generated_mesh
-        self.mesh = saved_generated_mesh
-        self.mesh.ideal_vertices = saved_ideal_vertices
-        self.mesh.elements = saved_elements
         self._actual_layers = saved_actual_layers
 
-        # ── C++ 求解器可用性检查 / 自动编译 ──
-        if not is_cpp_available():
-            builder = CppBuilder()
-            if builder.pyd_exists():
-                # .pyd 存在但导入失败 → 可能是旧版本或 ABI 不匹配，尝试重新编译
-                self._log.append_log("  [build] 检测到旧版 .pyd，重新编译 …")
-            else:
-                self._log.append_log("  [build] C++ 求解器未编译，开始自动编译 …")
-
-            missing = builder.check_prerequisites()
-            if missing:
-                self._log.append_log(
-                    f"  [build] 缺少依赖: {', '.join(missing)}"
-                )
-                self._log.append_log("  [build] 回退到 Python 参考求解器")
-                self._log.append_log("  [info] 使用 Python 参考求解器")
-                self._do_run_simulation(config)
-            else:
-                self._log.append_log(
-                    f"  [build] 前置条件就绪，正在后台编译 …"
-                )
-                self._start_cpp_build(builder, config)
-            return
-
-        self._log.append_log("  [info] 使用 C++ 加速求解器")
-        self._do_run_simulation(config)
-
-    def _do_run_simulation(self, config: SimulationConfig) -> None:
-        """实际执行仿真的内部方法（供 _on_run 和编译完成回调共用）。"""
         try:
-            results = self._run_simulation(config)
-            self._last_results = results
-            self._on_finish(results)
+            # ── 创建异步 Worker 并移入 QThread ──
+            self._worker = SimulationWorker(
+                mesh=self._generated_mesh,
+                config=config,
+                n_layers=self._actual_layers,
+                output_dir=Path("outputs/gui"),
+            )
+            self._thread = QtCore.QThread(self)
+
+            self._worker.moveToThread(self._thread)
+
+            # ── 连接 7 个信号 ──
+            self._worker.frame_ready.connect(self._on_worker_frame)
+            self._worker.progress_update.connect(self._on_worker_progress)
+            self._worker.log_message.connect(self._on_worker_log)
+            self._worker.finished.connect(self._on_worker_finished)
+            self._worker.error.connect(self._on_worker_error)
+            self._worker.sub_progress.connect(self._on_worker_sub_progress)
+            self._worker.layer_finished.connect(self._on_worker_layer_finished)
+
+            # ── 线程生命周期管理 ──
+            self._thread.started.connect(self._worker.run)
+            self._worker.finished.connect(self._thread.quit)
+            self._worker.finished.connect(self._worker.deleteLater)
+            self._thread.finished.connect(self._thread.deleteLater)
+            self._thread.finished.connect(
+                lambda: setattr(self, "_thread", None)
+            )
+            self._thread.finished.connect(
+                lambda: setattr(self, "_worker", None)
+            )
+
+            # ── 仿真期间禁用运行按钮 ──
+            self._btn_run.setEnabled(False)
+            self._btn_run.setText("⏳ 仿真中…")
+
+            self._thread.start()
+
         except Exception as exc:
             import traceback
-            self._log.append_log(f"\n[错误] {exc}")
+            self._log.append_log(f"\n[错误] 启动仿真线程失败: {exc}")
             self._log.append_log(traceback.format_exc())
-            self._status.showMessage("仿真失败 ✗")
+            self._status.showMessage("仿真启动失败 ✗")
 
     # ========================================================================
-    # C++ 自动编译（后台线程）
+    # Worker 信号槽（主线程 UI 更新入口）
     # ========================================================================
-    def _start_cpp_build(
-        self, builder: "CppBuilder", config: "SimulationConfig"
-    ) -> None:
-        """在后台线程启动 C++ 编译器。"""
-        self._pending_build_config = config
-        self._btn_run.setEnabled(False)
-        self._status.showMessage("正在编译 C++ 求解器 …")
 
-        # 创建 worker 和 thread
-        self._build_worker = _BuildWorker(builder)
-        self._build_thread = QtCore.QThread(self)
+    @QtCore.Slot(dict)
+    def _on_worker_frame(self, payload: dict) -> None:
+        """接收 Worker 的 ``frame_ready`` 信号，更新 3D 视图。
 
-        self._build_worker.moveToThread(self._build_thread)
+        同时将帧数据缓存到 ``animation_frames``，供仿真结束后的
+        动画回放使用。
 
-        # 线程启动 → worker.run()
-        self._build_thread.started.connect(self._build_worker.run)
-
-        # worker 完成 → 收集结果、清理线程
-        self._build_worker.build_finished.connect(self._on_cpp_build_finished)
-        self._build_worker.build_output.connect(self._log.append_log)
-
-        # worker 完成 → 退出线程
-        self._build_worker.build_finished.connect(self._build_thread.quit)
-
-        self._build_thread.start()
-
-    def _on_cpp_build_finished(self, result: "CppBuildResult") -> None:
-        """编译线程完成回调（在主线程中执行）。"""
-        # 清理线程资源
-        if self._build_thread is not None:
-            self._build_thread.wait(2000)
-            self._build_thread = None
-        self._build_worker = None
-
-        config = self._pending_build_config
-        self._pending_build_config = None
-
-        self._btn_run.setEnabled(True)
-
-        if result.success:
-            self._log.append_log("  [build] ✓ 编译成功，加载 C++ 求解器")
-            self._status.showMessage("C++ 求解器就绪 ✓")
-            if refresh_availability():
-                self._log.append_log("  [info] 使用 C++ 加速求解器")
-            else:
-                self._log.append_log("  [info] 使用 Python 参考求解器")
-        else:
-            self._log.append_log(
-                f"  [build] ⚠ 编译失败，回退到 Python 参考求解器"
-            )
-            self._log.append_log("  [info] 使用 Python 参考求解器")
-            self._status.showMessage("编译失败，使用 Python 求解器")
-
-        # 无论编译成功与否，继续执行仿真
-        if config is not None:
-            self._do_run_simulation(config)
-
-    # ========================================================================
-    def _run_simulation(self, config: SimulationConfig) -> list[LayerResult]:
-        """执行完整的逐层仿真流程。
-
-        使用已生成的 ``_generated_mesh``，逐层激活、施加 CZM 剥离力、
-        VBD 求解，PID 控制器调节电场强度，输出 VTK 可视化文件。
+        **DVR 时间轴门控**：当用户正在拖动滑块（``_dv_is_slider_down=True``）
+        时，跳过实时 3D 渲染推送，仅保留帧缓存写入。避免拖动冲突。
 
         Parameters
         ----------
-        config : SimulationConfig
-            仿真参数配置。
-
-        Returns
-        -------
-        list[LayerResult]
-            各层的仿真结果列表。
+        payload : dict
+            ``SimulationWorker.frame_ready`` 信号携带的帧数据，
+            包含 vertices / tets / active_mask / title 四个键。
         """
-        output_dir = Path("outputs/gui")
-        vtk_dir = output_dir / "vtk"
-        reports_dir = output_dir / "reports"
-        for d in (vtk_dir, reports_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        vertices: np.ndarray = payload["vertices"]
+        tets: np.ndarray | None = payload.get("tets")
+        active_mask: np.ndarray = payload["active_mask"]
+        title: str = payload.get("title", "")
 
-        # ── 防御性编程：再次校验 mesh 数据完整性（二次保险）──
-        if self.mesh is None or self.mesh.ideal_vertices is None or self.mesh.elements is None:
-            # 不弹窗（_on_run 已做过 UI 拦截），仅在日志中记录并安全退出
-            self._log.append_log(
-                "<span style='color:orange;font-weight:bold;'>"
-                "[错误] _run_simulation 中检测到网格数据丢失，仿真中断</span>"
+        if self._anim_tets is None and tets is not None:
+            self._anim_tets = tets.copy()
+
+        # ── DVR 滑块拖动门控：拖动期间抑制实时渲染 ──
+        if not self._dv_is_slider_down:
+            self._viewer.show_deformed_mesh(
+                vertices, tets, active_mask, title=title,
             )
-            return []
 
-        # 使用 self.mesh 访问持久化数据（self.mesh 即为 self._generated_mesh 的引用）
-        mesh = self.mesh
-        target_vertices = mesh.ideal_vertices.copy()
-
-        # ── 优先尝试 C++ 加速求解器 ──
-        _use_cpp_solver = False
+        # ── 缓存动画帧 ──
+        lid = -1
         try:
-            from hydrogel_vbd.solver.cpp_adapter import is_cpp_available
-
-            if is_cpp_available():
-                _use_cpp_solver = True
-                self._log.append_log(
-                    "  [info] 使用 C++ 加速求解器"
-                )
-            else:
-                self._log.append_log(
-                    "  [info] 使用 Python 参考求解器 (C++ 模块未编译)"
-                )
+            import re
+            m = re.search(r"第\s*(\d+)/", title)
+            if m:
+                lid = int(m.group(1)) - 1
         except Exception:
-            self._log.append_log(
-                "  [info] 使用 Python 参考求解器"
+            pass
+
+        self.animation_frames.append({
+            "vertices": vertices.copy(),
+            "active_mask": active_mask.copy(),
+            "title": title,
+            "layer_id": lid,
+        })
+
+    @QtCore.Slot(int, int, int, int)
+    def _on_worker_progress(
+        self, layer: int, n_layers: int, step: int, iteration: int
+    ) -> None:
+        """接收 Worker 的 ``progress_update`` 信号，更新进度条。
+
+        Parameters
+        ----------
+        layer : int
+            当前层序号（从 1 开始）。
+        n_layers : int
+            总层数。
+        step : int
+            当前步数计数器。
+        iteration : int
+            当前 VBD 迭代次数。
+        """
+        self._progress.set_layer(layer, n_layers)
+        self._status.showMessage(
+            f"仿真运行中 — 第 {layer}/{n_layers} 层 "
+            f"(步 {step}, 迭代 {iteration})"
+        )
+
+    @QtCore.Slot(str)
+    def _on_worker_log(self, message: str) -> None:
+        """接收 Worker 的 ``log_message`` 信号，追加到日志面板。
+
+        Parameters
+        ----------
+        message : str
+            日志消息字符串（支持 HTML 富文本）。
+        """
+        self._log.append_log(message)
+
+    @QtCore.Slot(list)
+    def _on_worker_finished(self, results: list[LayerResult]) -> None:
+        """接收 Worker 的 ``finished`` 信号，执行后处理。
+
+        恢复运行按钮、清除线程引用、调用 ``_on_finish`` 生成汇总
+        和启动动画回放。
+
+        Parameters
+        ----------
+        results : list[LayerResult]
+            仿真结果列表（来自 Worker）。
+        """
+        self._last_results = results
+
+        # ── 恢复运行按钮 ──
+        self._btn_run.setEnabled(True)
+        self._btn_run.setText("▶ 运行仿真")
+
+        # ── 若当前正在动画回放，先停止 ──
+        self._stop_animation_timer()
+
+        # ── 设置动画帧数据（Worker 已通过 frame_ready 填充）──
+        if self._anim_tets is None and results:
+            self._anim_tets = (
+                self._generated_mesh.tets if self._generated_mesh else None
             )
 
-        if not _use_cpp_solver:
-            solver = PythonReferenceVBDSolver(config)
-        activator = LayerActivator()
-        controller = PIDFieldController(config)
+        # ── 触发汇总逻辑 ──
+        self._on_finish(results)
 
-        results: list[LayerResult] = []
-        n_layers = self._actual_layers
+    @QtCore.Slot(str)
+    def _on_worker_error(self, error_msg: str) -> None:
+        """接收 Worker 的 ``error`` 信号，显示错误信息。
 
-        # ── 帧数据缓存：初始化动画帧列表 ──
-        self.animation_frames.clear()
-        self._anim_tets = mesh.tets.copy()
-
-        # ── 渲染降频与异步刷新 ─────────────────────────────────
-        #   render_interval:  物理引擎跑 N 步，界面才刷新 1 次
-        #   displacement_threshold:  形变积累超过此阈值时强制刷新
-        #   last_render_displacement:  上次刷新时的形变量 (m)
-        step_counter = 0
-        render_interval = 50
-        displacement_threshold = 0.1e-3  # 0.1 mm
-        last_render_displacement = 0.0
-
-        def _on_physics_iteration(
-            iteration: int, max_dx: float
-        ) -> None:
-            """物理求解器每次 VBD 迭代后的回调。
-
-            用于降频泵送 Qt 事件循环并条件性刷新 3D 视图，
-            防止长时间密集计算导致 GUI "未响应"。
-            """
-            nonlocal step_counter, last_render_displacement
-
-            step_counter += 1
-
-            # 取出当前顶点坐标（mesh.vertices 已被求解器原地更新）
-            x_current = mesh.vertices.copy()
-            current_displacement = float(
-                np.max(
-                    np.linalg.norm(
-                        x_current - mesh.ideal_vertices, axis=1
-                    )
-                )
-            )
-
-            # 条件一：步数计数器取模命中 (降频)
-            # 条件二：形变累积超过阈值 (关键帧强制刷新)
-            should_render = (
-                (step_counter % render_interval == 0)
-                or (
-                    current_displacement - last_render_displacement
-                    >= displacement_threshold
-                )
-            )
-
-            if should_render:
-                self._viewer.show_deformed_mesh(
-                    x_current,
-                    mesh.tets,
-                    mesh.active_vertex_mask,
-                    title=(
-                        f"第 {layer_id + 1}/{n_layers} 层"
-                        f" — 迭代 {iteration}"
-                    ),
-                )
-                QtWidgets.QApplication.processEvents()
-                last_render_displacement = current_displacement
-            else:
-                # 即使不渲染，也定期泵送事件循环以避免"未响应"
-                if step_counter % 20 == 0:
-                    QtWidgets.QApplication.processEvents()
-        # ────────────────────────────────────────────────────────
-
-        for layer_id in range(n_layers):
-            self._progress.set_layer(layer_id + 1, n_layers)
-            self._log.append_log(
-                f"--- 第 {layer_id + 1}/{n_layers} 层"
-                f" (E_z={controller.E_z:.3f}) ---"
-            )
-
-            # 激活当前层节点
-            activator.activate_with_inheritance(
-                mesh, layer_id, z_fep=config.z_fep
-            )
-            bottom = mesh.bottom_nodes(layer_id)
-
-            # 更新 CZM 状态
-            update_czm_states(
-                mesh,
-                bottom,
-                internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
-                area=config.node_area,
-                t_max=config.T_max,
-                k_czm=config.K_czm,
-                delta_f=config.delta_f,
-                z_fep=config.z_fep,
-                dt=config.dt,
-            )
-
-            # 平台运动学 + VBD 求解
-            if config.v_lift > 0 and np.any(mesh.is_top_fixed):
-                lifting_top = np.flatnonzero(mesh.is_top_fixed)
-                if _use_cpp_solver:
-                    from hydrogel_vbd.solver.cpp_adapter import solve_with_lift as cpp_solve_with_lift
-
-                    _ = QtWidgets.QApplication.processEvents()
-                    solve_result = cpp_solve_with_lift(
-                        mesh, config, controller.E_z, layer_id, lifting_top
-                    )
-                else:
-                    solve_result = solver.solve_with_lift(
-                        mesh,
-                        layer_id=layer_id,
-                        e_z=controller.E_z,
-                        lifting_top=lifting_top,
-                        on_iteration=_on_physics_iteration,
-                    )
-                self._log.append_log(
-                    f"  提升完成, 静平衡迭代 {solve_result.iterations} 步, "
-                    f"max_dx={solve_result.max_dx:.2e}"
-                )
-            else:
-                if _use_cpp_solver:
-                    from hydrogel_vbd.solver.cpp_adapter import solve_until_stable as cpp_solve_until_stable
-
-                    _ = QtWidgets.QApplication.processEvents()
-                    solve_result = cpp_solve_until_stable(
-                        mesh, config, controller.E_z, layer_id
-                    )
-                else:
-                    solve_result = solver.solve_until_stable(
-                        mesh,
-                        layer_id=layer_id,
-                        e_z=controller.E_z,
-                        on_iteration=_on_physics_iteration,
-                    )
-
-            x_sim, v_sim = solve_result.x, solve_result.v
-
-            # PID 反馈
-            err_avg = (
-                float(
-                    np.mean(
-                        target_vertices[bottom, 2] - x_sim[bottom, 2]
-                    )
-                )
-                if len(bottom)
-                else 0.0
-            )
-            pid_state = controller.update(err_avg=err_avg)
-
-            # 形状误差指标
-            max_error = float(
-                np.max(
-                    np.linalg.norm(
-                        target_vertices - x_sim, axis=1
-                    )
-                )
-            )
-            rms_error = float(
-                np.sqrt(
-                    np.mean(
-                        np.sum(
-                            (target_vertices - x_sim) ** 2,
-                            axis=1,
-                        )
-                    )
-                )
-            )
-
-            self._log.append_log(
-                f"  max_error={max_error:.4f}, rms_error={rms_error:.4f}, "
-                f"kinetic={solve_result.kinetic_energy:.2e}, "
-                f"E_z_next={pid_state.E_z:.3f}"
-            )
-
-            # 封装结果
-            result = LayerResult(
-                layer_id=layer_id,
-                x_sim=x_sim.copy(),
-                v_sim=v_sim.copy(),
-                error_metrics={
-                    "err_avg": err_avg,
-                    "E_z": pid_state.E_z,
-                    "max_error": max_error,
-                    "rms_error": rms_error,
-                },
-                field_command_next=None,
-                max_deformation=max_error,
-                rms_error=rms_error,
-                success=bool(max_error < 2.0),
-            )
-            results.append(result)
-
-            # ── 每层完成后的 GUI 更新（保证层间可见）──
-            self._viewer.show_deformed_mesh(
-                x_sim,
-                mesh.tets,
-                mesh.active_vertex_mask,
-                title=f"第 {layer_id + 1}/{n_layers} 层 — 层完成",
-            )
-            QtWidgets.QApplication.processEvents()
-
-            # ── 缓存动画帧：每层完成后保存一帧 ──
-            self.animation_frames.append({
-                "vertices": x_sim.copy(),
-                "active_mask": mesh.active_vertex_mask.copy(),
-                "title": f"第 {layer_id + 1}/{n_layers} 层 — 层完成",
-            })
-
-            # 输出 VTU（包含丰富的场数据供 ParaView 分析）
-            disp = np.linalg.norm(x_sim - mesh.ideal_vertices, axis=1)
-            write_vtu(
-                vtk_dir / f"layer_{layer_id:04d}.vtu",
-                mesh,
-                point_data={
-                    "active": mesh.active_vertex_mask.astype(float),
-                    "layer_id": mesh.layer_id_per_vertex.astype(np.int32)
-                        if mesh.layer_id_per_vertex is not None
-                        else np.zeros(len(mesh.vertices), dtype=np.int32),
-                    "damage": mesh.damage.astype(np.float32),
-                    "czm_state": mesh.czm_state.astype(np.float32),
-                    "displacement": disp.astype(np.float32),
-                },
-                field_types={
-                    "active": "Float32",
-                    "layer_id": "Int32",
-                    "damage": "Float32",
-                    "czm_state": "Float32",
-                    "displacement": "Float32",
-                },
-            )
-
-        # ── 强制末帧刷新：仿真循环结束后确保显示最终结果 ──
-        if results:
-            final_result = results[-1]
-            self._viewer.show_deformed_mesh(
-                final_result.x_sim,
-                mesh.tets,
-                mesh.active_vertex_mask,
-                title=f"仿真完成 — 全部 {n_layers} 层",
-            )
-            QtWidgets.QApplication.processEvents()
-            self._log.append_log(
-                "  ✓ 末帧已刷新 — 3D 视图显示最终变形结果"
-            )
-
-            # ── 缓存最终帧 ──
-            self.animation_frames.append({
-                "vertices": final_result.x_sim.copy(),
-                "active_mask": mesh.active_vertex_mask.copy(),
-                "title": f"仿真完成 — 全部 {n_layers} 层",
-            })
-
-        # CSV 汇总
-        write_metrics_csv(reports_dir / "error_metrics.csv", results)
-
-        # ── 无缝衔接：仿真结束后自动启动动画回放 ──
-        if self.animation_frames:
-            self._log.append_log(
-                f"  🎬 已缓存 {len(self.animation_frames)} 帧，启动动画回放 …"
-            )
-            self.start_animation_playback()
-
-        return results
+        Parameters
+        ----------
+        error_msg : str
+            错误信息和回溯字符串。
+        """
+        self._btn_run.setEnabled(True)
+        self._btn_run.setText("▶ 运行仿真")
+        self._log.append_log(f"\n[严重错误] {error_msg}")
+        self._status.showMessage("仿真线程崩溃 ✗")
+        QtWidgets.QMessageBox.critical(
+            self, "仿真线程错误",
+            f"仿真线程发生不可恢复的错误:\n\n{error_msg}",
+        )
 
     # ========================================================================
     # 后处理动画回放
@@ -1532,8 +1511,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_animation_playback(self) -> None:
         """启动后处理动画回放。
 
-        使用 ``QtCore.QTimer`` 循环播放仿真过程中缓存的所有帧。
-        若动画已在运行则先停止再重启。
+        使用 ``QtCore.QTimer`` 以约 30 FPS（33 ms 间隔）循环播放
+        仿真过程中缓存的所有帧。若动画已在运行则先停止再重启。
+        播放启动时显示动画播放控制面板。
         """
         if not self.animation_frames:
             self._log.append_log(
@@ -1543,75 +1523,212 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 停止已有的定时器（如果正在播放）
         self._stop_animation_timer()
-
+        self._anim_paused = False
+        self._anim_layer_filter = None
         self.current_frame_idx = 0
-        self._anim_interp = 0.0  # 帧间插值因子 [0, 1)
 
-        # 创建定时器：33 ms → ~30 FPS
+        # ── 填充层筛选下拉框 ──
+        if self._anim_layer_combo is not None:
+            self._anim_layer_combo.blockSignals(True)
+            self._anim_layer_combo.clear()
+            self._anim_layer_combo.addItem("全部层", -1)
+            unique_layers = sorted({
+                f["layer_id"]
+                for f in self.animation_frames
+                if "layer_id" in f
+            })
+            for lid in unique_layers:
+                self._anim_layer_combo.addItem(f"第 {lid + 1} 层", lid)
+            self._anim_layer_combo.setCurrentIndex(0)
+            self._anim_layer_combo.blockSignals(False)
+
+        # ── 重建帧索引映射 ──
+        self._rebuild_frame_indices()
+
+        # ── 显示控制面板 ──
+        self._set_anim_panel_visible(True)
+
+        # 创建定时器：约 33 ms → ~30 FPS
         self._anim_timer = QtCore.QTimer(self)
         self._anim_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._anim_timer.timeout.connect(self._update_anim_frame)
         self._anim_timer.start(33)
 
-        # 显示"停止回放"按钮
+        # 更新顶部栏的停止回放按钮
         self._btn_stop_anim.setVisible(True)
 
         self._log.append_log(
             "  ▶ 动画回放开始 (循环播放, ~30 FPS, "
-            f"{len(self.animation_frames)} 帧)"
+            f"{len(self.animation_frames)} 帧, "
+            f"筛选后 {len(self._frame_indices)} 帧)"
         )
         self._status.showMessage(
-            f"动画回放中 … [{len(self.animation_frames)} 帧]"
+            f"动画回放中 … [{len(self._frame_indices)} 帧]"
         )
+
+    def _set_anim_panel_visible(self, visible: bool) -> None:
+        """统一控制动画面板所有控件的可见性。"""
+        if self._btn_anim_play is not None:
+            self._btn_anim_play.setVisible(visible)
+        if self._btn_anim_pause is not None:
+            self._btn_anim_pause.setVisible(visible)
+        if hasattr(self, '_btn_stop_anim_from_panel') and self._btn_stop_anim_from_panel is not None:
+            self._btn_stop_anim_from_panel.setVisible(visible)
+        if self._anim_frame_label is not None:
+            self._anim_frame_label.setVisible(visible)
+        if self._anim_layer_combo is not None:
+            self._anim_layer_combo.setVisible(visible)
+        if self._anim_slider is not None:
+            self._anim_slider.setVisible(visible)
+
+    def _rebuild_frame_indices(self) -> None:
+        """根据当前层筛选重建帧索引映射列表。
+
+        若 ``_anim_layer_filter`` 为 None，包含全部帧；
+        否则仅保留 ``layer_id`` 匹配的帧。
+        同时更新 Slider 范围和显示。
+        """
+        self._frame_indices.clear()
+        for i, f in enumerate(self.animation_frames):
+            lid = f.get("layer_id")
+            if self._anim_layer_filter is None or lid == self._anim_layer_filter:
+                self._frame_indices.append(i)
+
+        # 更新 Slider 范围
+        n_filt = len(self._frame_indices)
+        if self._anim_slider is not None:
+            self._anim_slider.blockSignals(True)
+            self._anim_slider.setRange(0, max(n_filt - 1, 0))
+            self._anim_slider.setValue(min(self.current_frame_idx, max(n_filt - 1, 0)))
+            self._anim_slider.blockSignals(False)
+
+        # 钳制当前帧索引
+        if self.current_frame_idx >= n_filt:
+            self.current_frame_idx = 0
+
+        # 更新帧标签
+        if self._anim_frame_label is not None:
+            total = n_filt
+            self._anim_frame_label.setText(
+                f"帧: {self.current_frame_idx + 1} / {total}"
+            )
 
     def _update_anim_frame(self) -> None:
         """逐帧渲染动画：每次定时器超时时调用。
 
-        在相邻帧之间线性插值顶点位置，消除跳跃感，
-        到达最后一帧后自动回到第 0 帧实现无限循环。
+        按 ``_frame_indices`` 筛选后的顺序读取帧数据，
+        调用 ``_viewer.show_deformed_mesh`` 刷新 3D 视图。
+        播放到最后一帧后自动回到第 0 帧实现无限循环。
+        同步更新 Slider 位置和帧标签。
         """
-        if not self.animation_frames or self._anim_tets is None:
+        if not self._frame_indices or self._anim_tets is None:
             self._stop_animation_timer()
             return
 
-        n_frames = len(self.animation_frames)
-        if n_frames == 1:
-            frame = self.animation_frames[0]
-            interp_verts = frame["vertices"]
-            active_mask = frame["active_mask"]
-            title = f"回放 — {frame['title']}"
-        else:
-            idx_a = self.current_frame_idx
-            idx_b = (self.current_frame_idx + 1) % n_frames
-            t = self._anim_interp
-            frame_a = self.animation_frames[idx_a]
-            frame_b = self.animation_frames[idx_b]
-            interp_verts = frame_a["vertices"].astype(np.float32) * (1 - t) + frame_b["vertices"].astype(np.float32) * t
-            active_mask = frame_a["active_mask"]
-            title = f"回放 — {frame_a['title']}"
+        if self._anim_paused:
+            return
+
+        n_filt = len(self._frame_indices)
+        if n_filt == 0:
+            return
+
+        real_idx = self._frame_indices[self.current_frame_idx]
+        if real_idx >= len(self.animation_frames):
+            real_idx = 0
+
+        frame = self.animation_frames[real_idx]
 
         self._viewer.show_deformed_mesh(
-            interp_verts,
+            frame["vertices"],
             self._anim_tets,
-            active_mask,
-            title=title,
-            color_mode=self._color_mode,
-            layer_id_per_vertex=self.mesh.layer_id_per_vertex if self.mesh else None,
-            damage=self.mesh.damage if self.mesh else None,
-            czm_state=self.mesh.czm_state if self.mesh else None,
+            frame["active_mask"],
+            title=f"🔁 回放 — {frame['title']}",
         )
         QtWidgets.QApplication.processEvents()
 
-        # 推进插值因子：每个 tick 约前进 0.15（~7 ticks/帧 ≈ 平滑过渡）
-        self._anim_interp += 0.15
-        if self._anim_interp >= 1.0:
-            self._anim_interp = 0.0
-            self.current_frame_idx = (self.current_frame_idx + 1) % n_frames
+        # 更新 Slider 和帧标签（双向绑定中的主动方向）
+        if self._anim_slider is not None:
+            self._anim_slider.blockSignals(True)
+            self._anim_slider.setValue(self.current_frame_idx)
+            self._anim_slider.blockSignals(False)
+
+        if self._anim_frame_label is not None:
+            self._anim_frame_label.setText(
+                f"帧: {self.current_frame_idx + 1} / {n_filt}"
+            )
+
+        # 循环播放：到达末尾后回到第 0 帧
+        self.current_frame_idx += 1
+        if self.current_frame_idx >= n_filt:
+            self.current_frame_idx = 0
+
+    # ── 动画控制面板信号槽 ──
+
+    def _on_anim_play_clicked(self) -> None:
+        """「播放」按钮：从头开始播放动画。"""
+        if not self.animation_frames:
+            return
+        self._anim_paused = False
+        self.current_frame_idx = 0
+        if self._anim_slider is not None:
+            self._anim_slider.setValue(0)
+
+    def _on_anim_pause_clicked(self) -> None:
+        """「暂停」按钮：切换暂停/继续状态。"""
+        self._anim_paused = not self._anim_paused
+        if self._btn_anim_pause is not None:
+            self._btn_anim_pause.setText("▶ 继续" if self._anim_paused else "⏸ 暂停")
+            self._btn_anim_pause.setToolTip(
+                "继续动画回放" if self._anim_paused else "暂停动画回放"
+            )
+
+    def _on_anim_layer_filter_changed(self, _index: int) -> None:
+        """层筛选下拉框变更：重建帧索引并重置到第 0 帧。"""
+        if self._anim_layer_combo is None:
+            return
+        data = self._anim_layer_combo.currentData()
+        if data == -1:
+            self._anim_layer_filter = None
+        else:
+            self._anim_layer_filter = int(data)
+        self.current_frame_idx = 0
+        self._rebuild_frame_indices()
+
+    def _on_anim_slider_changed(self, value: int) -> None:
+        """Slider 值变更：跳转到指定筛选帧（用户拖动时触发）。
+
+        注意：blockSignals 用于防止 _update_anim_frame 更新
+        Slider 时触发递归调用。
+        """
+        if self._anim_slider is None:
+            return
+        # 仅当信号未被阻塞时处理（即用户主动拖动）
+        if self._anim_slider.signalsBlocked():
+            return
+        n_filt = len(self._frame_indices)
+        if 0 <= value < n_filt:
+            self.current_frame_idx = value
+            # 立即渲染该帧
+            real_idx = self._frame_indices[value]
+            if real_idx < len(self.animation_frames):
+                frame = self.animation_frames[real_idx]
+                if self._anim_tets is not None:
+                    self._viewer.show_deformed_mesh(
+                        frame["vertices"],
+                        self._anim_tets,
+                        frame["active_mask"],
+                        title=f"🔁 回放 — {frame['title']}",
+                    )
+                    QtWidgets.QApplication.processEvents()
+            if self._anim_frame_label is not None:
+                self._anim_frame_label.setText(
+                    f"帧: {value + 1} / {n_filt}"
+                )
 
     def _on_stop_animation(self) -> None:
         """手动停止动画回放，恢复初始网格视图。
 
-        停止定时器，清空动画帧缓存，隐藏停止按钮，
+        停止定时器，清空动画帧缓存，隐藏停止按钮和控制面板，
         并将 3D 视图恢复为划分网格后的初始状态。
         """
         # 停止定时器
@@ -1621,9 +1738,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.animation_frames.clear()
         self._anim_tets = None
         self.current_frame_idx = 0
+        self._frame_indices.clear()
+        self._anim_paused = False
+        self._anim_layer_filter = None
 
         # 隐藏停止按钮
         self._btn_stop_anim.setVisible(False)
+        # 隐藏面板控件
+        self._set_anim_panel_visible(False)
 
         # 恢复 3D 视图为初始网格（如果存在）
         if self._generated_mesh is not None:
@@ -1640,19 +1762,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log.append_log("  ⏹ 动画回放已手动停止")
 
     def _on_finish(self, results: list[LayerResult]) -> None:
-        """仿真完成回调 —— 委托到 _on_simulation_finished。"""
-        self._on_simulation_finished(results)
-
-    def _on_color_mode_changed(self, index: int) -> None:
-        """着色模式切换回调。"""
-        mode_map = {0: "active", 1: "layer", 2: "damage", 3: "displacement", 4: "czm"}
-        self._color_mode = mode_map.get(index, "active")
-        # 立即刷新当前动画帧（如果正在播放）
-        if self._anim_timer is not None and self._anim_timer.isActive():
-            self._anim_interp = 0.0  # 重置插值
-
-    def _on_simulation_finished(self, results: list[LayerResult]) -> None:
-        """仿真完成汇总。
+        """仿真完成汇总，并弹出电场-误差分析窗口。
 
         Parameters
         ----------
@@ -1677,28 +1787,398 @@ class MainWindow(QtWidgets.QMainWindow):
             f"成功 {success_count}/{len(results)} 层"
         )
 
+        # ── 弹出电场-误差分析窗口 ──
+        if _HAS_MPL and results:
+            try:
+                analysis_win = ElectricFieldPlotWindow(results, self)
+                analysis_win.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+                analysis_win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+                analysis_win.show()
+                self._log.append_log("  📊 已弹出电场-误差分析图窗")
+            except Exception as exc:
+                self._log.append_log(f"  ⚠ 分析图窗创建失败: {exc}")
+        elif not _HAS_MPL:
+            self._log.append_log(
+                "  ⚠ matplotlib 未安装，跳过分析图窗。"
+                " 请运行: pip install matplotlib"
+            )
 
-# ============================================================================
-# C++ 编译后台 Worker（QThread 模式）
-# ============================================================================
-class _BuildWorker(QtCore.QObject):
-    """在后台线程中执行 C++ 编译的 worker 对象。"""
 
-    build_output = QtCore.Signal(str)       # 实时输出行
-    build_finished = QtCore.Signal(CppBuildResult)  # 编译完成（携带结果）
+    # ========================================================================
+    # DVR 实时时间轴槽函数
+    # ========================================================================
 
-    def __init__(self, builder: "CppBuilder") -> None:
-        super().__init__()
-        self._builder = builder
+    @QtCore.Slot(int, int, int)
+    def _on_worker_sub_progress(
+        self, layer_idx: int, percentage: int, step_count: int
+    ) -> None:
+        """接收 Worker 的 ``sub_progress`` 信号，更新细粒度子进度条。
 
-    @QtCore.Slot()
-    def run(self) -> None:
-        """在后台线程中执行编译。"""
-        def on_line(line: str) -> None:
-            self.build_output.emit(line)
+        Parameters
+        ----------
+        layer_idx : int
+            当前层序号（从 0 开始）。
+        percentage : int
+            0–100 的整数，当前层内提升进度。
+        step_count : int
+            总步数计数器。
+        """
+        # ── 更新绿色子进度条 ──
+        self._progress.set_sub_progress(percentage)
 
-        result = self._builder.build(on_line=on_line)
-        self.build_finished.emit(result)
+        # ── 更新 DVR 时间轴标签 ──
+        if self._dv_label is not None:
+            self._dv_label.setText(
+                f"层 {layer_idx + 1}/{self._actual_layers} — {percentage}%"
+            )
+
+    @QtCore.Slot(object)
+    def _on_worker_layer_finished(self, result: "LayerResult") -> None:
+        """接收 Worker 的 ``layer_finished`` 信号。
+
+        每层完成后更新 DVR 时间轴滑块范围和标签，
+        并实时绘制电场-误差迷你图表。
+
+        Parameters
+        ----------
+        result : LayerResult
+            当前层的结果对象。
+        """
+        layer_id = int(getattr(result, "layer_id", 0))
+        total_layers = self._actual_layers or 1
+
+        # ── 更新 DVR 滑块范围 ──
+        if self._dv_slider is not None:
+            self._dv_slider.blockSignals(True)
+            self._dv_slider.setRange(0, total_layers - 1)
+            self._dv_slider.setValue(layer_id)
+            self._dv_slider.blockSignals(False)
+
+        # ── 实时电场数据采集 ──
+        e_z = (
+            result.error_metrics.get("E_z", 0.0)
+            if hasattr(result, "error_metrics") and result.error_metrics
+            else 0.0
+        )
+        max_err = getattr(result, "max_deformation", 0.0)
+        rms_err = getattr(result, "rms_error", 0.0)
+        self._dv_efield_layer_data.append(
+            (layer_id, float(e_z), float(max_err), float(rms_err))
+        )
+
+        # ── 绘制迷你电场图表 ──
+        self._draw_dv_efield_chart()
+
+    def _draw_dv_efield_chart(self) -> None:
+        """在迷你 matplotlib 嵌板中实时绘制 E_z 逐层折线图。
+
+        仅在 ``matplotlib`` 可用且嵌板已创建时执行。
+        """
+        if self._dv_efield_fig is None or self._dv_efield_canvas is None:
+            return
+        if not self._dv_efield_layer_data:
+            return
+
+        fig = self._dv_efield_fig
+        fig.clear()
+
+        ax = fig.add_subplot(1, 1, 1)
+        layer_ids = [d[0] for d in self._dv_efield_layer_data]
+        e_z_vals = [d[1] for d in self._dv_efield_layer_data]
+
+        ax.plot(
+            layer_ids, e_z_vals,
+            "b-o", markersize=3, linewidth=1.2,
+            label="E_z (V/m)",
+        )
+        ax.set_xlabel("层", fontsize=7)
+        ax.set_ylabel("E_z", fontsize=7, color="b")
+        ax.tick_params(axis="both", labelsize=6)
+        ax.set_title("实时 E_z 逐层", fontsize=8)
+        ax.grid(True, alpha=0.25)
+
+        fig.tight_layout(pad=0.8)
+        fig.canvas.draw_idle()
+
+    # ── DVR 滑块交互槽 ──
+
+    def _on_dv_slider_pressed(self) -> None:
+        """用户开始拖动 DVR 时间轴滑块。"""
+        self._dv_is_slider_down = True
+
+    def _on_dv_slider_released(self) -> None:
+        """用户释放 DVR 时间轴滑块。
+
+        关闭门控并立即渲染当前滑块位置对应的最新帧缓存。
+        """
+        self._dv_is_slider_down = False
+
+        # ── 查找滑块位置 (layer_id) 对应的最新帧 ──
+        if self._dv_slider is None:
+            return
+        target_layer = self._dv_slider.value()
+        self._render_dv_layer_frame(target_layer)
+
+    def _on_dv_slider_changed(self, value: int) -> None:
+        """DVR 滑块值变化时更新标签。"""
+        if self._dv_label is not None:
+            self._dv_label.setText(
+                f"查看: 第 {value + 1}/{self._actual_layers} 层"
+            )
+
+    def _render_dv_layer_frame(self, target_layer: int) -> None:
+        """从 ``animation_frames`` 缓存中查找目标层的最后一帧并渲染。
+
+        Parameters
+        ----------
+        target_layer : int
+            目标层序号（从 0 开始）。
+        """
+        # ── 逆序查找目标层的最新帧 ──
+        best_idx = -1
+        for i in range(len(self.animation_frames) - 1, -1, -1):
+            lid = self.animation_frames[i].get("layer_id", -1)
+            if lid == target_layer:
+                best_idx = i
+                break
+
+        if best_idx < 0:
+            # ── 向前顺向查找最近的一帧 ──
+            for i in range(len(self.animation_frames)):
+                lid = self.animation_frames[i].get("layer_id", -1)
+                if lid >= 0 and lid <= target_layer:
+                    best_idx = i
+                else:
+                    break
+            if best_idx < 0:
+                return
+
+        frame = self.animation_frames[best_idx]
+        tets = self._anim_tets if self._anim_tets is not None else frame.get("tets")
+        self._viewer.show_deformed_mesh(
+            frame["vertices"],
+            tets,
+            frame["active_mask"],
+            title=(
+                f"📽 DVR 定位 — 第 {target_layer + 1} 层"
+                f" — {frame['title']}"
+            ),
+        )
+        QtWidgets.QApplication.processEvents()
+
+class ElectricFieldPlotWindow(QtWidgets.QDialog):
+    """电场-误差追踪分析窗口。
+
+    仿真完成后弹出，嵌入 matplotlib 双面板图表：
+    - **左上**：E_z 电场强度 vs 层数折线图（右侧 y 轴为累计误差百分比填充）
+    - **右下**：max_error 与 rms_error 双线对比图
+
+    支持 PNG / SVG 格式保存到 outputs/gui/reports/ 目录。
+
+    Parameters
+    ----------
+    results : list[LayerResult]
+        各层仿真结果列表。
+    parent : QWidget or None
+        父窗口。
+    """
+
+    _DEFAULT_SAVE_DIR = Path("outputs/gui/reports")
+
+    def __init__(
+        self,
+        results: list[LayerResult],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._results = results
+        self.setWindowTitle("电场-误差追踪分析")
+        self.resize(800, 500)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # ── 创建 matplotlib Figure 和 Canvas ──
+        fig = Figure(figsize=(8, 4.5), dpi=100)
+        self._fig = fig
+        canvas = FigureCanvas(fig)
+        layout.addWidget(canvas)
+
+        # ── 保存按钮行 ──
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch()
+
+        btn_save_png = QtWidgets.QPushButton("💾 保存 PNG")
+        btn_save_png.setFixedHeight(28)
+        btn_save_png.clicked.connect(lambda: self._save_figure("png"))
+        btn_layout.addWidget(btn_save_png)
+
+        btn_save_svg = QtWidgets.QPushButton("💾 保存 SVG")
+        btn_save_svg.setFixedHeight(28)
+        btn_save_svg.clicked.connect(lambda: self._save_figure("svg"))
+        btn_layout.addWidget(btn_save_svg)
+
+        layout.addLayout(btn_layout)
+
+        # ── 绑制图表 ──
+        self._draw_charts()
+
+    # ────────────────────────────────────────────────────────
+    # 数据提取
+    # ────────────────────────────────────────────────────────
+
+    def _extract_data(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """从结果列表中提取绘制所需的数据列。
+
+        Returns
+        -------
+        layers : np.ndarray
+            层序号 (0, 1, 2, ...)。
+        e_z_vals : np.ndarray
+            各层电场强度 E_z。
+        max_err : np.ndarray
+            各层最大形变误差。
+        rms_err : np.ndarray
+            各层 RMS 误差。
+        cum_pct : np.ndarray
+            累计误差百分比（归一化到 0-100 %）。
+        """
+        n = len(self._results)
+        layers = np.arange(n, dtype=int)
+        e_z_vals = np.array(
+            [r.error_metrics.get("E_z", 0.0) if hasattr(r, "error_metrics") else 0.0
+             for r in self._results],
+            dtype=float,
+        )
+        max_err = np.array([r.max_deformation for r in self._results], dtype=float)
+        rms_err = np.array([r.rms_error for r in self._results], dtype=float)
+
+        # 累计误差百分比
+        cum_sum = np.cumsum(max_err)
+        total = cum_sum[-1] if cum_sum[-1] > 0 else 1.0
+        cum_pct = cum_sum / total * 100.0
+
+        return layers, e_z_vals, max_err, rms_err, cum_pct
+
+    # ────────────────────────────────────────────────────────
+    # 绘图
+    # ────────────────────────────────────────────────────────
+
+    def _draw_charts(self) -> None:
+        """绑制双面板图表。
+
+        左上（axes[0]）：E_z 折线图 + 右侧 y 轴累计百分比填充
+        右下（axes[1]）：max_error 与 rms_error 双线对比
+        """
+        fig = self._fig
+        fig.clear()
+
+        layers, e_z_vals, max_err, rms_err, cum_pct = self._extract_data()
+
+        # ── 左上：E_z 电场 ──
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax1.plot(layers, e_z_vals, "b-o", markersize=4, linewidth=1.5, label="E_z (V/m)")
+        ax1.set_xlabel("层序号")
+        ax1.set_ylabel("E_z (V/m)", color="b")
+        ax1.tick_params(axis="y", labelcolor="b")
+        ax1.set_title("电场强度 E_z 逐层变化")
+        ax1.grid(True, alpha=0.3)
+
+        # 右侧 y 轴：累计误差百分比填充
+        ax1b = ax1.twinx()
+        ax1b.fill_between(
+            layers,
+            cum_pct,
+            0,
+            alpha=0.15,
+            color="orange",
+            label="累计误差 (%)",
+        )
+        ax1b.plot(
+            layers,
+            cum_pct,
+            "orange",
+            linestyle="--",
+            linewidth=1.0,
+            markersize=3,
+            marker="s",
+            markerfacecolor="orange",
+        )
+        ax1b.set_ylabel("累计误差 (%)", color="orange")
+        ax1b.tick_params(axis="y", labelcolor="orange")
+        ax1b.set_ylim(0, 105)
+
+        # 合并图例
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1b.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+
+        # ── 右下：max_error / rms_error 对比 ──
+        ax2 = fig.add_subplot(2, 2, 4)
+        ax2.plot(
+            layers,
+            max_err,
+            "r-s",
+            markersize=4,
+            linewidth=1.5,
+            label="max_error (m)",
+        )
+        ax2.plot(
+            layers,
+            rms_err,
+            "g-^",
+            markersize=4,
+            linewidth=1.5,
+            label="rms_error (m)",
+        )
+        ax2.set_xlabel("层序号")
+        ax2.set_ylabel("误差 (m)")
+        ax2.set_title("形状误差对比")
+        ax2.legend(loc="upper left", fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.canvas.draw()
+
+    # ────────────────────────────────────────────────────────
+    # 保存
+    # ────────────────────────────────────────────────────────
+
+    def _save_figure(self, fmt: str) -> None:
+        """将当前图表保存为 PNG 或 SVG 文件。
+
+        Parameters
+        ----------
+        fmt : str
+            文件格式扩展名 ("png" 或 "svg")。
+        """
+        self._DEFAULT_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        default_name = f"electric_field_error_analysis.{fmt}"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            f"保存图表为 {fmt.upper()}",
+            str(self._DEFAULT_SAVE_DIR / default_name),
+            f"{fmt.upper()} 文件 (*.{fmt})",
+        )
+        if not path:
+            return
+
+        try:
+            self._fig.savefig(path, dpi=150, bbox_inches="tight")
+            QtWidgets.QMessageBox.information(
+                self,
+                "保存成功",
+                f"图表已保存至:\n{path}",
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "保存失败",
+                f"无法保存图表:\n{exc}",
+            )
 
 
 def launch_gui() -> None:

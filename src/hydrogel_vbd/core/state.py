@@ -508,8 +508,14 @@ class MeshState:
 
     @property
     def masses(self) -> np.ndarray:
-        """返回节点质量的副本（兼容性属性）。"""
-        return self.node_mass.copy() if self.node_mass is not None else np.ones(self.vertices.shape[0], dtype=float)
+        """返回节点质量的持久化引用（绝对禁止 .copy()，防止 GC 销毁悬空指针）。
+
+        若 ``node_mass`` 尚未初始化（None），则自动按密度 1.0 计算并存储。
+        返回的是原始数组引用，确保 C++ Eigen::Map 映射的内存不被回收。
+        """
+        if self.node_mass is None:
+            self.node_mass = self._build_node_masses(density=1.0)
+        return self.node_mass
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
