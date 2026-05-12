@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 class MultiphysicsVbdPidTests(unittest.TestCase):
     def test_czm_state_machine_softens_then_releases_and_free_time_advances(self):
-        from hydrogel_vbd.forces.czm import CZMState, update_czm_states
+        from hydrogel_vbd.physics.czm import CZMState, update_czm_states
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 
         mesh, _ = ConformalMeshPipeline.create_demo(layers=1, layer_thickness=0.05)
@@ -34,33 +34,44 @@ class MultiphysicsVbdPidTests(unittest.TestCase):
         self.assertTrue(np.all(mesh.time_free[bottom] > 0.0))
 
     def test_local_physics_terms_have_force_and_hessian_and_fluid_is_cut_off(self):
-        from hydrogel_vbd.config import SimulationConfig
-        from hydrogel_vbd.forces.local_terms import build_local_physics_terms
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.local_terms import build_local_physics_terms
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
-        from hydrogel_vbd.forces.czm import CZMState
+        from hydrogel_vbd.physics.czm import CZMState
 
         config = SimulationConfig()
         mesh, _ = ConformalMeshPipeline.create_demo(layers=1, layer_thickness=0.05)
         mesh.activate_layer(0)
         bottom = mesh.bottom_nodes(0)
         mesh.czm_state[bottom] = CZMState.FREE
-        mesh.vertices[bottom, 2] = config.d_min * 10.0
-        mesh.prev_vertices[bottom, 2] = 0.0
 
-        terms = build_local_physics_terms(mesh, config, e_z=10.0, x_prev=mesh.prev_vertices)
+        # ── 构建纯流体拖曳场景：F = I 无弹性形变 ──
+        mesh.vertices = mesh.ideal_vertices * config.c_shrink
+        # 底部 z 向上微抬 d_min*10，prev 留在原始位置产生向上速度
+        mesh.vertices[bottom, 2] += config.d_min * 10.0
+        mesh.prev_vertices[bottom, 2] = mesh.ideal_vertices[bottom, 2] * config.c_shrink
+
+        # (a) 流体激活跃：time_free 小 → 满足 t_fluid_max 条件
+        mesh.time_free[bottom] = 0.0
+        terms = build_local_physics_terms(mesh, config, e_z=0.0, x_prev=mesh.prev_vertices)
 
         self.assertEqual(terms.force.shape, mesh.vertices.shape)
         self.assertEqual(terms.hessian.shape, (mesh.vertices.shape[0], 3, 3))
         self.assertTrue(np.all(terms.force[bottom, 2] < 0.0))
         self.assertTrue(np.all(terms.hessian[bottom, 2, 2] > 0.0))
 
-        mesh.vertices[bottom, 2] = config.d_fluid_max * 2.0
-        far_terms = build_local_physics_terms(mesh, config, e_z=10.0, x_prev=mesh.prev_vertices)
-        self.assertTrue(np.all(far_terms.hessian[bottom, 2, 2] < terms.hessian[bottom, 2, 2]))
+        # (b) 流体截止：time_free ≥ t_fluid_max → 跳过流体贡献
+        mesh.time_free[bottom] = config.t_fluid_max + 1.0
+        far_terms = build_local_physics_terms(mesh, config, e_z=0.0, x_prev=mesh.prev_vertices)
+
+        # 流体 Hessian 被移除，总 Hessian 应下降（弹性部分不变）
+        hessian_drop = terms.hessian[bottom, 2, 2] - far_terms.hessian[bottom, 2, 2]
+        self.assertTrue(np.all(hessian_drop > 0.0),
+                        f"fluid Hessian not removed (drop={hessian_drop})")
 
     def test_vbd_solver_skips_fixed_nodes_tracks_convergence_and_blocks_damaging_extrapolation(self):
-        from hydrogel_vbd.config import SimulationConfig
-        from hydrogel_vbd.forces.czm import CZMState
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.czm import CZMState
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
         from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
 
@@ -82,7 +93,7 @@ class MultiphysicsVbdPidTests(unittest.TestCase):
         self.assertEqual(result.chebyshev_skipped_damaging, int(len(bottom)))
 
     def test_pid_controller_and_outputs_use_average_sag_and_m150(self):
-        from hydrogel_vbd.config import SimulationConfig
+        from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.control.field_controller import PIDFieldController
         from hydrogel_vbd.io.gcode_exporter import insert_pid_field_commands
 
@@ -100,7 +111,7 @@ class MultiphysicsVbdPidTests(unittest.TestCase):
         self.assertIn("M150 E", gcode)
 
     def test_demo_loop_exports_pid_report_json_and_gcode(self):
-        from hydrogel_vbd.main_loop import run_demo
+        from hydrogel_vbd.core.main_loop import run_demo
 
         output_dir = ROOT / "outputs" / "architecture_demo_test"
         if output_dir.exists():

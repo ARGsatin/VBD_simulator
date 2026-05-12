@@ -1,1 +1,0 @@
-"""Hydrogel material models."""
