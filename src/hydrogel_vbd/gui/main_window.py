@@ -272,6 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_auto_res: QtWidgets.QLabel | None = None
         # ── 网格算法选择器 ──
         self._combo_mesh_algo: QtWidgets.QComboBox | None = None
+        self._chk_use_cpp: QtWidgets.QCheckBox | None = None
 
         # ── 后处理动画回放状态 ──
         self.animation_frames: list[dict[str, Any]] = []
@@ -449,6 +450,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "标准非结构化算法: 跳过切片，直接生成自由四面体网格"
         )
         info_layout_1.addWidget(self._combo_mesh_algo)
+
+        # ── C++ 求解器开关 ──
+        info_layout_1.addSpacing(12)
+        self._chk_use_cpp = QtWidgets.QCheckBox("使用 C++ 加速求解器")
+        self._chk_use_cpp.setChecked(True)
+        self._chk_use_cpp.setToolTip(
+            "勾选后优先使用 C++ 加速求解器；\n"
+            "取消勾选则始终使用 Python 参考求解器"
+        )
+        info_layout_1.addWidget(self._chk_use_cpp)
         info_layout_1.addStretch()
 
         left_layout.addLayout(info_layout_1)
@@ -1319,8 +1330,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._actual_layers = saved_actual_layers
 
         # ── C++ 求解器可用性检查 / 自动编译 ──
-        _cpp_ready = is_cpp_available()
-        if not _cpp_ready:
+        _user_wants_cpp = (
+            self._chk_use_cpp is not None and self._chk_use_cpp.isChecked()
+        )
+        _cpp_ready = _user_wants_cpp and is_cpp_available()
+        if _user_wants_cpp and not is_cpp_available():
             builder = CppBuilder()
             if builder.pyd_exists():
                 self._log.append_log("  [build] 检测到旧版 .pyd，重新编译 ...")
@@ -1337,10 +1351,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log.append_log("  [build] 前置条件就绪，正在后台编译 ...")
                 self._start_cpp_build(builder, config)
                 return
-        # 编译线程 return 后，_on_cpp_build_finished 会重新调用 _on_run()，
-        # 届时 _cpp_ready 为 True 直接进入此分支
         if _cpp_ready:
             self._log.append_log("  [info] 使用 C++ 加速求解器")
+        elif _user_wants_cpp and not is_cpp_available():
+            pass  # 已在上方打印回退消息
+        else:
+            self._log.append_log("  [info] 使用 Python 参考求解器（用户选择）")
 
         try:
             # ── 创建异步 Worker 并移入 QThread ──
@@ -1349,6 +1365,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 config=config,
                 n_layers=self._actual_layers,
                 output_dir=Path("outputs/gui"),
+                use_cpp=_cpp_ready,
             )
             self._thread = QtCore.QThread(self)
 
@@ -2281,6 +2298,21 @@ def launch_gui() -> None:
     创建 QApplication 实例，应用 Fusion 主题风格，
     显示主窗口并进入事件循环。
     """
+    # ── 全局崩溃日志（闪退时唯一可用的诊断信息）──
+    import traceback as _tb
+    _crash_log = Path(__file__).resolve().parent.parent.parent.parent / "crash.log"
+
+    def _global_excepthook(exc_type, exc_value, exc_tb):
+        """将所有未捕获异常写入 crash.log 后再调用默认处理器。"""
+        msg = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            _crash_log.write_text(msg, encoding="utf-8")
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _global_excepthook
+
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     win = MainWindow()

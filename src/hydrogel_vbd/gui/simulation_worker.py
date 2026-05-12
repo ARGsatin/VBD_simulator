@@ -25,6 +25,7 @@ C++ 求解器函数 ``solve_lift_and_relax`` 已降级为"单步求解器"
 
 from __future__ import annotations
 
+import atexit
 import time
 import traceback
 from pathlib import Path
@@ -35,6 +36,7 @@ from PySide6 import QtCore
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
 from hydrogel_vbd.physics.czm import CZMState
+from hydrogel_vbd.solver.cpp_adapter import is_cpp_available
 
 
 class SimulationWorker(QtCore.QObject):
@@ -70,14 +72,15 @@ class SimulationWorker(QtCore.QObject):
         config: SimulationConfig,
         n_layers: int,
         output_dir: str | Path,
+        use_cpp: bool = True,
     ) -> None:
         super().__init__()
-        # 完全深拷贝网格状态，确保线程安全
         self._mesh = self._deep_copy_mesh(mesh)
         self._config = config
         self._n_layers = int(n_layers)
         self._output_dir = Path(output_dir)
         self._stop_flag = False
+        self._use_cpp = use_cpp and is_cpp_available()
 
     # ───────────────────────────────────────────────────────────
     # 网格深拷贝（避免数据竞争 → 杜绝 Segfault）
@@ -262,14 +265,27 @@ class SimulationWorker(QtCore.QObject):
         2. **逐层仿真**：VBD 稳定求解 + 平台提升（Python 侧控制时间循环）
         3. **后处理**：最终结果写入 + 完成信号
         """
+        # ── 文件级崩溃追踪（线程内 Qt 信号可能在 crash 前未送达）──
+        _trace_path = Path(self._output_dir) / "worker_trace.log"
+        _trace_path.parent.mkdir(parents=True, exist_ok=True)
+        def _trace(msg: str) -> None:
+            try:
+                with open(_trace_path, "a", encoding="utf-8") as f:
+                    f.write(f"{time.perf_counter():.3f} {msg}\n")
+            except Exception:
+                pass
+        _trace("worker_run_start")
+
         try:
             results: list[LayerResult] = []
             t_start = time.perf_counter()
 
             self.log_message.emit("⚙️ [Worker] 仿真线程已启动…")
+            _trace("worker_log_started")
 
             # ════════════════ 阶段 1：前处理 ════════════════
             self._preprocess()
+            _trace("preprocess_done")
 
             # ════════════════ 阶段 2：逐层仿真 ════════════════
             results = self._run_layers()
@@ -341,19 +357,18 @@ class SimulationWorker(QtCore.QObject):
         from hydrogel_vbd.control.field_controller import PIDFieldController
         from hydrogel_vbd.physics.czm import update_czm_states
         from hydrogel_vbd.solver.cpp_adapter import (
-            is_cpp_available,
             solve_until_stable as cpp_solve_until_stable,
             solve_lift_and_relax as cpp_solve_lift_and_relax,
         )
 
-        _use_cpp = is_cpp_available()
-        if _use_cpp:
+        if self._use_cpp:
             self.log_message.emit("  [info] 使用 C++ 加速求解器")
         else:
             self.log_message.emit("  [info] 使用 Python 参考求解器")
-        solver = PythonReferenceVBDSolver(self._config) if not _use_cpp else None
+        solver = PythonReferenceVBDSolver(self._config) if not self._use_cpp else None
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
+        _trace(f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers}")
 
         results: list[LayerResult] = []
         step_counter = 0
@@ -385,8 +400,9 @@ class SimulationWorker(QtCore.QObject):
 
             if top_ids is not None and len(top_ids) > 0:
                 # ── 带提升的控制反转循环 ──
+                _trace(f"layer_{layer_id}_lift_start top_ids={len(top_ids)}")
                 while lift_distance < lift_max and not self._stop_flag:
-                    if _use_cpp:
+                    if self._use_cpp:
                         result = cpp_solve_lift_and_relax(
                             self._mesh, self._config, e_z, layer_id, top_ids
                         )
@@ -453,7 +469,8 @@ class SimulationWorker(QtCore.QObject):
                     )
             else:
                 # ── 无提升：直接静平衡求解 ──
-                if _use_cpp:
+                _trace(f"layer_{layer_id}_solve_start cpp={_use_cpp}")
+                if self._use_cpp:
                     result = cpp_solve_until_stable(
                         self._mesh, self._config, e_z, layer_id
                     )
