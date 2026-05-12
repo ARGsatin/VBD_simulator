@@ -371,7 +371,7 @@ class SimulationWorker(QtCore.QObject):
         solver = PythonReferenceVBDSolver(self._config) if not self._use_cpp else None
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
-        _trace(f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers}")
+        self._trace(f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers}")
 
         results: list[LayerResult] = []
         step_counter = 0
@@ -403,7 +403,7 @@ class SimulationWorker(QtCore.QObject):
 
             if top_ids is not None and len(top_ids) > 0:
                 # ── 带提升的控制反转循环 ──
-                _trace(f"layer_{layer_id}_lift_start top_ids={len(top_ids)}")
+                self._trace(f"layer_{layer_id}_lift_start top_ids={len(top_ids)}")
                 while lift_distance < lift_max and not self._stop_flag:
                     if self._use_cpp:
                         result = cpp_solve_lift_and_relax(
@@ -472,7 +472,7 @@ class SimulationWorker(QtCore.QObject):
                     )
             else:
                 # ── 无提升：直接静平衡求解 ──
-                _trace(f"layer_{layer_id}_solve_start cpp={_use_cpp}")
+                self._trace(f"layer_{layer_id}_solve_start cpp={self._use_cpp}")
                 if self._use_cpp:
                     result = cpp_solve_until_stable(
                         self._mesh, self._config, e_z, layer_id

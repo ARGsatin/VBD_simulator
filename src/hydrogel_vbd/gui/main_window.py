@@ -453,11 +453,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── C++ 求解器开关 ──
         info_layout_1.addSpacing(12)
-        self._chk_use_cpp = QtWidgets.QCheckBox("使用 C++ 加速求解器")
-        self._chk_use_cpp.setChecked(True)
+        self._chk_use_cpp = QtWidgets.QCheckBox("使用 C++ 加速求解器 (实验性)")
+        self._chk_use_cpp.setChecked(False)
         self._chk_use_cpp.setToolTip(
             "勾选后优先使用 C++ 加速求解器；\n"
-            "取消勾选则始终使用 Python 参考求解器"
+            "⚠ 实验性功能：在 QThread 中可能不稳定，默认关闭"
         )
         info_layout_1.addWidget(self._chk_use_cpp)
         info_layout_1.addStretch()
