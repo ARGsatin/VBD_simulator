@@ -169,9 +169,8 @@ def neo_hookean_pk1_stress(
 
     # 翻转单元 → 惩罚应力
     if J <= 1e-12:
-        FinvT = np.linalg.inv(F).T
-        penalty_factor = -2.0 * inverted_penalty * (1.0 - J) * J
-        return penalty_factor * FinvT
+        # 用 F 直接计算罚应力（避免 inv(F) 在奇异矩阵上崩溃）
+        return -2.0 * inverted_penalty * (1.0 - J) * F
 
     FinvT = np.linalg.inv(F).T
     log_J = float(np.log(J))

@@ -7,7 +7,8 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\('src/hydrogel_vbd/geometry/stl_mesher.py', doraise=True\\)\")",
       "Bash(python *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
