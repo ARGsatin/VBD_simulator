@@ -44,6 +44,8 @@ from hydrogel_vbd.geometry.stl_mesher import create_demo_or_stl, STLMesher
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+from hydrogel_vbd.solver.cpp_adapter import is_cpp_available, refresh_availability
+from hydrogel_vbd.solver.cpp_builder import CppBuilder, CppBuildResult
 from hydrogel_vbd.core.state import LayerResult, MeshState
 from hydrogel_vbd.gui.mesh_viewer import MeshViewer
 from hydrogel_vbd.gui.simulation_worker import SimulationWorker
@@ -294,6 +296,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_anim_play: QtWidgets.QPushButton | None = None
         self._btn_anim_pause: QtWidgets.QPushButton | None = None
         self._frame_indices: list[int] = []  # 筛选后的帧索引映射
+
+        # ── C++ 自动编译状态 ──
+        self._build_thread: QtCore.QThread | None = None
+        self._build_worker: QtCore.QObject | None = None
+        self._pending_build_config: SimulationConfig | None = None
 
         # ── DVR 实时时间轴状态 ──
         self._dv_slider: QtWidgets.QSlider | None = None
@@ -1321,6 +1328,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._generated_mesh = saved_generated_mesh
         self._actual_layers = saved_actual_layers
 
+        # ── C++ 求解器可用性检查 / 自动编译 ──
+        if not is_cpp_available():
+            builder = CppBuilder()
+            if builder.pyd_exists():
+                self._log.append_log("  [build] 检测到旧版 .pyd，重新编译 ...")
+            else:
+                self._log.append_log("  [build] C++ 求解器未编译，开始自动编译 ...")
+
+            missing = builder.check_prerequisites()
+            if missing:
+                self._log.append_log(
+                    f"  [build] 缺少依赖: {', '.join(missing)}"
+                )
+                self._log.append_log("  [build] 回退到 Python 参考求解器")
+            else:
+                self._log.append_log("  [build] 前置条件就绪，正在后台编译 ...")
+                self._start_cpp_build(builder, config)
+                return
+
         try:
             # ── 创建异步 Worker 并移入 QThread ──
             self._worker = SimulationWorker(
@@ -1365,6 +1391,57 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log.append_log(f"\n[错误] 启动仿真线程失败: {exc}")
             self._log.append_log(traceback.format_exc())
             self._status.showMessage("仿真启动失败 ✗")
+
+    # ========================================================================
+    # C++ 自动编译（后台线程）
+    # ========================================================================
+    def _start_cpp_build(
+        self, builder: "CppBuilder", config: "SimulationConfig"
+    ) -> None:
+        """在后台线程启动 C++ 编译器。"""
+        self._pending_build_config = config
+        self._btn_run.setEnabled(False)
+        self._btn_run.setText("🔧 编译 C++ 求解器…")
+        self._status.showMessage("正在编译 C++ 求解器 …")
+
+        self._build_worker = _BuildWorker(builder)
+        self._build_thread = QtCore.QThread(self)
+        self._build_worker.moveToThread(self._build_thread)
+
+        self._build_thread.started.connect(self._build_worker.run)
+        self._build_worker.build_finished.connect(self._on_cpp_build_finished)
+        self._build_worker.build_output.connect(self._log.append_log)
+        self._build_worker.build_finished.connect(self._build_thread.quit)
+
+        self._build_thread.start()
+
+    def _on_cpp_build_finished(self, result: "CppBuildResult") -> None:
+        """编译线程完成回调（在主线程中执行）。"""
+        if self._build_thread is not None:
+            self._build_thread.wait(2000)
+            self._build_thread = None
+        self._build_worker = None
+
+        config = self._pending_build_config
+        self._pending_build_config = None
+
+        self._btn_run.setEnabled(True)
+
+        if result.success:
+            self._log.append_log("  [build] [OK] 编译成功，加载 C++ 求解器")
+            self._status.showMessage("C++ 求解器就绪")
+            refresh_availability()
+        else:
+            self._log.append_log(
+                "  [build] [FAIL] 编译失败，回退到 Python 参考求解器"
+            )
+            self._status.showMessage("编译失败，使用 Python 求解器")
+
+        # 编译成功后，重新触发仿真（递归调用 _on_run）
+        # config 仍然有效，网格未变，直接创建 Worker
+        if config is not None:
+            # 手动再次触发 _on_run（此时 C++ 已可用或已回退）
+            self._on_run()
 
     # ========================================================================
     # Worker 信号槽（主线程 UI 更新入口）
@@ -2179,6 +2256,28 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
                 "保存失败",
                 f"无法保存图表:\n{exc}",
             )
+
+
+# ============================================================================
+# C++ 编译后台 Worker（QThread 模式）
+# ============================================================================
+class _BuildWorker(QtCore.QObject):
+    """在后台线程中执行 C++ 编译的 worker 对象。"""
+
+    build_output = QtCore.Signal(str)
+    build_finished = QtCore.Signal(CppBuildResult)
+
+    def __init__(self, builder: "CppBuilder") -> None:
+        super().__init__()
+        self._builder = builder
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        def on_line(line: str) -> None:
+            self.build_output.emit(line)
+
+        result = self._builder.build(on_line=on_line)
+        self.build_finished.emit(result)
 
 
 def launch_gui() -> None:

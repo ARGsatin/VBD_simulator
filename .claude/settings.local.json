@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('src/hydrogel_vbd/gui/main_window.py', doraise=True\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('src/hydrogel_vbd/geometry/stl_mesher.py', doraise=True\\)\")",
+      "Bash(python *)"
+    ]
+  }
+}

@@ -163,14 +163,14 @@ def solve_until_stable(
     )
 
 
-def solve_with_lift(
+def solve_lift_and_relax(
     mesh: MeshState,
     config: SimulationConfig,
     e_z: float,
     layer_id: int,
     lifting_top: np.ndarray,
 ) -> VBDSolveResult:
-    """C++ 加速的平台提升剥离 + 静平衡求解。
+    """C++ 加速的单步提升-静平衡求解（单次调用，不再内嵌循环）。
 
     Parameters
     ----------
@@ -198,7 +198,7 @@ def solve_with_lift(
     cpp_cfg = _build_cpp_config(config)
     lifting_top_list = lifting_top.astype(int).tolist()
 
-    result_dict = hydrogel_vbd_cpp.solve_with_lift(
+    result_dict = hydrogel_vbd_cpp.solve_lift_and_relax(
         mesh.vertices,
         mesh.velocities,
         mesh.ideal_vertices,
