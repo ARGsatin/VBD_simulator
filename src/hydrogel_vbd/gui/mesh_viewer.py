@@ -16,10 +16,26 @@ try:
     import matplotlib
 
     matplotlib.use("QtAgg")
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
+    from matplotlib import font_manager
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    # ── 中文字体配置 ──
+    _CJK_FONT = None
+    for _fp in font_manager.fontManager.ttflist:
+        if "YaHei" in _fp.name or "SimHei" in _fp.name:
+            _CJK_FONT = _fp.name
+            break
+    if _CJK_FONT is None:
+        for _fp in font_manager.fontManager.ttflist:
+            if "Hei" in _fp.name or "Song" in _fp.name or "Ming" in _fp.name:
+                _CJK_FONT = _fp.name
+                break
+    if _CJK_FONT is not None:
+        matplotlib.rcParams["font.family"] = _CJK_FONT
+    matplotlib.rcParams["axes.unicode_minus"] = False
 except ImportError:
     raise ImportError(
         "PySide6 和 matplotlib 未安装。请运行:\n"
@@ -52,9 +68,6 @@ class MeshViewer(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._canvas)
-        # ── 添加 matplotlib 导航工具栏（缩放/旋转/平移）──
-        self._toolbar = NavigationToolbar2QT(self._canvas, self)
-        layout.addWidget(self._toolbar)
         self.setLayout(layout)
 
         # 存储当前绘图元素，方便清除

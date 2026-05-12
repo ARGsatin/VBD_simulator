@@ -323,18 +323,22 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.setContentsMargins(2, 2, 2, 2)
         top_bar.setSpacing(4)
 
-        self._btn_load = QtWidgets.QPushButton("📂 加载模型")
+        self._btn_load = QtWidgets.QPushButton("加载模型")
         self._btn_load.setFixedHeight(28)
+        self._btn_load.setFixedWidth(80)
         self._btn_load.clicked.connect(self._on_load_stl)
 
-        self._btn_clear = QtWidgets.QPushButton("✕ 清除")
+        self._btn_clear = QtWidgets.QPushButton("清除")
         self._btn_clear.setFixedHeight(28)
+        self._btn_clear.setFixedWidth(50)
         self._btn_clear.clicked.connect(self._on_clear_stl)
 
-        self._lbl_model = QtWidgets.QLabel("无模型 (使用 Demo 网格)")
+        self._lbl_model = QtWidgets.QLabel("无模型 (Demo 网格)")
+        self._lbl_model.setMinimumWidth(120)
 
-        self._btn_mesh = QtWidgets.QPushButton("🔄 划分网格")
+        self._btn_mesh = QtWidgets.QPushButton("划分网格")
         self._btn_mesh.setFixedHeight(28)
+        self._btn_mesh.setFixedWidth(80)
         self._btn_mesh.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #2196F3; "
             "color: white; border-radius: 3px; }"
@@ -343,8 +347,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._btn_mesh.clicked.connect(self._on_generate_mesh)
 
-        self._btn_run = QtWidgets.QPushButton("▶ 运行仿真")
+        self._btn_run = QtWidgets.QPushButton("运行仿真")
         self._btn_run.setFixedHeight(28)
+        self._btn_run.setFixedWidth(80)
         self._btn_run.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #4CAF50; "
             "color: white; border-radius: 3px; }"
@@ -353,7 +358,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._btn_run.clicked.connect(self._on_run)
 
-        self._btn_stop_anim = QtWidgets.QPushButton("⏹ 停止回放")
+        self._btn_stop_anim = QtWidgets.QPushButton("停止回放")
         self._btn_stop_anim.setFixedHeight(28)
         self._btn_stop_anim.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #f44336; "
@@ -379,8 +384,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 左侧面板
         left = QtWidgets.QWidget()
-        left.setMinimumWidth(400)
-        left.setMaximumWidth(450)
+        left.setMinimumWidth(440)
+        left.setMaximumWidth(520)
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(2, 2, 2, 2)
         left_layout.setSpacing(4)
@@ -494,21 +499,21 @@ class MainWindow(QtWidgets.QMainWindow):
         anim_panel_layout.setContentsMargins(4, 2, 4, 2)
         anim_panel_layout.setSpacing(6)
 
-        self._btn_anim_play = QtWidgets.QPushButton("▶ 播放")
+        self._btn_anim_play = QtWidgets.QPushButton("播放")
         self._btn_anim_play.setFixedHeight(26)
         self._btn_anim_play.setFixedWidth(70)
         self._btn_anim_play.setToolTip("从头开始播放动画")
         self._btn_anim_play.clicked.connect(self._on_anim_play_clicked)
         self._btn_anim_play.setVisible(False)
 
-        self._btn_anim_pause = QtWidgets.QPushButton("⏸ 暂停")
+        self._btn_anim_pause = QtWidgets.QPushButton("暂停")
         self._btn_anim_pause.setFixedHeight(26)
         self._btn_anim_pause.setFixedWidth(70)
         self._btn_anim_pause.setToolTip("暂停/继续动画回放")
         self._btn_anim_pause.clicked.connect(self._on_anim_pause_clicked)
         self._btn_anim_pause.setVisible(False)
 
-        self._btn_stop_anim_from_panel = QtWidgets.QPushButton("⏹ 停止")
+        self._btn_stop_anim_from_panel = QtWidgets.QPushButton("停止")
         self._btn_stop_anim_from_panel.setFixedHeight(26)
         self._btn_stop_anim_from_panel.setFixedWidth(70)
         self._btn_stop_anim_from_panel.setToolTip("停止回放并恢复初始网格")
@@ -1394,7 +1399,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # ── 仿真期间禁用运行按钮 ──
             self._btn_run.setEnabled(False)
-            self._btn_run.setText("⏳ 仿真中…")
+            self._btn_run.setText("仿真中...")
 
             self._thread.start()
 
@@ -1413,7 +1418,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """在后台线程启动 C++ 编译器。"""
         self._pending_build_config = config
         self._btn_run.setEnabled(False)
-        self._btn_run.setText("🔧 编译 C++ 求解器…")
+        self._btn_run.setText("编译 C++...")
         self._status.showMessage("正在编译 C++ 求解器 …")
 
         self._build_worker = _BuildWorker(builder)
@@ -1556,7 +1561,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── 恢复运行按钮 ──
         self._btn_run.setEnabled(True)
-        self._btn_run.setText("▶ 运行仿真")
+        self._btn_run.setText("运行仿真")
 
         # ── 若当前正在动画回放，先停止 ──
         self._stop_animation_timer()
@@ -1580,7 +1585,7 @@ class MainWindow(QtWidgets.QMainWindow):
             错误信息和回溯字符串。
         """
         self._btn_run.setEnabled(True)
-        self._btn_run.setText("▶ 运行仿真")
+        self._btn_run.setText("运行仿真")
         self._log.append_log(f"\n[严重错误] {error_msg}")
         self._status.showMessage("仿真线程崩溃 ✗")
         QtWidgets.QMessageBox.critical(
@@ -1766,7 +1771,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """「暂停」按钮：切换暂停/继续状态。"""
         self._anim_paused = not self._anim_paused
         if self._btn_anim_pause is not None:
-            self._btn_anim_pause.setText("▶ 继续" if self._anim_paused else "⏸ 暂停")
+            self._btn_anim_pause.setText("继续" if self._anim_paused else "暂停")
             self._btn_anim_pause.setToolTip(
                 "继续动画回放" if self._anim_paused else "暂停动画回放"
             )
