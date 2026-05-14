@@ -46,6 +46,108 @@ def _poisson_to_lame(mu: float, kappa: float) -> tuple[float, float]:
     return mu, lam
 
 
+def _make_psd(hessian: np.ndarray) -> np.ndarray:
+    """Project a 3x3 Hessian to the positive semidefinite cone."""
+    eigvals, eigvecs = np.linalg.eigh(hessian)
+    if float(np.min(eigvals)) >= 0.0:
+        return hessian
+    return eigvecs @ np.diag(np.maximum(eigvals, 0.0)) @ eigvecs.T
+
+
+def _normal_pull_from_terms(
+    terms_force: np.ndarray,
+    bottom_nodes: np.ndarray,
+) -> np.ndarray:
+    """Extract upward normal pull for CZM updates from assembled nodal forces."""
+    if len(bottom_nodes) == 0:
+        return np.zeros(0, dtype=float)
+    force_z = np.asarray(terms_force[bottom_nodes, 2], dtype=float)
+    return np.maximum(force_z, 0.0)
+
+
+def _current_czm_masks(mesh: MeshState, layer_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return FIXED/DAMAGING CZM masks limited to the current layer bottom."""
+    current_bottom = _current_bottom_mask(mesh, layer_id)
+    fixed = current_bottom & (mesh.czm_state == CZMState.FIXED)
+    damaging = current_bottom & (mesh.czm_state == CZMState.DAMAGING)
+    return fixed, damaging
+
+
+def _current_bottom_mask(mesh: MeshState, layer_id: int) -> np.ndarray:
+    """Return the nodes that can contact the FEP for the current layer only."""
+    current_bottom = np.zeros(mesh.vertices.shape[0], dtype=bool)
+    bottom_nodes = mesh.bottom_nodes(layer_id)
+    if bottom_nodes.size:
+        current_bottom[bottom_nodes] = True
+    elif not np.any(mesh.is_top_surface_of_layer >= 0):
+        current_bottom = np.asarray(mesh.is_bottom_surface, dtype=bool).copy()
+    current_bottom &= mesh.active_vertex_mask
+    return current_bottom
+
+
+def _fep_floor_for_nodes(
+    mesh: MeshState,
+    config: SimulationConfig,
+    layer_id: int,
+    nodes: np.ndarray,
+    current_bottom: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return which nodes have a FEP collision floor and the floor z value."""
+    node_ids = np.asarray(nodes, dtype=int)
+    applies = np.asarray(mesh.active_vertex_mask[node_ids], dtype=bool).copy()
+    base_z_fep = float(config.z_fep) - int(layer_id) * float(config.layer_thickness)
+    node_layers = np.asarray(mesh.first_active_layer[node_ids], dtype=int)
+    surface_layers = np.asarray(mesh.is_top_surface_of_layer[node_ids], dtype=int)
+    node_layers = np.where(
+        surface_layers >= 0,
+        np.maximum(node_layers, surface_layers),
+        node_layers,
+    ).astype(float)
+    floor_z = base_z_fep + node_layers * float(config.layer_thickness)
+
+    current = np.asarray(current_bottom[node_ids], dtype=bool)
+    floor_z[current] = float(config.z_fep)
+
+    global_bottom = np.asarray(mesh.is_bottom_surface[node_ids], dtype=bool)
+    previous_global_bottom = global_bottom & ~current
+    if np.any(previous_global_bottom):
+        floor_z[previous_global_bottom] = base_z_fep
+        applies[previous_global_bottom] = True
+
+    return applies, floor_z
+
+
+def _apply_fep_floor_to_mask(
+    mesh: MeshState,
+    config: SimulationConfig,
+    layer_id: int,
+    mask: np.ndarray,
+    current_bottom: np.ndarray,
+) -> None:
+    node_ids = np.flatnonzero(np.asarray(mask, dtype=bool) & mesh.active_vertex_mask)
+    if len(node_ids) == 0:
+        return
+    applies, floor_z = _fep_floor_for_nodes(
+        mesh, config, layer_id, node_ids, current_bottom
+    )
+    fix = applies & (mesh.vertices[node_ids, 2] < floor_z)
+    mesh.vertices[node_ids[fix], 2] = floor_z[fix]
+
+
+def _apply_fep_floor(
+    mesh: MeshState,
+    config: SimulationConfig,
+    layer_id: int,
+    node_id: int,
+    current_bottom: np.ndarray,
+) -> None:
+    applies, floor_z = _fep_floor_for_nodes(
+        mesh, config, layer_id, np.asarray([node_id], dtype=int), current_bottom
+    )
+    if bool(applies[0]) and mesh.vertices[node_id, 2] < floor_z[0]:
+        mesh.vertices[node_id, 2] = floor_z[0]
+
+
 def _vertex_local_elastic_energy(
     mesh: MeshState,
     node_id: int,
@@ -260,7 +362,9 @@ class PythonReferenceVBDSolver:
         masses = mesh.masses
 
         # ── 构建局部物理项（弹性力 + Hessian） ──
-        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+        terms = build_local_physics_terms(
+            mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+        )
 
         # ── 自适应加速度（基于初始固化度） ──
         adaptive_accel = np.zeros_like(mesh.vertices)
@@ -279,11 +383,13 @@ class PythonReferenceVBDSolver:
         )
 
         # ── 固定节点：平台夹持、CZM 固定、未激活 ──
+        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
         fixed = (
             mesh.is_top_fixed
-            | (mesh.czm_state == CZMState.FIXED)
+            | czm_fixed
             | ~mesh.active_vertex_mask
         )
+        current_bottom = _current_bottom_mask(mesh, layer_id)
 
         # ── 图着色分组（用于并行化/分组计算） ──
         colors = (
@@ -297,8 +403,7 @@ class PythonReferenceVBDSolver:
         stable_counter = 0                                              # 连续收敛步数
         damaging_count = int(
             np.sum(
-                mesh.active_vertex_mask
-                & (mesh.czm_state == CZMState.DAMAGING)
+                czm_damaging
             )
         )
 
@@ -315,7 +420,9 @@ class PythonReferenceVBDSolver:
             #       物理力（基于上一轮旧坐标），使Gauss-Seidel跌落为Jacobi迭代，
             #       降低了收敛速度，也使"图着色"失去了其核心加速意义。
             # ── 重新计算物理项（位置变化后力场变化） ──
-            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+            terms = build_local_physics_terms(
+                mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+            )
             max_dx = 0.0
 
             # ── 按颜色分组遍历 ──
@@ -341,27 +448,22 @@ class PythonReferenceVBDSolver:
 
                 # ── FEP 穿透批量修正 ──
                 not_top = ~mesh.is_top_fixed[active_nodes]
-                is_bottom = mesh.is_bottom_surface[active_nodes]
-                fep_fix = not_top & is_bottom & (
-                    mesh.vertices[active_nodes, 2] < config.z_fep
+                fep_applies, fep_floor = _fep_floor_for_nodes(
+                    mesh, config, layer_id, active_nodes, current_bottom
                 )
-                mesh.vertices[active_nodes[fep_fix], 2] = config.z_fep
+                fep_fix = (
+                    not_top
+                    & fep_applies
+                    & (mesh.vertices[active_nodes, 2] < fep_floor)
+                )
+                mesh.vertices[active_nodes[fep_fix], 2] = fep_floor[fep_fix]
 
                 # ── 批量提取 Hessian ──
                 h_elastic_batch = terms.hessian[active_nodes].copy()  # (K, 3, 3)
 
                 # ── DAMAGING 节点 PSD 批量修正 ──
-                damaging = mesh.czm_state[active_nodes] == CZMState.DAMAGING
-                if np.any(damaging):
-                    for idx in np.flatnonzero(damaging):
-                        h_e = h_elastic_batch[idx]
-                        eigvals = np.linalg.eigvalsh(h_e)
-                        if np.min(eigvals) < 0:
-                            eigvecs = np.linalg.eigh(h_e)[1]
-                            eigvals_psd = np.maximum(eigvals, 0.0)
-                            h_elastic_batch[idx] = (
-                                eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
-                            )
+                for idx in range(K):
+                    h_elastic_batch[idx] = _make_psd(h_elastic_batch[idx])
 
                 # ── 批量装配 H_total: M/dt²·I + (1 + k_d/dt)·H_elastic + ε·I ──
                 mass_batch = masses[active_nodes]                       # (K,)
@@ -411,12 +513,10 @@ class PythonReferenceVBDSolver:
                     accepted = False
                     for _ in range(12):
                         mesh.vertices[node_id] = x_saved + alpha * dx
-                        if (
-                            not mesh.is_top_fixed[node_id]
-                            and mesh.is_bottom_surface[node_id]
-                        ):
-                            if mesh.vertices[node_id, 2] < config.z_fep:
-                                mesh.vertices[node_id, 2] = config.z_fep
+                        if not mesh.is_top_fixed[node_id]:
+                            _apply_fep_floor(
+                                mesh, config, layer_id, node_id, current_bottom
+                            )
 
                         e_after = _vertex_local_elastic_energy(
                             mesh, node_id, mu_lame, lam_lame
@@ -442,10 +542,13 @@ class PythonReferenceVBDSolver:
                 free_mask = (
                     mesh.active_vertex_mask
                     & ~fixed
-                    & (mesh.czm_state != CZMState.DAMAGING)
+                    & ~czm_damaging
                 )
                 mesh.vertices[free_mask] += omega * (
                     mesh.vertices[free_mask] - x_old_iter[free_mask]
+                )
+                _apply_fep_floor_to_mask(
+                    mesh, config, layer_id, free_mask, current_bottom
                 )
 
             # ── 收敛判定 ──
@@ -536,11 +639,13 @@ class PythonReferenceVBDSolver:
         config = self.config
         x_prev = mesh.vertices.copy()
         masses = mesh.masses
+        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
         fixed = (
             mesh.is_top_fixed
-            | (mesh.czm_state == CZMState.FIXED)
+            | czm_fixed
             | ~mesh.active_vertex_mask
         )
+        current_bottom = _current_bottom_mask(mesh, layer_id)
 
         # ════════════════════ 单步提升 ════════════════════
         v_lift = float(config.v_lift)
@@ -548,31 +653,21 @@ class PythonReferenceVBDSolver:
 
         # 刚性抬升顶部节点（仅 Z 方向）— 单步 v_lift * dt
         mesh.vertices[lifting_top, 2] += v_lift * config.dt
-
-        # ── 更新 CZM 状态（提离型膜脱粘）──
-        from hydrogel_vbd.physics.czm import update_czm_states
-
-        if len(bottom):
-            update_czm_states(
-                mesh,
-                bottom,
-                internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
-                area=config.node_area,
-                t_max=config.T_max,
-                k_czm=config.K_czm,
-                delta_f=config.delta_f,
-                z_fep=config.z_fep,
-                dt=config.dt,
-            )
+        terms = build_local_physics_terms(
+            mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+        )
 
         # ════════════════════ 静平衡迭代 ════════════════════
+        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
         fixed[:] = (
             mesh.is_top_fixed
-            | (mesh.czm_state == CZMState.FIXED)
+            | czm_fixed
             | ~mesh.active_vertex_mask
         )
 
-        terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+        terms = build_local_physics_terms(
+            mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+        )
         adaptive_accel = np.zeros_like(mesh.vertices)
         adaptive_accel[mesh.active_vertex_mask] = (
             config.c_init
@@ -596,8 +691,7 @@ class PythonReferenceVBDSolver:
         stable_counter = 0
         damaging_count = int(
             np.sum(
-                mesh.active_vertex_mask
-                & (mesh.czm_state == CZMState.DAMAGING)
+                czm_damaging
             )
         )
 
@@ -607,7 +701,9 @@ class PythonReferenceVBDSolver:
         for iteration in range(1, config.max_iters + 1):
             iterations_done = iteration
             x_old_iter = mesh.vertices.copy()
-            terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+            terms = build_local_physics_terms(
+                mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+            )
             max_dx = 0.0
 
             for color in sorted(set(int(c) for c in colors)):
@@ -615,21 +711,12 @@ class PythonReferenceVBDSolver:
                     if fixed[node_id]:
                         continue
 
-                    if (
-                        not mesh.is_top_fixed[node_id]
-                        and mesh.is_bottom_surface[node_id]
-                    ):
-                        if mesh.vertices[node_id, 2] < config.z_fep:
-                            mesh.vertices[node_id, 2] = config.z_fep
+                    if not mesh.is_top_fixed[node_id]:
+                        _apply_fep_floor(
+                            mesh, config, layer_id, node_id, current_bottom
+                        )
 
-                    h_elastic = terms.hessian[node_id]
-
-                    if mesh.czm_state[node_id] == CZMState.DAMAGING:
-                        eigvals = np.linalg.eigvalsh(h_elastic)
-                        if np.min(eigvals) < 0:
-                            eigvals_psd = np.maximum(eigvals, 0.0)
-                            eigvecs = np.linalg.eigh(h_elastic)[1]
-                            h_elastic = eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
+                    h_elastic = _make_psd(terms.hessian[node_id])
 
                     h_total = (
                         (masses[node_id] / (config.dt ** 2)) * np.eye(3)
@@ -661,12 +748,10 @@ class PythonReferenceVBDSolver:
                     accepted = False
                     for _ in range(12):
                         mesh.vertices[node_id] = x_saved + alpha * dx
-                        if (
-                            not mesh.is_top_fixed[node_id]
-                            and mesh.is_bottom_surface[node_id]
-                        ):
-                            if mesh.vertices[node_id, 2] < config.z_fep:
-                                mesh.vertices[node_id, 2] = config.z_fep
+                        if not mesh.is_top_fixed[node_id]:
+                            _apply_fep_floor(
+                                mesh, config, layer_id, node_id, current_bottom
+                            )
                         e_after = _vertex_local_elastic_energy(
                             mesh, node_id, mu_lame, lam_lame
                         )
@@ -681,12 +766,10 @@ class PythonReferenceVBDSolver:
                     actual_dx = mesh.vertices[node_id] - x_saved
                     length = float(np.linalg.norm(actual_dx))
 
-                    if (
-                        not mesh.is_top_fixed[node_id]
-                        and mesh.is_bottom_surface[node_id]
-                    ):
-                        if mesh.vertices[node_id, 2] < config.z_fep:
-                            mesh.vertices[node_id, 2] = config.z_fep
+                    if not mesh.is_top_fixed[node_id]:
+                        _apply_fep_floor(
+                            mesh, config, layer_id, node_id, current_bottom
+                        )
 
                     max_dx = max(max_dx, length)
 
@@ -695,10 +778,13 @@ class PythonReferenceVBDSolver:
                 free_mask = (
                     mesh.active_vertex_mask
                     & ~fixed
-                    & (mesh.czm_state != CZMState.DAMAGING)
+                    & ~czm_damaging
                 )
                 mesh.vertices[free_mask] += omega * (
                     mesh.vertices[free_mask] - x_old_iter[free_mask]
+                )
+                _apply_fep_floor_to_mask(
+                    mesh, config, layer_id, free_mask, current_bottom
                 )
 
             if max_dx < target_epsilon:
@@ -721,6 +807,26 @@ class PythonReferenceVBDSolver:
         mesh.prev_vertices = x_prev
 
         free_bottom = mesh.bottom_nodes(layer_id)
+        if len(free_bottom):
+            from hydrogel_vbd.physics.czm import update_czm_states
+
+            terms_after = build_local_physics_terms(
+                mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+            )
+            update_czm_states(
+                mesh,
+                free_bottom,
+                internal_pull_z=_normal_pull_from_terms(
+                    terms_after.force, free_bottom
+                ),
+                area=config.node_area,
+                t_max=config.T_max,
+                k_czm=config.K_czm,
+                delta_f=config.delta_f,
+                z_fep=config.z_fep,
+                dt=config.dt,
+            )
+
         all_free = bool(
             len(free_bottom) == 0
             or np.all(mesh.czm_state[free_bottom] == CZMState.FREE)

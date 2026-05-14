@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,32 @@ from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
 
 _CPP_AVAILABLE = False
 _CPP_IMPORT_ERROR: str | None = None
+
+
+def _prefer_newer_cpp_build_dir() -> None:
+    """Prefer freshly built development binaries over stale deployed pyd files."""
+    try:
+        project_root = Path(__file__).resolve().parents[3]
+    except IndexError:
+        return
+    src_dir = project_root / "src"
+    cpp_dir = project_root / "cpp"
+    if not cpp_dir.exists():
+        return
+    build_pyds = []
+    for build_dir in cpp_dir.glob("build*/Release"):
+        build_pyds.extend(build_dir.glob("hydrogel_vbd_cpp*.pyd"))
+    if not build_pyds:
+        return
+    for build_pyd in sorted(build_pyds, key=lambda p: p.stat().st_mtime):
+        src_pyd = src_dir / build_pyd.name
+        if not src_pyd.exists() or build_pyd.stat().st_mtime > src_pyd.stat().st_mtime:
+            build_path = str(build_pyd.parent)
+            if build_path not in sys.path:
+                sys.path.insert(0, build_path)
+
+
+_prefer_newer_cpp_build_dir()
 
 # ── QThread 安全：在加载 C++ 模块前禁用 OpenMP 多线程 ──
 # MSVC 的 vcomp.dll 在 QThread 内创建 Win32 工作线程会导致 segfault。
@@ -66,6 +93,14 @@ def is_cpp_available() -> bool:
 def get_import_error() -> str | None:
     """获取 C++ 模块导入失败的错误信息（仅调试/日志用途）。"""
     return _CPP_IMPORT_ERROR
+
+
+def cpp_module_info() -> str:
+    """Return the loaded C++ module name and binary path for diagnostics."""
+    if not _CPP_AVAILABLE:
+        return f"unavailable: {_CPP_IMPORT_ERROR}"
+    module_path = getattr(hydrogel_vbd_cpp, "__file__", "")
+    return f"{_CPP_MODULE_NAME} {module_path}"
 
 
 def refresh_availability() -> bool:
@@ -164,13 +199,25 @@ def _check_contiguous(name: str, arr: np.ndarray) -> None:
         )
 
 
+def _ensure_mesh_int32_array(mesh: MeshState, attr: str) -> np.ndarray:
+    """确保 C++ 会原地写入的整型数组持久挂在 mesh 上。"""
+    arr = getattr(mesh, attr)
+    prepared = np.ascontiguousarray(arr, dtype=np.int32)
+    if prepared is not arr:
+        setattr(mesh, attr, prepared)
+    return prepared
+
+
 def _validate_arrays(
     vertices: np.ndarray,
     velocities: np.ndarray,
     masses: np.ndarray,
+    first_active_layer: np.ndarray,
+    is_top_surface_of_layer: np.ndarray,
     active_vertex_mask: np.ndarray,
     is_top_fixed: np.ndarray,
     is_bottom_surface: np.ndarray,
+    is_current_bottom: np.ndarray,
     czm_state: np.ndarray,
     damage: np.ndarray,
     time_free: np.ndarray,
@@ -191,9 +238,12 @@ def _validate_arrays(
     _check_shape("vertices", vertices, (nV, 3))
     _check_shape("velocities", velocities, (nV, 3))
     _check_shape("masses", masses, (nV,))
+    _check_shape("first_active_layer", first_active_layer, (nV,))
+    _check_shape("is_top_surface_of_layer", is_top_surface_of_layer, (nV,))
     _check_shape("active_vertex_mask", active_vertex_mask, (nV,))
     _check_shape("is_top_fixed", is_top_fixed, (nV,))
     _check_shape("is_bottom_surface", is_bottom_surface, (nV,))
+    _check_shape("is_current_bottom", is_current_bottom, (nV,))
     _check_shape("czm_state", czm_state, (nV,))
     _check_shape("damage", damage, (nV,))
     _check_shape("time_free", time_free, (nV,))
@@ -214,8 +264,11 @@ def _validate_arrays(
     # ── C 连续检查（Eigen::Map<..., RowMajor> 要求）──
     for name, arr in [
         ("vertices", vertices), ("velocities", velocities),
-        ("masses", masses), ("active_vertex_mask", active_vertex_mask),
+        ("masses", masses), ("first_active_layer", first_active_layer),
+        ("is_top_surface_of_layer", is_top_surface_of_layer),
+        ("active_vertex_mask", active_vertex_mask),
         ("is_top_fixed", is_top_fixed), ("is_bottom_surface", is_bottom_surface),
+        ("is_current_bottom", is_current_bottom),
         ("czm_state", czm_state), ("damage", damage),
         ("time_free", time_free), ("tets", tets),
         ("active_tet_mask", active_tet_mask),
@@ -233,6 +286,18 @@ def _validate_arrays(
             raise TypeError(f"{name} must be float64 (C++ writes in-place), got {arr.dtype}")
 
     return nV, nT
+
+
+def _current_bottom_mask(mesh: MeshState, layer_id: int) -> np.ndarray:
+    """Mask for the interface that is currently attached to the FEP."""
+    mask = np.zeros(mesh.vertices.shape[0], dtype=bool)
+    bottom_nodes = mesh.bottom_nodes(int(layer_id))
+    if bottom_nodes.size:
+        mask[bottom_nodes] = True
+    elif not np.any(mesh.is_top_surface_of_layer >= 0):
+        mask = np.asarray(mesh.is_bottom_surface, dtype=bool).copy()
+    mask &= mesh.active_vertex_mask
+    return np.ascontiguousarray(mask, dtype=bool)
 
 
 def solve_until_stable(
@@ -264,21 +329,25 @@ def solve_until_stable(
             f"导入错误: {_CPP_IMPORT_ERROR}"
         )
 
+    # ── Dtype 标准化（numpy 默认 int64，但 C++ 需要 int32/bool）──
+    # czm_state 是 C++ 原地写入状态，必须持久挂回 mesh，不能用临时拷贝。
+    _czm = _ensure_mesh_int32_array(mesh, "czm_state")
+    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
+    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
+    _first_active_layer = np.ascontiguousarray(mesh.first_active_layer, dtype=np.int32)
+    _surface_layers = np.ascontiguousarray(mesh.is_top_surface_of_layer, dtype=np.int32)
+    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
+    _current_bottom = _current_bottom_mask(mesh, layer_id)
+
     # ── 预检：数组 shape/contiguity ──
     _validate_arrays(
         mesh.vertices, mesh.velocities, mesh.masses,
+        _first_active_layer, _surface_layers,
         mesh.active_vertex_mask, mesh.is_top_fixed,
-        mesh.is_bottom_surface.astype(bool),
-        mesh.czm_state, mesh.damage, mesh.time_free,
-        mesh.tets, mesh.active_tet_mask,
-        mesh.dm_inv, mesh.tet_volumes, mesh.colors,
+        _bs, _current_bottom, _czm, mesh.damage, mesh.time_free,
+        _tets, mesh.active_tet_mask,
+        mesh.dm_inv, mesh.tet_volumes, _colors,
     )
-
-    # ── Dtype 标准化（numpy 默认 int64，但 C++ 需要 int32/bool）──
-    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
-    _czm = np.ascontiguousarray(mesh.czm_state, dtype=np.int32)
-    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
-    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
 
     cpp_cfg = _build_cpp_config(config)
 
@@ -287,9 +356,12 @@ def solve_until_stable(
         mesh.velocities,
         mesh.ideal_vertices,
         mesh.masses,
+        _first_active_layer,
+        _surface_layers,
         mesh.active_vertex_mask,
         mesh.is_top_fixed,
         _bs,
+        _current_bottom,
         _czm,
         mesh.damage,
         mesh.time_free,
@@ -347,21 +419,25 @@ def solve_lift_and_relax(
             f"导入错误: {_CPP_IMPORT_ERROR}"
         )
 
+    # ── Dtype 标准化（numpy 默认 int64，C++ 需要 int32/bool）──
+    # czm_state 是 C++ 原地写入状态，必须持久挂回 mesh，不能用临时拷贝。
+    _czm = _ensure_mesh_int32_array(mesh, "czm_state")
+    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
+    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
+    _first_active_layer = np.ascontiguousarray(mesh.first_active_layer, dtype=np.int32)
+    _surface_layers = np.ascontiguousarray(mesh.is_top_surface_of_layer, dtype=np.int32)
+    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
+    _current_bottom = _current_bottom_mask(mesh, layer_id)
+
     # ── 预检：数组 shape/contiguity ──
     _validate_arrays(
         mesh.vertices, mesh.velocities, mesh.masses,
+        _first_active_layer, _surface_layers,
         mesh.active_vertex_mask, mesh.is_top_fixed,
-        mesh.is_bottom_surface.astype(bool),
-        mesh.czm_state, mesh.damage, mesh.time_free,
-        mesh.tets, mesh.active_tet_mask,
-        mesh.dm_inv, mesh.tet_volumes, mesh.colors,
+        _bs, _current_bottom, _czm, mesh.damage, mesh.time_free,
+        _tets, mesh.active_tet_mask,
+        mesh.dm_inv, mesh.tet_volumes, _colors,
     )
-
-    # ── Dtype 标准化（numpy 默认 int64，C++ 需要 int32/bool）──
-    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
-    _czm = np.ascontiguousarray(mesh.czm_state, dtype=np.int32)
-    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
-    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
 
     cpp_cfg = _build_cpp_config(config)
     lifting_top_list = [int(x) for x in lifting_top]
@@ -371,9 +447,12 @@ def solve_lift_and_relax(
         mesh.velocities,
         mesh.ideal_vertices,
         mesh.masses,
+        _first_active_layer,
+        _surface_layers,
         mesh.active_vertex_mask,
         mesh.is_top_fixed,
         _bs,
+        _current_bottom,
         _czm,
         mesh.damage,
         mesh.time_free,

@@ -3,11 +3,18 @@
 import sys
 import unittest
 from pathlib import Path
+import os
+from unittest.mock import patch
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+class _FakeSignal:
+    def connect(self, slot) -> None:  # noqa: ANN001
+        pass
 
 
 class LiftSolverTests(unittest.TestCase):
@@ -55,6 +62,559 @@ class LiftSolverTests(unittest.TestCase):
         )
         new_top_z = result.x[self.mesh.is_top_fixed, 2]
         self.assertTrue(np.all(new_top_z > original_top_z))
+
+
+class PythonLiftSolverStabilityTests(unittest.TestCase):
+    """Python 提升求解器数值稳定性回归测试。"""
+
+    @staticmethod
+    def _single_vertex_mesh(*, bottom_interface: int = 1):
+        from hydrogel_vbd.core.state import MeshState
+
+        mesh = MeshState(
+            vertices=np.zeros((1, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=int),
+            layer_id_per_vertex=np.array([0], dtype=int),
+            layer_id_per_tet=np.zeros(0, dtype=int),
+            first_active_layer=np.array([0], dtype=int),
+            is_bottom_surface=np.array([bottom_interface == 0], dtype=bool),
+            is_top_surface_of_layer=np.array([bottom_interface], dtype=int),
+        )
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(1, dtype=int)
+        mesh.node_mass = np.ones(1, dtype=float)
+        mesh.czm_state[:] = 2  # FREE
+        return mesh
+
+    def test_solve_with_lift_psd_projects_indefinite_hessian(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        config = SimulationConfig(
+            dt=1.0,
+            k_d=0.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0e-12,
+            v_lift=0.0,
+        )
+        mesh = self._single_vertex_mesh()
+        bad_hessian = -1.000000001 * np.eye(3)[None, :, :]
+        terms = LocalPhysicsTerms(
+            force=np.array([[1.0, 0.0, 0.0]], dtype=float),
+            hessian=bad_hessian,
+        )
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.build_local_physics_terms",
+            return_value=terms,
+        ):
+            result = PythonReferenceVBDSolver(config).solve_with_lift(
+                mesh, layer_id=0, e_z=0.0, lifting_top=np.array([], dtype=int)
+            )
+
+        self.assertEqual(result.iterations, 1)
+        self.assertTrue(np.all(np.isfinite(result.x)))
+
+    def test_indefinite_hessian_projection_clips_negative_modes(self) -> None:
+        from hydrogel_vbd.solver.vbd_solver import _make_psd
+
+        hessian = np.diag([-2.0, 0.5, 3.0])
+        projected = _make_psd(hessian)
+
+        self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(projected))), 0.0)
+        np.testing.assert_allclose(projected, np.diag([0.0, 0.5, 3.0]))
+
+    def test_solve_with_lift_updates_czm_with_actual_pull(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            max_iters=1,
+            N_stable=1,
+            v_lift=0.0,
+            T_max=5000.0,
+        )
+        mesh = self._single_vertex_mesh(bottom_interface=0)
+        mesh.is_bottom_surface[:] = True
+        mesh.czm_state[:] = int(CZMState.FIXED)
+        actual_pull = 123.0
+        terms = LocalPhysicsTerms(
+            force=np.array([[0.0, 0.0, actual_pull]], dtype=float),
+            hessian=np.zeros((1, 3, 3), dtype=float),
+        )
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.vbd_solver.build_local_physics_terms",
+                return_value=terms,
+            ),
+            patch("hydrogel_vbd.physics.czm.update_czm_states") as update_mock,
+        ):
+            PythonReferenceVBDSolver(config).solve_with_lift(
+                mesh, layer_id=0, e_z=0.0, lifting_top=np.array([], dtype=int)
+            )
+
+        self.assertEqual(update_mock.call_count, 1)
+        pull_arg = update_mock.call_args.kwargs["internal_pull_z"]
+        np.testing.assert_allclose(pull_arg, [actual_pull])
+
+    def test_layer_one_solver_does_not_clamp_previous_global_bottom_to_current_fep(self) -> None:
+        from dataclasses import replace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        config = SimulationConfig(
+            layer_thickness=0.0019981,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            max_iters=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        activator = LayerActivator()
+        activator.activate_with_inheritance(mesh, 0, z_fep=0.0)
+        previous_bottom = mesh.bottom_nodes(0)
+
+        layer_config = replace(config, z_fep=config.layer_thickness)
+        activator.activate_with_inheritance(
+            mesh, 1, z_fep=layer_config.z_fep
+        )
+        lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
+
+        result = PythonReferenceVBDSolver(layer_config).solve_with_lift(
+            mesh, layer_id=1, e_z=0.0, lifting_top=lifting_top
+        )
+
+        self.assertLess(result.max_dx, 1.0e-5)
+        self.assertLess(
+            float(np.max(mesh.vertices[previous_bottom, 2])),
+            config.layer_thickness * 0.01,
+        )
+        self.assertGreaterEqual(float(np.min(mesh.vertices[previous_bottom, 2])), 0.0)
+        self.assertGreaterEqual(float(np.min(mesh.vertices[previous_bottom, 2])), 0.0)
+
+    def test_layer_one_interior_nodes_are_clamped_to_their_layer_floor(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        config = SimulationConfig(
+            layer_thickness=0.0019981,
+            dt=1.0e-3,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+            d_fluid_max=0.0,
+        )
+        layer_config = config
+        layer_config.z_fep = config.layer_thickness
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, layer_config.z_fep - 1.0e-3]], dtype=float),
+            tets=np.zeros((0, 4), dtype=int),
+            layer_id_per_vertex=np.array([1], dtype=int),
+            layer_id_per_tet=np.zeros(0, dtype=int),
+            first_active_layer=np.array([1], dtype=int),
+            is_bottom_surface=np.array([False], dtype=bool),
+            is_top_surface_of_layer=np.array([-1], dtype=int),
+        )
+        mesh.active_vertex_mask[:] = True
+        mesh.colors = np.zeros(1, dtype=int)
+        mesh.node_mass = np.ones(1, dtype=float)
+        terms = LocalPhysicsTerms(
+            force=np.zeros_like(mesh.vertices),
+            hessian=np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float),
+        )
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.build_local_physics_terms",
+            return_value=terms,
+        ):
+            PythonReferenceVBDSolver(layer_config).solve_with_lift(
+                mesh, layer_id=1, e_z=0.0, lifting_top=np.array([], dtype=int)
+            )
+
+        self.assertGreaterEqual(
+            float(mesh.vertices[0, 2]),
+            layer_config.z_fep,
+        )
+
+
+class WorkerLiftControlTests(unittest.TestCase):
+    """Worker 层内提升控制回归测试。"""
+
+    def test_current_lifting_top_uses_active_layer_top_nodes(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        config = SimulationConfig(layer_thickness=1.0e-4)
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=3, layer_thickness=config.layer_thickness, config=config
+        )
+
+        # Simulate the previous worker preprocess cache of the global highest face.
+        z_max = float(np.max(mesh.vertices[:, 2]))
+        mesh.top_ids = np.flatnonzero(np.isclose(mesh.vertices[:, 2], z_max))
+
+        LayerActivator().activate_with_inheritance(
+            mesh, current_layer=0, z_fep=config.z_fep
+        )
+
+        lifting_top = SimulationWorker._current_lifting_top(mesh)
+        np.testing.assert_array_equal(lifting_top, mesh.top_nodes(0))
+        self.assertTrue(np.all(mesh.active_vertex_mask[lifting_top]))
+
+    def test_expected_lift_steps_uses_si_units(self) -> None:
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        lift_max = 5.0 * 1.0e-4
+        lift_step = 1.0e-3 * 1.0e-3
+        self.assertEqual(
+            SimulationWorker._expected_lift_steps(lift_max, lift_step),
+            500,
+        )
+        with self.assertRaises(ValueError):
+            SimulationWorker._expected_lift_steps(lift_max, 0.0)
+
+    def test_layer_contact_z_advances_with_layer_index(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        config = SimulationConfig(z_fep=0.01, layer_thickness=0.0019981)
+
+        self.assertAlmostEqual(SimulationWorker._layer_contact_z(config, 0), 0.01)
+        self.assertAlmostEqual(
+            SimulationWorker._layer_contact_z(config, 2),
+            0.0139962,
+        )
+
+    def test_cpp_subprocess_config_includes_lift_multiplier(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.cpp_subprocess import _DoneMsg
+
+        captured: dict[str, object] = {}
+
+        class FakeCppSubprocessSolver:
+            def __init__(self, mesh_dict, config_dict, n_layers, output_dir):  # noqa: ANN001
+                captured["config_dict"] = config_dict
+
+            def start(self) -> None:
+                pass
+
+            def iter_messages(self, timeout=0.2):  # noqa: ANN001
+                yield _DoneMsg(results=[])
+
+            def terminate(self) -> None:
+                pass
+
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=SimulationConfig(lift_multiplier=1.5),
+            n_layers=0,
+            output_dir="outputs/gui",
+            use_cpp=False,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.cpp_subprocess.CppSubprocessSolver",
+            FakeCppSubprocessSolver,
+        ):
+            worker._run_cpp_subprocess()
+
+        config_dict = captured["config_dict"]
+        self.assertEqual(config_dict["lift_multiplier"], 1.5)
+
+    def test_yaml_config_loads_lift_multiplier(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+
+        config = SimulationConfig.from_yaml(ROOT / "configs" / "config.yaml")
+
+        self.assertAlmostEqual(config.lift_multiplier, 1.5)
+
+    def test_cpp_done_payload_converts_to_layer_result(self) -> None:
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.core.state import LayerResult
+
+        result = SimulationWorker._cpp_payload_to_layer_result({
+            "layer_id": 8,
+            "total_steps": 2998,
+            "final_max_dx": 1.25e-6,
+            "total_iterations": 59960,
+            "max_iter_hits": 17,
+            "clipped_steps": 11,
+            "elapsed_s": 4.2,
+            "avg_call_ms": 1.4,
+            "success": True,
+        })
+
+        self.assertIsInstance(result, LayerResult)
+        self.assertEqual(result.layer_id, 8)
+        self.assertAlmostEqual(result.max_deformation, 1.25e-6)
+        self.assertEqual(result.error_metrics["total_steps"], 2998)
+        self.assertEqual(result.error_metrics["solver_total_steps"], 2998)
+        self.assertAlmostEqual(result.error_metrics["solver_final_max_dx"], 1.25e-6)
+        self.assertEqual(result.error_metrics["solver_max_iter_hits"], 17)
+        self.assertEqual(result.error_metrics["solver_clipped_steps"], 11)
+        self.assertEqual(result.error_metrics["shape_error_available"], 0.0)
+        self.assertTrue(result.success)
+
+    def test_worker_rejects_detach_before_solver_convergence(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(max_iters=20, N_stable=2, epsilon=1.0e-9)
+        result = VBDSolveResult(
+            x=np.zeros((0, 3)),
+            v=np.zeros((0, 3)),
+            iterations=config.max_iters,
+            max_dx=SimulationWorker.DX_CLIP_DIAGNOSTIC,
+            kinetic_energy=0.0,
+            stable_steps=0,
+            all_free=True,
+            chebyshev_skipped_damaging=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "solver did not converge"):
+            SimulationWorker._raise_if_detached_before_convergence(
+                layer_id=3,
+                layer_steps=2,
+                result=result,
+                config=config,
+            )
+
+    def test_worker_czm_update_uses_actual_local_pull(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        config = SimulationConfig(T_max=5000.0)
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh(
+            bottom_interface=0
+        )
+        actual_pull = 321.0
+        terms = LocalPhysicsTerms(
+            force=np.array([[0.0, 0.0, actual_pull]], dtype=float),
+            hessian=np.zeros((1, 3, 3), dtype=float),
+        )
+
+        with (
+            patch(
+                "hydrogel_vbd.physics.local_terms.build_local_physics_terms",
+                return_value=terms,
+            ),
+            patch("hydrogel_vbd.physics.czm.update_czm_states") as update_mock,
+        ):
+            SimulationWorker._update_czm_from_current_terms(
+                mesh, config, layer_id=0, e_z=0.0, x_prev=mesh.vertices.copy()
+            )
+
+        self.assertEqual(update_mock.call_count, 1)
+        pull_arg = update_mock.call_args.kwargs["internal_pull_z"]
+        np.testing.assert_allclose(pull_arg, [actual_pull])
+
+    def test_solver_only_fixes_czm_nodes_on_current_bottom(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh(bottom_interface=0)
+        mesh.czm_state[:] = int(CZMState.FIXED)
+        force = np.array([[1.0, 0.0, 0.0]], dtype=float)
+        terms = LocalPhysicsTerms(
+            force=force,
+            hessian=np.zeros((1, 3, 3), dtype=float),
+        )
+        config = SimulationConfig(
+            dt=1.0,
+            k_d=0.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0e-12,
+            c_init=0.0,
+        )
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.build_local_physics_terms",
+            return_value=terms,
+        ):
+            PythonReferenceVBDSolver(config).solve_with_lift(
+                mesh, layer_id=1, e_z=0.0, lifting_top=np.array([], dtype=int)
+            )
+
+        self.assertGreater(mesh.vertices[0, 0], 0.0)
+
+    def test_local_terms_ignore_free_czm_away_from_current_bottom(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.physics.local_terms import build_local_physics_terms
+
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh(bottom_interface=0)
+        mesh.czm_state[:] = int(CZMState.FREE)
+        mesh.vertices[0, 2] = 2.0e-6
+        mesh.prev_vertices[0, 2] = 1.0e-6
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=0.0,
+            dt=1.0e-3,
+            d_min=1.0e-9,
+            d_fluid_max=1.0e-3,
+            t_fluid_max=1.0,
+        )
+
+        terms = build_local_physics_terms(
+            mesh, config, e_z=0.0, x_prev=mesh.prev_vertices, layer_id=1
+        )
+
+        np.testing.assert_allclose(terms.force[0], np.zeros(3))
+        np.testing.assert_allclose(terms.hessian[0], np.zeros((3, 3)))
+
+    def test_worker_stop_request_terminates_active_cpp_subprocess(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=SimulationConfig(),
+            n_layers=1,
+            output_dir="outputs/gui",
+            use_cpp=False,
+        )
+
+        class FakeCppSolver:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        cpp_solver = FakeCppSolver()
+        worker._cpp_solver = cpp_solver
+
+        worker.request_stop()
+
+        self.assertTrue(worker._stop_flag)
+        self.assertTrue(cpp_solver.terminated)
+
+    def test_python_worker_diagnostic_guard_writes_csv_and_stops(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.diagnostics import SolverStepDiagnostics
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=20.0e-6,
+            lift_multiplier=5.0,
+            max_iters=2,
+            N_stable=1,
+            epsilon=1.0e-9,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        out_dir = Path("outputs/test_python_worker_diag")
+        csv_path = out_dir / "reports" / "solver_diagnostics.csv"
+        csv_path.unlink(missing_ok=True)
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_with_lift(self, mesh_arg, **kwargs):  # noqa: ANN001, ARG002
+                return VBDSolveResult(
+                    x=mesh_arg.vertices,
+                    v=mesh_arg.velocities,
+                    iterations=self.config.max_iters,
+                    max_dx=0.002,
+                    kinetic_energy=0.0,
+                    stable_steps=0,
+                    all_free=False,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        saved = {
+            "HYDROGEL_VBD_SOLVER_DIAG": os.environ.get("HYDROGEL_VBD_SOLVER_DIAG"),
+            "HYDROGEL_VBD_SOLVER_DIAG_STRIDE": os.environ.get(
+                "HYDROGEL_VBD_SOLVER_DIAG_STRIDE"
+            ),
+        }
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir=out_dir,
+            use_cpp=False,
+            solver_diagnostics_enabled=True,
+            solver_diagnostics_stride=1,
+        )
+        worker._trace = lambda msg: None
+        try:
+            os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG", None)
+            os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG_STRIDE", None)
+            with patch(
+                "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+                FakeSolver,
+            ):
+                results = worker._run_layers()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(worker._stop_flag)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].error_metrics["solver_total_steps"], 50.0)
+        self.assertFalse(results[0].success)
+        header = csv_path.read_text(encoding="utf-8").splitlines()[0].split(",")
+        self.assertEqual(header, SolverStepDiagnostics.csv_fields())
+
+
+class LayerActivatorTopFallbackTests(unittest.TestCase):
+    """层顶面分类缺失时的激活回归测试。"""
+
+    def test_final_layer_uses_geometry_top_when_interface_id_is_missing(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+
+        config = SimulationConfig(layer_thickness=1.0e-4)
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        original_final_top = mesh.top_nodes(1)
+        self.assertGreater(len(original_final_top), 0)
+
+        # Simulate STL/OCC classification that lacks interface_id == n_layers.
+        mesh.is_top_surface_of_layer[original_final_top] = -1
+
+        LayerActivator().activate_with_inheritance(
+            mesh, current_layer=1, z_fep=config.z_fep
+        )
+
+        lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
+        np.testing.assert_array_equal(lifting_top, original_final_top)
 
 
 class VbdSolverSolveUntilStableTests(unittest.TestCase):
@@ -142,6 +702,9 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertIsNotNone(config.kappa)
         self.assertIsNotNone(config.v_lift)
         self.assertIsNotNone(config.K_p)
+        self.assertAlmostEqual(config.layer_thickness, 1.0e-4)
+        self.assertIn("lift_multiplier", panel._spin_map)
+        self.assertAlmostEqual(config.lift_multiplier, 1.5)
         app.quit()
 
     def test_main_window_init(self) -> None:
@@ -154,12 +717,832 @@ class GuiParamConfigTests(unittest.TestCase):
 
         win = MainWindow()
         self.assertEqual(win.windowTitle(), "Hydrogel VBD Simulator")
+        self.assertIsNotNone(win._chk_solver_diag)
+        self.assertFalse(win._chk_solver_diag.isChecked())
         self.assertTrue(win.isVisible() is False)
+        app.quit()
+
+    def test_solver_diagnostics_checkbox_controls_run_environment(self) -> None:
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        saved = os.environ.get("HYDROGEL_VBD_SOLVER_DIAG")
+        try:
+            os.environ["HYDROGEL_VBD_SOLVER_DIAG"] = "external"
+            win = MainWindow()
+            win._chk_solver_diag.setChecked(True)
+
+            win._apply_solver_diagnostics_env_for_run()
+            self.assertEqual(os.environ["HYDROGEL_VBD_SOLVER_DIAG"], "1")
+
+            win._restore_solver_diagnostics_env_after_run()
+            self.assertEqual(os.environ["HYDROGEL_VBD_SOLVER_DIAG"], "external")
+        finally:
+            if saved is None:
+                os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG", None)
+            else:
+                os.environ["HYDROGEL_VBD_SOLVER_DIAG"] = saved
+            app.quit()
+
+    def test_solver_diagnostics_checkbox_is_passed_to_worker(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6 import QtCore
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        mesh = MeshState(
+            vertices=np.zeros((1, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(1, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+        )
+        win = MainWindow()
+        win._generated_mesh = mesh
+        win._actual_layers = 1
+        win._chk_solver_diag.setChecked(True)
+
+        created = {}
+
+        class FakeThread:
+            def __init__(self, parent=None) -> None:  # noqa: ANN001
+                self.started = _FakeSignal()
+                self.finished = _FakeSignal()
+
+            def start(self) -> None:
+                pass
+
+            def quit(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+            def requestInterruption(self) -> None:
+                pass
+
+        class FakeWorker:
+            def __init__(self, **kwargs) -> None:  # noqa: ANN003
+                created.update(kwargs)
+                self.frame_ready = _FakeSignal()
+                self.progress_update = _FakeSignal()
+                self.log_message = _FakeSignal()
+                self.finished = _FakeSignal()
+                self.cancelled = _FakeSignal()
+                self.error = _FakeSignal()
+                self.sub_progress = _FakeSignal()
+                self.layer_finished = _FakeSignal()
+
+            def moveToThread(self, thread) -> None:  # noqa: ANN001
+                pass
+
+            def run(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+        with patch(
+            "hydrogel_vbd.gui.main_window.SimulationWorker",
+            FakeWorker,
+        ), patch.object(QtCore, "QThread", FakeThread), patch(
+            "hydrogel_vbd.gui.main_window.is_cpp_available",
+            return_value=False,
+        ):
+            win._on_run()
+
+        self.assertTrue(created["solver_diagnostics_enabled"])
+        app.quit()
+
+    def test_main_window_exposes_simulation_stop_button(self) -> None:
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        win = MainWindow()
+        self.assertEqual(win._btn_stop_sim.text(), "中断仿真")
+        self.assertTrue(win._btn_stop_sim.isHidden())
+        self.assertFalse(win._btn_stop_sim.isEnabled())
+        app.quit()
+
+    def test_stop_simulation_requests_worker_stop(self) -> None:
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        class FakeWorker:
+            def __init__(self) -> None:
+                self.stop_requested = False
+
+            def request_stop(self) -> None:
+                self.stop_requested = True
+
+        win = MainWindow()
+        worker = FakeWorker()
+        win._worker = worker
+        win._set_simulation_running(True)
+
+        win._on_stop_simulation()
+
+        self.assertTrue(worker.stop_requested)
+        self.assertTrue(win._simulation_stop_requested)
+        self.assertFalse(win._btn_stop_sim.isEnabled())
+        self.assertEqual(win._btn_stop_sim.text(), "正在中断...")
         app.quit()
 
     def test_launch_gui_importable(self) -> None:
         from hydrogel_vbd.gui.main_window import launch_gui
         self.assertTrue(callable(launch_gui))
+
+    def test_report_uses_solver_diagnostic_mode_without_shape_error(self) -> None:
+        from hydrogel_vbd.core.state import FieldCommand, LayerResult
+        from hydrogel_vbd.gui.main_window import ElectricFieldPlotWindow
+
+        results = [
+            LayerResult(
+                layer_id=0,
+                x_sim=np.zeros((0, 3)),
+                v_sim=np.zeros((0, 3)),
+                error_metrics={
+                    "E_z": 0.0,
+                    "max_error": 2.0e-3,
+                    "solver_final_max_dx": 2.0e-3,
+                    "solver_max_iter_hit_pct": 100.0,
+                    "solver_avg_call_ms": 23.4,
+                    "shape_error_available": 0.0,
+                },
+                field_command_next=FieldCommand(np.array([])),
+                max_deformation=2.0e-3,
+                rms_error=0.0,
+                success=True,
+            )
+        ]
+        plot_data = ElectricFieldPlotWindow._build_plot_data(results)
+
+        self.assertEqual(plot_data.mode, "solver")
+        self.assertEqual(plot_data.primary_label, "solver max_dx (m)")
+        self.assertEqual(plot_data.aux_label, "max_iter 命中率 (%)")
+        np.testing.assert_allclose(plot_data.primary, [2.0e-3])
+        np.testing.assert_allclose(plot_data.aux_pct, [100.0])
+
+    def test_report_uses_shape_error_mode_when_metrics_exist(self) -> None:
+        from hydrogel_vbd.core.state import FieldCommand, LayerResult
+        from hydrogel_vbd.gui.main_window import ElectricFieldPlotWindow
+
+        results = [
+            LayerResult(
+                layer_id=0,
+                x_sim=np.zeros((0, 3)),
+                v_sim=np.zeros((0, 3)),
+                error_metrics={
+                    "E_z": 1.0,
+                    "shape_max_error": 3.0e-4,
+                    "shape_rms_error": 2.0e-4,
+                    "shape_error_available": 1.0,
+                },
+                field_command_next=FieldCommand(np.array([])),
+                max_deformation=9.0e-3,
+                rms_error=9.0e-3,
+                success=True,
+            )
+        ]
+        plot_data = ElectricFieldPlotWindow._build_plot_data(results)
+
+        self.assertEqual(plot_data.mode, "shape")
+        self.assertEqual(plot_data.primary_label, "max_error (m)")
+        self.assertEqual(plot_data.secondary_label, "rms_error (m)")
+        np.testing.assert_allclose(plot_data.primary, [3.0e-4])
+        np.testing.assert_allclose(plot_data.secondary, [2.0e-4])
+
+
+class CppAdapterStateWritebackTests(unittest.TestCase):
+    """C++ 适配层可写状态数组回写回归测试。"""
+
+    def test_cpp_adapter_passes_current_layer_bottom_mask(self) -> None:
+        from types import SimpleNamespace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        import hydrogel_vbd.solver.cpp_adapter as cpp_adapter
+
+        mesh = MeshState(
+            vertices=np.zeros((2, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=int),
+            layer_id_per_vertex=np.array([0, 1], dtype=int),
+            layer_id_per_tet=np.zeros(0, dtype=int),
+            first_active_layer=np.array([0, 1], dtype=int),
+            is_bottom_surface=np.array([True, False], dtype=bool),
+            is_top_surface_of_layer=np.array([0, 1], dtype=int),
+        )
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=int)
+        mesh.node_mass = np.ones(2, dtype=float)
+
+        captured: dict[str, np.ndarray] = {}
+
+        class FakeSolverConfig:
+            pass
+
+        def fake_solve_lift_and_relax(*args):
+            captured["global_bottom"] = np.asarray(args[6], dtype=bool).copy()
+            captured["current_bottom"] = np.asarray(args[7], dtype=bool).copy()
+            return {
+                "max_dx": 0.0,
+                "kinetic_energy": 0.0,
+                "iterations": 0,
+                "stable_steps": 0,
+                "all_free": False,
+                "chebyshev_skipped_damaging": 0,
+            }
+
+        fake_cpp = SimpleNamespace(
+            SolverConfig=FakeSolverConfig,
+            solve_lift_and_relax=fake_solve_lift_and_relax,
+        )
+
+        with patch.object(cpp_adapter, "_CPP_AVAILABLE", True), patch.object(
+            cpp_adapter, "hydrogel_vbd_cpp", fake_cpp
+        ):
+            cpp_adapter.solve_lift_and_relax(
+                mesh,
+                SimulationConfig(),
+                e_z=0.0,
+                layer_id=1,
+                lifting_top=np.array([], dtype=int),
+            )
+
+        np.testing.assert_array_equal(captured["global_bottom"], [True, False])
+        np.testing.assert_array_equal(captured["current_bottom"], [False, True])
+
+    def test_solve_lift_and_relax_writes_int64_czm_state_back(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.solver.cpp_adapter import (
+            is_cpp_available,
+            solve_lift_and_relax,
+        )
+
+        if not is_cpp_available():
+            self.skipTest("C++ solver module is not available")
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            max_iters=1,
+            N_stable=1,
+            layer_thickness=1.0e-4,
+            delta_f=1.0e-4,
+            v_lift=1.0e-3,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh.activate_layer(0)
+        top = mesh.top_nodes(0)
+        mesh.is_top_fixed[top] = True
+
+        bottom = mesh.bottom_nodes(0)
+        mesh.vertices[bottom, 2] = 6.0 * config.delta_f
+        mesh.czm_state = mesh.czm_state.astype(np.int64, copy=True)
+
+        solve_lift_and_relax(
+            mesh,
+            config,
+            e_z=0.0,
+            layer_id=0,
+            lifting_top=top,
+        )
+
+        self.assertTrue(
+            np.all(mesh.czm_state[bottom] == int(CZMState.DAMAGING))
+        )
+
+    def test_cpp_lift_does_not_clamp_previous_global_bottom_to_current_fep(self) -> None:
+        from dataclasses import replace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+        from hydrogel_vbd.solver.cpp_adapter import (
+            is_cpp_available,
+            solve_lift_and_relax,
+        )
+
+        if not is_cpp_available():
+            self.skipTest("C++ solver module is not available")
+
+        config = SimulationConfig(
+            layer_thickness=0.0019981,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            max_iters=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        activator = LayerActivator()
+        activator.activate_with_inheritance(mesh, 0, z_fep=0.0)
+        previous_bottom = mesh.bottom_nodes(0)
+
+        layer_config = replace(config, z_fep=config.layer_thickness)
+        activator.activate_with_inheritance(
+            mesh, 1, z_fep=layer_config.z_fep
+        )
+        lifting_top = np.flatnonzero(
+            mesh.is_top_fixed & mesh.active_vertex_mask
+        ).astype(np.int32)
+
+        result = solve_lift_and_relax(mesh, layer_config, 0.0, 1, lifting_top)
+
+        self.assertLess(result.max_dx, 1.0e-5)
+        self.assertLess(
+            float(np.max(mesh.vertices[previous_bottom, 2])),
+            config.layer_thickness * 0.01,
+        )
+
+
+class CppSubprocessRuntimeTests(unittest.TestCase):
+    """C++ 子进程运行时配置测试。"""
+
+    def test_configure_cpp_runtime_enables_requested_subprocess_threads(self) -> None:
+        from hydrogel_vbd.solver.cpp_subprocess import (
+            _configure_cpp_runtime_for_subprocess,
+        )
+
+        saved = {
+            key: os.environ.get(key)
+            for key in (
+                "HYDROGEL_VBD_SUBPROCESS_THREADS",
+                "HYDROGEL_VBD_OMP",
+                "OMP_NUM_THREADS",
+            )
+        }
+        try:
+            os.environ["HYDROGEL_VBD_SUBPROCESS_THREADS"] = "4"
+            os.environ.pop("HYDROGEL_VBD_OMP", None)
+            os.environ.pop("OMP_NUM_THREADS", None)
+
+            info = _configure_cpp_runtime_for_subprocess()
+
+            self.assertEqual(info["threads"], 4)
+            self.assertEqual(os.environ["HYDROGEL_VBD_OMP"], "1")
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "4")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_cpp_lift_step_updates_current_layer_czm_boundary(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            max_iters=2,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        expected_layer1_bottom = mesh.bottom_nodes(1)
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=True,
+                chebyshev_skipped_damaging=0,
+            )
+
+        conn = FakeConn()
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_solve,
+            ),
+            patch("hydrogel_vbd.physics.czm.update_czm_states") as update_mock,
+        ):
+            _run_simulation(conn, mesh_dict, config_dict, n_layers=2, output_dir="outputs/gui")
+
+        updated_node_sets = [
+            np.asarray(call.kwargs["bottom_nodes"], dtype=int)
+            if "bottom_nodes" in call.kwargs
+            else np.asarray(call.args[1], dtype=int)
+            for call in update_mock.call_args_list
+        ]
+        self.assertTrue(
+            any(np.array_equal(nodes, expected_layer1_bottom) for nodes in updated_node_sets)
+        )
+
+    def test_cpp_lift_rejects_detach_before_solver_convergence(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.solver.cpp_subprocess import DX_CLIP_DIAGNOSTIC, _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            max_iters=2,
+            N_stable=1,
+            epsilon=1.0e-9,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        bottom = mesh.bottom_nodes(0)
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+            "epsilon": config.epsilon,
+        }
+
+        class FakeConn:
+            def send(self, msg) -> None:  # noqa: ANN001
+                pass
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=cfg_arg.max_iters,
+                max_dx=DX_CLIP_DIAGNOSTIC,
+                kinetic_energy=0.0,
+                stable_steps=0,
+                all_free=True,
+                chebyshev_skipped_damaging=0,
+            )
+
+        def fake_czm_update(mesh_arg, bottom_nodes, **kwargs):  # noqa: ANN001, ARG001
+            mesh_arg.czm_state[np.asarray(bottom_nodes, dtype=int)] = int(CZMState.FREE)
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_solve,
+            ),
+            patch(
+                "hydrogel_vbd.physics.czm.update_czm_states",
+                side_effect=fake_czm_update,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "solver did not converge"):
+                _run_simulation(
+                    FakeConn(), mesh_dict, config_dict,
+                    n_layers=1, output_dir="outputs/gui",
+                )
+
+    def test_cpp_lift_uses_actual_pull_and_restores_cpp_czm_mutation(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.physics.local_terms import LocalPhysicsTerms
+        from hydrogel_vbd.solver.cpp_subprocess import _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=2.0e-7,
+            max_iters=2,
+            N_stable=1,
+            epsilon=1.0e-9,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        bottom = mesh.bottom_nodes(0)
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+            "epsilon": config.epsilon,
+        }
+        actual_pull = 321.0
+        terms = LocalPhysicsTerms(
+            force=np.full_like(mesh.vertices, [0.0, 0.0, actual_pull], dtype=float),
+            hessian=np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float),
+        )
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            mesh_arg.czm_state[bottom] = int(CZMState.FREE)
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        def fake_update(mesh_arg, bottom_nodes, **kwargs):  # noqa: ANN001
+            nodes = np.asarray(bottom_nodes, dtype=int)
+            self.assertTrue(np.all(mesh_arg.czm_state[nodes] == int(CZMState.FIXED)))
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_solve,
+            ),
+            patch(
+                "hydrogel_vbd.physics.local_terms.build_local_physics_terms",
+                return_value=terms,
+            ),
+            patch(
+                "hydrogel_vbd.physics.czm.update_czm_states",
+                side_effect=fake_update,
+            ) as update_mock,
+        ):
+            _run_simulation(
+                FakeConn(), mesh_dict, config_dict,
+                n_layers=1, output_dir="outputs/gui",
+            )
+
+        pull_arg = update_mock.call_args.kwargs["internal_pull_z"]
+        np.testing.assert_allclose(pull_arg, np.full(len(bottom), actual_pull))
+
+    def test_cpp_diagnostic_runaway_guard_returns_done_without_error(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.solver.cpp_subprocess import _DoneMsg, _ErrorMsg, _run_simulation
+        from hydrogel_vbd.solver.diagnostics import SolverStepDiagnostics
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=20.0e-6,
+            lift_multiplier=5.0,
+            max_iters=2,
+            N_stable=1,
+            epsilon=1.0e-9,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        bottom = mesh.bottom_nodes(0)
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+            "epsilon": config.epsilon,
+        }
+        out_dir = Path("outputs/test_cpp_diagnostic_guard")
+        csv_path = out_dir / "reports" / "solver_diagnostics.csv"
+        csv_path.unlink(missing_ok=True)
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=cfg_arg.max_iters,
+                max_dx=0.002,
+                kinetic_energy=0.0,
+                stable_steps=0,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        def fake_update(mesh_arg, bottom_nodes, **kwargs):  # noqa: ANN001, ARG001
+            mesh_arg.czm_state[np.asarray(bottom_nodes, dtype=int)] = int(CZMState.FIXED)
+
+        saved = {
+            "HYDROGEL_VBD_SOLVER_DIAG": os.environ.get("HYDROGEL_VBD_SOLVER_DIAG"),
+            "HYDROGEL_VBD_SOLVER_DIAG_STRIDE": os.environ.get(
+                "HYDROGEL_VBD_SOLVER_DIAG_STRIDE"
+            ),
+        }
+        conn = FakeConn()
+        try:
+            os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG", None)
+            os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG_STRIDE", None)
+            with patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_solve,
+            ), patch(
+                "hydrogel_vbd.physics.czm.update_czm_states",
+                side_effect=fake_update,
+            ):
+                _run_simulation(
+                    conn,
+                    mesh_dict,
+                    config_dict,
+                    n_layers=1,
+                    output_dir=out_dir,
+                    diag_enabled_override=True,
+                    diag_stride_override=1,
+                )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(any(isinstance(msg, _ErrorMsg) for msg in conn.messages))
+        done_messages = [msg for msg in conn.messages if isinstance(msg, _DoneMsg)]
+        self.assertEqual(len(done_messages), 1)
+        self.assertEqual(done_messages[0].results[0]["total_steps"], 50)
+        self.assertFalse(done_messages[0].results[0]["success"])
+        header = csv_path.read_text(encoding="utf-8").splitlines()[0].split(",")
+        self.assertEqual(header, SolverStepDiagnostics.csv_fields())
+
+    def test_cpp_diagnostics_off_does_not_write_csv(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=2.0e-7,
+            max_iters=2,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+        out_dir = Path("outputs/test_cpp_diagnostics_off")
+        csv_path = out_dir / "reports" / "solver_diagnostics.csv"
+        csv_path.unlink(missing_ok=True)
+
+        class FakeConn:
+            def send(self, msg) -> None:  # noqa: ANN001
+                pass
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=True,
+                chebyshev_skipped_damaging=0,
+            )
+
+        saved = os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG", None)
+        try:
+            with patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_solve,
+            ):
+                _run_simulation(FakeConn(), mesh_dict, config_dict, n_layers=1, output_dir=out_dir)
+        finally:
+            if saved is not None:
+                os.environ["HYDROGEL_VBD_SOLVER_DIAG"] = saved
+
+        self.assertFalse(csv_path.exists())
 
 
 if __name__ == "__main__":

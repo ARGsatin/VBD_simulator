@@ -21,8 +21,8 @@ from tests.validator import make_unit_tet
 class TestCZMStateMachine:
     """验证 CZM 状态转换逻辑。"""
 
-    def test_fixed_stays_fixed_at_zero_gap(self) -> None:
-        """gap=0 → 节点保持 FIXED。"""
+    def test_fixed_stays_fixed_at_zero_gap_without_pull(self) -> None:
+        """gap=0 且拉力未超阈值 → 节点保持 FIXED。"""
         verts, tets, dm_inv = make_unit_tet(scale=1.0)
         mesh = _make_mini_mesh(verts, tets, dm_inv, fix_bottom=False)
         mesh.czm_state[:] = CZMState.FIXED
@@ -32,12 +32,29 @@ class TestCZMStateMachine:
 
         update_czm_states(
             mesh, bottom,
-            internal_pull_z=np.full(3, 5000.0 * 1.05),
+            internal_pull_z=np.zeros(3),
             area=1.0, t_max=5000.0, k_czm=1e8, delta_f=1e-4,
             z_fep=0.0, dt=0.01,  # z_fep = 顶点 Z → gap=0
         )
-        # gap=0 → traction=0, gap≯delta_f(1e-4)
         assert all(mesh.czm_state[i] == CZMState.FIXED for i in bottom)
+
+    def test_fixed_to_damaging_by_pull_threshold_at_zero_gap(self) -> None:
+        """pull_z / area > T_max 时，即使 gap=0 也应开始损伤。"""
+        verts, tets, dm_inv = make_unit_tet(scale=1.0)
+        mesh = _make_mini_mesh(verts, tets, dm_inv, fix_bottom=False)
+        mesh.czm_state[:] = CZMState.FIXED
+        mesh.is_bottom_surface[:] = True
+        mesh.vertices[:, 2] = 0.0
+        bottom = np.array([0, 1, 2], dtype=int)
+
+        update_czm_states(
+            mesh, bottom,
+            internal_pull_z=np.full(3, 5000.0 * 1.05),
+            area=1.0, t_max=5000.0, k_czm=1e8, delta_f=1e-4,
+            z_fep=0.0, dt=0.01,
+        )
+
+        assert all(mesh.czm_state[i] == CZMState.DAMAGING for i in bottom)
 
     def test_fixed_to_damaging_by_gap(self) -> None:
         """gap > delta_f → FIXED→DAMAGING。"""

@@ -38,23 +38,32 @@ class ConformalArchitectureTests(unittest.TestCase):
             for neighbor_id in neighbors:
                 self.assertNotEqual(mesh.colors[node_id], mesh.colors[neighbor_id])
 
-    def test_layer_activation_inherits_shape_clamps_fep_and_resets_new_velocities(self):
+    def test_layer_activation_lowers_stack_to_current_layer_contact_plane(self):
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
 
-        mesh, _ = ConformalMeshPipeline.create_demo(layers=2, layer_thickness=0.05)
+        layer_thickness = 0.05
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=layer_thickness
+        )
         mesh.activate_layer(0)
-        bottom = mesh.bottom_nodes(0)
-        mesh.vertices[bottom, 2] = -0.01
+        active_before = mesh.active_vertex_mask.copy()
+        previous_bottom = mesh.bottom_nodes(0)
+        current_bottom = mesh.bottom_nodes(1)
+        mesh.vertices[active_before, 2] += 0.15
         mesh.velocities[:] = 3.0
 
-        LayerActivator().activate_with_inheritance(mesh, current_layer=1, z_fep=0.0)
+        LayerActivator().activate_with_inheritance(
+            mesh, current_layer=1, z_fep=layer_thickness
+        )
 
-        np.testing.assert_allclose(mesh.vertices[bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.vertices[current_bottom, 2], layer_thickness)
+        np.testing.assert_allclose(mesh.vertices[previous_bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.velocities[active_before], 0.0)
         new_nodes = np.flatnonzero(mesh.first_active_layer == 1)
         self.assertGreater(len(new_nodes), 0)
         np.testing.assert_allclose(mesh.velocities[new_nodes], 0.0)
-        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] >= 0.0))
+        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] >= layer_thickness))
         self.assertTrue(np.all(mesh.vertices[new_nodes, 2] <= mesh.ideal_vertices[new_nodes, 2]))
 
 

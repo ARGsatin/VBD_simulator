@@ -27,6 +27,80 @@ class LayerActivator:
     初始运动学和 CZM 状态。
     """
 
+    @staticmethod
+    def _geometric_layer_top_nodes(
+        mesh: MeshState,
+        current_layer: int,
+    ) -> np.ndarray:
+        """当接口编号缺失时，用当前层四面体的最高 Z 节点恢复顶面。"""
+        if mesh.tets is None or mesh.layer_id_per_tet is None:
+            return np.zeros(0, dtype=int)
+        layer_tets = mesh.tets[mesh.layer_id_per_tet == current_layer]
+        if layer_tets.size == 0:
+            return np.zeros(0, dtype=int)
+
+        layer_nodes = np.unique(layer_tets.ravel())
+        if layer_nodes.size == 0:
+            return np.zeros(0, dtype=int)
+
+        z_values = mesh.vertices[layer_nodes, 2]
+        z_max = float(np.max(z_values))
+        z_span = float(np.ptp(mesh.vertices[:, 2])) if mesh.vertices.size else 0.0
+        tol = max(1e-12, z_span * 1e-9)
+        return np.asarray(
+            layer_nodes[np.isclose(z_values, z_max, atol=tol)],
+            dtype=int,
+        )
+
+    @staticmethod
+    def _infer_layer_thickness(mesh: MeshState, current_layer: int) -> float:
+        bottom = mesh.bottom_nodes(current_layer)
+        top = mesh.top_nodes(current_layer)
+        if len(bottom) and len(top):
+            return float(
+                np.median(mesh.ideal_vertices[top, 2])
+                - np.median(mesh.ideal_vertices[bottom, 2])
+            )
+        surface_ids = np.unique(mesh.is_top_surface_of_layer)
+        surface_ids = surface_ids[surface_ids >= 0]
+        z_levels = []
+        for sid in surface_ids:
+            nodes = mesh.layer_interface_nodes(int(sid))
+            if len(nodes):
+                z_levels.append(float(np.median(mesh.ideal_vertices[nodes, 2])))
+        if len(z_levels) < 2:
+            return 0.0
+        diffs = np.diff(np.sort(np.asarray(z_levels, dtype=float)))
+        diffs = diffs[diffs > 1e-12]
+        return float(np.median(diffs)) if len(diffs) else 0.0
+
+    @staticmethod
+    def _lower_active_stack_to_contact(
+        mesh: MeshState,
+        current_layer: int,
+        z_fep: float,
+    ) -> None:
+        if current_layer <= 0:
+            return
+        active = np.asarray(mesh.active_vertex_mask, dtype=bool).copy()
+        contact = mesh.bottom_nodes(current_layer)
+        contact = contact[active[contact]] if len(contact) else contact
+        if len(contact):
+            dz = float(z_fep) - float(np.median(mesh.vertices[contact, 2]))
+            mesh.vertices[active, 2] += dz
+            mesh.velocities[active] = 0.0
+
+        thickness = LayerActivator._infer_layer_thickness(mesh, current_layer)
+        previous_z_fep = float(z_fep) - thickness if thickness > 0.0 else float(z_fep)
+        previous_bottom = mesh.bottom_nodes(current_layer - 1)
+        previous_bottom = previous_bottom[active[previous_bottom]] if len(previous_bottom) else previous_bottom
+        if len(previous_bottom):
+            collided = previous_bottom[
+                mesh.vertices[previous_bottom, 2] < previous_z_fep
+            ]
+            mesh.vertices[collided, 2] = previous_z_fep
+            mesh.velocities[collided, 2] = 0.0
+
     def activate(self, mesh: MeshState, current_layer: int) -> MeshState:
         """激活指定层（轻量版，不处理继承）。
 
@@ -92,16 +166,7 @@ class LayerActivator:
           其余节点为 ``FREE``。
         * ``is_top_fixed`` 掩码在每个新层激活时被重新覆盖。
         """
-        # ── 继承上一层的底面穿透修正 ──
-        if current_layer > 0:
-            previous_bottom = mesh.bottom_nodes(current_layer - 1)
-            # 发生穿透的底面节点（z < 离型膜面）
-            collided = previous_bottom[
-                mesh.vertices[previous_bottom, 2] < z_fep
-            ]
-            # 修正穿透并停止运动
-            mesh.vertices[collided, 2] = z_fep
-            mesh.velocities[collided, 2] = 0.0
+        self._lower_active_stack_to_contact(mesh, current_layer, z_fep)
 
         # ── 激活新层 ──
         mesh.activate_layer(current_layer)
@@ -112,6 +177,8 @@ class LayerActivator:
         )
         top = mesh.top_nodes(current_layer)       # 新层顶层（平台夹持面）
         bottom = mesh.bottom_nodes(current_layer)  # 新层底面（离型膜接触面）
+        if len(top) == 0:
+            top = self._geometric_layer_top_nodes(mesh, current_layer)
 
         # ── 顶层节点：z 不超过理想构型 ──
         if len(top):

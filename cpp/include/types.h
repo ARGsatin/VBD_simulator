@@ -70,11 +70,14 @@ struct MeshData {
     Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>> velocities;
     Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>> ideal_vertices;
     Eigen::Map<Eigen::VectorXd> masses;
+    Eigen::Map<Eigen::VectorXi> first_active_layer;
+    Eigen::Map<Eigen::VectorXi> is_top_surface_of_layer;
 
     // 掩码
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> active_mask;
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> is_top_fixed;
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> is_bottom_surface;
+    Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> is_current_bottom;
     Eigen::Map<Eigen::VectorXi> czm_state;
 
     // 损伤 + 自由时间
@@ -99,9 +102,12 @@ struct MeshData {
         Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>> vel,
         Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>> iv,
         Eigen::Map<Eigen::VectorXd> m,
+        Eigen::Map<Eigen::VectorXi> fal,
+        Eigen::Map<Eigen::VectorXi> surf,
         Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> act,
         Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> tf,
         Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> bs,
+        Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> cb,
         Eigen::Map<Eigen::VectorXi> czm,
         Eigen::Map<Eigen::VectorXd> dmg,
         Eigen::Map<Eigen::VectorXd> tf_t,
@@ -112,8 +118,9 @@ struct MeshData {
         Eigen::Map<Eigen::VectorXi> col
     )
         : vertices(v), velocities(vel), ideal_vertices(iv), masses(m),
+          first_active_layer(fal), is_top_surface_of_layer(surf),
           active_mask(act), is_top_fixed(tf), is_bottom_surface(bs),
-          czm_state(czm), damage(dmg), time_free(tf_t),
+          is_current_bottom(cb), czm_state(czm), damage(dmg), time_free(tf_t),
           tets(tet), active_tet_mask(at), dm_inv(dmi), tet_volumes(tv),
           colors(col),
           num_vertices(static_cast<int>(v.rows())),

@@ -43,6 +43,55 @@ static double chebyshev_omega(int iteration, double rho_cheb)
     return std::min(0.5, rho_k / (1.0 + rho_k));
 }
 
+static bool is_current_czm_state(const MeshData& mesh, int node_id, CZMState state)
+{
+    return mesh.is_current_bottom(node_id) &&
+           (static_cast<CZMState>(mesh.czm_state(node_id)) == state);
+}
+
+static bool fep_floor_for_node(
+    const MeshData& mesh,
+    const SolverConfig& cfg,
+    int layer_id,
+    int node_id,
+    double& floor_z)
+{
+    if (mesh.active_mask(node_id)) {
+        const double base_z_fep =
+            cfg.z_fep - static_cast<double>(layer_id) * cfg.layer_thickness;
+        int node_layer = mesh.first_active_layer(node_id);
+        const int surface_layer = mesh.is_top_surface_of_layer(node_id);
+        if (surface_layer >= 0 && surface_layer > node_layer) {
+            node_layer = surface_layer;
+        }
+        floor_z = base_z_fep + static_cast<double>(node_layer) * cfg.layer_thickness;
+    } else {
+        return false;
+    }
+    if (mesh.is_current_bottom(node_id)) {
+        floor_z = cfg.z_fep;
+        return true;
+    }
+    if (mesh.is_bottom_surface(node_id)) {
+        floor_z = cfg.z_fep - static_cast<double>(layer_id) * cfg.layer_thickness;
+        return true;
+    }
+    return true;
+}
+
+static void apply_fep_floor(
+    MeshData& mesh,
+    const SolverConfig& cfg,
+    int layer_id,
+    int node_id)
+{
+    double floor_z = 0.0;
+    if (fep_floor_for_node(mesh, cfg, layer_id, node_id, floor_z) &&
+        mesh.vertices(node_id, 2) < floor_z) {
+        mesh.vertices(node_id, 2) = floor_z;
+    }
+}
+
 // ============================================================================
 // 更新 CZM 状态（从 Python 移植）
 // ============================================================================
@@ -60,11 +109,14 @@ static void update_czm_states_inplace(
         if (!mesh.active_mask(node_id)) continue;
         CZMState state = static_cast<CZMState>(mesh.czm_state(node_id));
         if (state == CZMState::FIXED) {
-            // FIXED 阶段：检查是否超过损伤起始阈值
+            // In FIXED state the node can be position-locked at zero gap,
+            // so the supplied normal pull must also trigger damage onset.
             double z = mesh.vertices(node_id, 2);
             double gap = std::max(z - z_fep, 0.0);
-            double traction = k_czm * gap;  // 弹性段牵引力
-            if (gap > delta_f || traction > t_max) {
+            double traction = k_czm * gap;
+            double normal_pull = std::abs(internal_pull_z(static_cast<Eigen::Index>(i)));
+            double pull_stress = normal_pull / std::max(area, 1e-12);
+            if (gap > delta_f || traction > t_max || pull_stress > t_max) {
                 mesh.czm_state(node_id) = static_cast<int>(CZMState::DAMAGING);
                 mesh.damage(node_id) = 0.0;
             }
@@ -108,7 +160,7 @@ VBDSolveResult solve_until_stable(
     std::vector<char> fixed(nV, 0);
     for (int i = 0; i < nV; ++i) {
         fixed[i] = mesh.is_top_fixed(i) ||
-                   (static_cast<CZMState>(mesh.czm_state(i)) == CZMState::FIXED) ||
+                   is_current_czm_state(mesh, i, CZMState::FIXED) ||
                    !mesh.active_mask(i);
     }
 
@@ -181,10 +233,8 @@ VBDSolveResult solve_until_stable(
                 if (fixed[node_id]) continue;
 
                 // FEP 穿透约束
-                if (!mesh.is_top_fixed(node_id) && mesh.is_bottom_surface(node_id)) {
-                    if (mesh.vertices(node_id, 2) < cfg.z_fep)
-                        mesh.vertices(node_id, 2) = cfg.z_fep;
-                }
+                if (!mesh.is_top_fixed(node_id))
+                    apply_fep_floor(mesh, cfg, layer_id, node_id);
 
                     // 弹性 Hessian（每个线程独立分配的局部变量，线程安全）
                     Eigen::Matrix3d h_elastic = terms.hessian[node_id];
@@ -219,14 +269,14 @@ VBDSolveResult solve_until_stable(
                     length = dx_clip;
                 }
 
+                Eigen::Vector3d x_saved = mesh.vertices.row(node_id).transpose();
                 mesh.vertices.row(node_id) += dx.transpose();
 
                 // 再次 FEP 检查
-                if (!mesh.is_top_fixed(node_id) && mesh.is_bottom_surface(node_id)) {
-                    if (mesh.vertices(node_id, 2) < cfg.z_fep)
-                        mesh.vertices(node_id, 2) = cfg.z_fep;
-                }
+                if (!mesh.is_top_fixed(node_id))
+                    apply_fep_floor(mesh, cfg, layer_id, node_id);
 
+                length = (mesh.vertices.row(node_id).transpose() - x_saved).norm();
                 if (length > thread_max_dx) thread_max_dx = length;
             }
             local_max_dx[c] = thread_max_dx;
@@ -246,8 +296,9 @@ VBDSolveResult solve_until_stable(
             #endif
             for (int i = 0; i < nV; ++i) {
                 if (fixed[i]) continue;
-                if (static_cast<CZMState>(mesh.czm_state(i)) == CZMState::DAMAGING) continue;
+                if (is_current_czm_state(mesh, i, CZMState::DAMAGING)) continue;
                 mesh.vertices.row(i) += omega * (mesh.vertices.row(i) - x_old_iter.row(i));
+                apply_fep_floor(mesh, cfg, layer_id, i);
             }
         }
 
@@ -272,7 +323,7 @@ VBDSolveResult solve_until_stable(
     // ── all_free ──
     bool all_free = true;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.is_bottom_surface(i) && mesh.active_mask(i)) {
+        if (mesh.is_current_bottom(i) && mesh.active_mask(i)) {
             if (static_cast<CZMState>(mesh.czm_state(i)) != CZMState::FREE) {
                 all_free = false;
                 break;
@@ -291,7 +342,7 @@ VBDSolveResult solve_until_stable(
     // ── damaging 计数 ──
     int damaging_count = 0;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.active_mask(i) && static_cast<CZMState>(mesh.czm_state(i)) == CZMState::DAMAGING)
+        if (mesh.active_mask(i) && is_current_czm_state(mesh, i, CZMState::DAMAGING))
             damaging_count++;
     }
 
@@ -335,12 +386,12 @@ VBDSolveResult solve_lift_and_relax(
     // ── 收集底面节点（用于 CZM 状态更新与剥离判定）──
     std::vector<int> bottom;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.is_bottom_surface(i) && mesh.active_mask(i))
+        if (mesh.is_current_bottom(i) && mesh.active_mask(i))
             bottom.push_back(i);
     }
 
-    Eigen::VectorXd pull_z(bottom.size());
-    pull_z.setConstant(cfg.T_max * 1.05);
+    Eigen::VectorXd pull_z = Eigen::VectorXd::Zero(
+        static_cast<Eigen::Index>(bottom.size()));
 
     // ── 图着色分组（每次调用重构建，确保与当前状态一致）──
     int max_color = 0;
@@ -371,7 +422,7 @@ VBDSolveResult solve_lift_and_relax(
     std::vector<char> fixed(nV, 0);
     for (int i = 0; i < nV; ++i) {
         fixed[i] = mesh.is_top_fixed(i) ||
-                   (static_cast<CZMState>(mesh.czm_state(i)) == CZMState::FIXED) ||
+                   is_current_czm_state(mesh, i, CZMState::FIXED) ||
                    !mesh.active_mask(i);
     }
 
@@ -430,10 +481,8 @@ VBDSolveResult solve_lift_and_relax(
                 if (fixed[node_id]) continue;
 
                 // FEP 穿透约束
-                if (!mesh.is_top_fixed(node_id) && mesh.is_bottom_surface(node_id)) {
-                    if (mesh.vertices(node_id, 2) < cfg.z_fep)
-                        mesh.vertices(node_id, 2) = cfg.z_fep;
-                }
+                if (!mesh.is_top_fixed(node_id))
+                    apply_fep_floor(mesh, cfg, layer_id, node_id);
 
                 // 弹性 Hessian（线程局部变量，线程安全）
                 Eigen::Matrix3d h_elastic = terms.hessian[node_id];
@@ -468,14 +517,14 @@ VBDSolveResult solve_lift_and_relax(
                     length = dx_clip;
                 }
 
+                Eigen::Vector3d x_saved = mesh.vertices.row(node_id).transpose();
                 mesh.vertices.row(node_id) += dx.transpose();
 
                 // 再次 FEP 检查
-                if (!mesh.is_top_fixed(node_id) && mesh.is_bottom_surface(node_id)) {
-                    if (mesh.vertices(node_id, 2) < cfg.z_fep)
-                        mesh.vertices(node_id, 2) = cfg.z_fep;
-                }
+                if (!mesh.is_top_fixed(node_id))
+                    apply_fep_floor(mesh, cfg, layer_id, node_id);
 
+                length = (mesh.vertices.row(node_id).transpose() - x_saved).norm();
                 if (length > thread_max_dx) thread_max_dx = length;
             }
             local_max_dx[c] = thread_max_dx;
@@ -495,8 +544,9 @@ VBDSolveResult solve_lift_and_relax(
             #endif
             for (int i = 0; i < nV; ++i) {
                 if (fixed[i]) continue;
-                if (static_cast<CZMState>(mesh.czm_state(i)) == CZMState::DAMAGING) continue;
+                if (is_current_czm_state(mesh, i, CZMState::DAMAGING)) continue;
                 mesh.vertices.row(i) += omega * (mesh.vertices.row(i) - x_old_iter.row(i));
+                apply_fep_floor(mesh, cfg, layer_id, i);
             }
         }
 
@@ -524,6 +574,12 @@ VBDSolveResult solve_lift_and_relax(
     // Step 7: 更新底部 CZM 损伤状态
     // ════════════════════════════════════════════════════════════════════
     if (!bottom.empty()) {
+        build_local_physics_terms(mesh, cfg, e_z, x_prev, terms);
+        for (size_t i = 0; i < bottom.size(); ++i) {
+            int node_id = bottom[i];
+            pull_z(static_cast<Eigen::Index>(i)) =
+                std::max(terms.force(node_id, 2), 0.0);
+        }
         update_czm_states_inplace(mesh, bottom, pull_z,
             cfg.node_area, cfg.T_max, cfg.K_czm, cfg.delta_f, cfg.z_fep, cfg.dt);
     }
@@ -550,7 +606,7 @@ VBDSolveResult solve_lift_and_relax(
     // ── damaging 计数 ──
     int damaging_count = 0;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.active_mask(i) && static_cast<CZMState>(mesh.czm_state(i)) == CZMState::DAMAGING)
+        if (mesh.active_mask(i) && is_current_czm_state(mesh, i, CZMState::DAMAGING))
             damaging_count++;
     }
 

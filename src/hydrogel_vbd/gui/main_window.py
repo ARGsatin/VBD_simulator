@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,23 @@ except ImportError:
     _HAS_MPL = False
 
 
+@dataclass(frozen=True)
+class _ElectricFieldPlotData:
+    """电场分析图使用的已归一化数据。"""
+
+    layers: np.ndarray
+    e_z: np.ndarray
+    primary: np.ndarray
+    secondary: np.ndarray
+    aux_pct: np.ndarray
+    mode: str
+    primary_label: str
+    secondary_label: str
+    aux_label: str
+    primary_title: str
+    primary_ylabel: str
+
+
 # 参数元数据列表：定义每个参数在 GUI 中的显示标签、默认值、取值范围
 _PARAM_META: list[dict[str, Any]] = [
     {"key": "mu", "label": "剪切模量 μ (Pa)", "default": 5000.0, "min": 500.0, "max": 1e6},
@@ -71,6 +90,7 @@ _PARAM_META: list[dict[str, Any]] = [
     {"key": "max_iters", "label": "最大迭代次数", "default": 20, "min": 5, "max": 200},
     {"key": "N_stable", "label": "稳定步数判决", "default": 10, "min": 2, "max": 50},
     {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.10, "min": 0.01, "max": 10.0},
+    {"key": "lift_multiplier", "label": "提升距离倍数", "default": 1.5, "min": 0.1, "max": 5.0},
     {"key": "v_lift", "label": "提升速度 (m/s)", "default": 0.001, "min": 0.0, "max": 0.01},
     {"key": "K_p", "label": "PID K_p", "default": 150.0, "min": 0.0, "max": 1000.0},
     {"key": "K_i", "label": "PID K_i", "default": 20.0, "min": 0.0, "max": 200.0},
@@ -131,6 +151,14 @@ class ParameterPanel(QtWidgets.QGroupBox):
         }
         self.params_changed.emit(self._params)
 
+    @staticmethod
+    def _config_values_from_ui(params: dict[str, Any]) -> dict[str, Any]:
+        """将 GUI 显示单位转换为 ``SimulationConfig`` 使用的 SI 单位。"""
+        values = dict(params)
+        if "layer_thickness" in values:
+            values["layer_thickness"] = float(values["layer_thickness"]) * 1e-3
+        return values
+
     def get_config(self) -> SimulationConfig:
         """获取当前参数对应的 ``SimulationConfig`` 对象。
 
@@ -140,7 +168,7 @@ class ParameterPanel(QtWidgets.QGroupBox):
             包含当前所有参数值的配置对象。
         """
         self._collect_params()
-        return SimulationConfig(**self._params)
+        return SimulationConfig(**self._config_values_from_ui(self._params))
 
 
 class ProgressWidget(QtWidgets.QWidget):
@@ -191,7 +219,6 @@ class ProgressWidget(QtWidgets.QWidget):
         pct = int(100 * current / max(total, 1))
         self._bar.setValue(pct)
         self._label.setText(f"计算第 {current}/{total} 层 …")
-        QtWidgets.QApplication.processEvents()
 
     def set_sub_progress(self, percentage: int) -> None:
         """更新层内细粒度子进度（提升百分比）。
@@ -208,7 +235,6 @@ class ProgressWidget(QtWidgets.QWidget):
         self._bar.setValue(100)
         self._sub_bar.setValue(0)
         self._label.setText("仿真完成 ✓")
-        QtWidgets.QApplication.processEvents()
 
 
 class LogWidget(QtWidgets.QTextEdit):
@@ -231,7 +257,6 @@ class LogWidget(QtWidgets.QTextEdit):
             待显示的日志文本。
         """
         self.append(text)
-        QtWidgets.QApplication.processEvents()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -273,6 +298,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── 网格算法选择器 ──
         self._combo_mesh_algo: QtWidgets.QComboBox | None = None
         self._chk_use_cpp: QtWidgets.QCheckBox | None = None
+        self._chk_solver_diag: QtWidgets.QCheckBox | None = None
+        self._solver_diag_env_backup: dict[str, str | None] | None = None
 
         # ── 后处理动画回放状态 ──
         self.animation_frames: list[dict[str, Any]] = []
@@ -293,6 +320,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_worker: QtCore.QObject | None = None
         self._pending_build_config: SimulationConfig | None = None
 
+        # ── 仿真线程 / 中断状态 ──
+        self._thread: QtCore.QThread | None = None
+        self._worker: SimulationWorker | None = None
+        self._simulation_stop_requested: bool = False
+
         # ── DVR 实时时间轴状态 ──
         self._dv_slider: QtWidgets.QSlider | None = None
         self._dv_label: QtWidgets.QLabel | None = None
@@ -302,6 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dv_efield_layer_data: list[tuple[int, float, float, float]] = (
             []
         )  # (layer_id, e_z, max_err, rms_err)
+        self._is_rendering_worker_frame: bool = False
 
         self._init_central()
         self._update_button_states()
@@ -358,6 +391,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._btn_run.clicked.connect(self._on_run)
 
+        self._btn_stop_sim = QtWidgets.QPushButton("中断仿真")
+        self._btn_stop_sim.setFixedHeight(28)
+        self._btn_stop_sim.setFixedWidth(80)
+        self._btn_stop_sim.setStyleSheet(
+            "QPushButton { font-weight: bold; background-color: #E53935; "
+            "color: white; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #C62828; }"
+            "QPushButton:disabled { background-color: #BDBDBD; color: #757575; }"
+        )
+        self._btn_stop_sim.clicked.connect(self._on_stop_simulation)
+        self._btn_stop_sim.setEnabled(False)
+        self._btn_stop_sim.setVisible(False)
+
         self._btn_stop_anim = QtWidgets.QPushButton("停止回放")
         self._btn_stop_anim.setFixedHeight(28)
         self._btn_stop_anim.setFixedWidth(80)
@@ -378,6 +424,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(_sep)
         top_bar.addWidget(self._btn_mesh)
         top_bar.addWidget(self._btn_run)
+        top_bar.addWidget(self._btn_stop_sim)
         top_bar.addWidget(self._btn_stop_anim)
         root.addLayout(top_bar)
         root.setSpacing(2)
@@ -472,6 +519,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "⚠ 实验性功能：在 QThread 中可能不稳定，默认关闭"
         )
         info_3.addWidget(self._chk_use_cpp)
+        info_3.addSpacing(12)
+        self._chk_solver_diag = QtWidgets.QCheckBox("输出求解器诊断 CSV")
+        self._chk_solver_diag.setChecked(False)
+        self._chk_solver_diag.setToolTip(
+            "勾选后本次仿真写入 outputs/gui/reports/solver_diagnostics.csv"
+        )
+        info_3.addWidget(self._chk_solver_diag)
         info_3.addStretch()
         left_layout.addLayout(info_3)
 
@@ -686,30 +740,63 @@ class MainWindow(QtWidgets.QMainWindow):
         """根据当前状态启用/禁用按钮。"""
         has_mesh = self._generated_mesh is not None
         has_model = self._stl_path is not None
+        is_running = self._thread is not None
 
         # "划分网格" — 总是可用（STL 模式用已加载的 STL，Demo 模式自动生成）
-        self._btn_mesh.setEnabled(True)
+        self._btn_mesh.setEnabled(not is_running)
 
         # "运行仿真" — 必须有已生成的网格
-        self._btn_run.setEnabled(has_mesh)
+        self._btn_run.setEnabled(has_mesh and not is_running)
         if not has_mesh:
             self._btn_run.setToolTip("请先点击「划分网格」生成网格")
+        elif is_running:
+            self._btn_run.setToolTip("仿真运行中")
         else:
             self._btn_run.setToolTip("开始逐层仿真")
+
+    def _set_simulation_running(self, running: bool) -> None:
+        """Update run/stop controls for the simulation worker lifecycle."""
+        if running:
+            self._btn_run.setEnabled(False)
+            self._btn_run.setText("仿真中...")
+            self._btn_stop_sim.setText("中断仿真")
+            self._btn_stop_sim.setEnabled(True)
+            self._btn_stop_sim.setVisible(True)
+            self._btn_mesh.setEnabled(False)
+            return
+
+        self._simulation_stop_requested = False
+        self._btn_run.setText("运行仿真")
+        self._btn_stop_sim.setText("中断仿真")
+        self._btn_stop_sim.setEnabled(False)
+        self._btn_stop_sim.setVisible(False)
+        has_mesh = self._generated_mesh is not None
+        self._btn_mesh.setEnabled(True)
+        self._btn_run.setEnabled(has_mesh)
+        self._btn_run.setToolTip(
+            "开始逐层仿真"
+            if has_mesh
+            else "请先点击「划分网格」生成网格"
+        )
 
     # ========================================================================
     # 槽函数 — 参数
     # ========================================================================
     @property
     def _layer_thickness_m(self) -> float:
-        """当前有效的层厚（m），从参数面板读取 mm 值并转换。"""
-        return self._config.layer_thickness * 1e-3 if self._config.layer_thickness > 0 else 5e-5
+        """当前有效的层厚（m），``SimulationConfig`` 内部始终使用 SI 单位。"""
+        return self._config.layer_thickness if self._config.layer_thickness > 0 else 5e-5
+
+    @property
+    def _layer_thickness_mm(self) -> float:
+        """当前有效的层厚（mm），仅用于 GUI 显示。"""
+        return self._layer_thickness_m * 1000.0
 
     def _on_params(self, params: dict[str, Any]) -> None:
         """参数面板变更：更新当前配置。"""
-        self._config = SimulationConfig(**params)
+        self._config = SimulationConfig(**ParameterPanel._config_values_from_ui(params))
         # 动态更新层厚显示
-        lt_mm = self._config.layer_thickness
+        lt_mm = float(params.get("layer_thickness", self._layer_thickness_mm))
         self._lbl_thickness.setText(f"{lt_mm:.2f}")
         # 自动重新计算层数和分辨率（仅在非自定义模式下）
         is_custom = (
@@ -1044,7 +1131,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             self._status.showMessage("正在生成几何预览 …")
-            QtWidgets.QApplication.processEvents()
 
             # 计算包围盒对角线长度（m）
             dx = self._bbox_x[1] - self._bbox_x[0]
@@ -1189,7 +1275,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         config = self._param_panel.get_config()
         lt_m = self._layer_thickness_m
-        lt_mm = self._config.layer_thickness
+        lt_mm = self._layer_thickness_mm
         config.layer_thickness = lt_m
 
         try:
@@ -1290,6 +1376,34 @@ class MainWindow(QtWidgets.QMainWindow):
     # ========================================================================
     # 槽函数 — 运行仿真
     # ========================================================================
+    def _apply_solver_diagnostics_env_for_run(self) -> None:
+        """Apply the GUI diagnostics checkbox to this simulation run."""
+        if self._solver_diag_env_backup is None:
+            self._solver_diag_env_backup = {
+                "HYDROGEL_VBD_SOLVER_DIAG": os.environ.get(
+                    "HYDROGEL_VBD_SOLVER_DIAG"
+                )
+            }
+        enabled = (
+            self._chk_solver_diag is not None
+            and self._chk_solver_diag.isChecked()
+        )
+        if enabled:
+            os.environ["HYDROGEL_VBD_SOLVER_DIAG"] = "1"
+        else:
+            os.environ.pop("HYDROGEL_VBD_SOLVER_DIAG", None)
+
+    def _restore_solver_diagnostics_env_after_run(self) -> None:
+        """Restore diagnostics-related environment variables after a run."""
+        if self._solver_diag_env_backup is None:
+            return
+        for key, value in self._solver_diag_env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._solver_diag_env_backup = None
+
     def _on_run(self) -> None:
         """运行仿真按钮槽函数 —— 异步 Worker 线程版。
 
@@ -1321,7 +1435,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log.append_log("模型: Demo (正方体网格)")
         self._log.append_log(
             f"层数: {saved_actual_layers} | "
-            f"层厚: {self._config.layer_thickness:.2f} mm | "
+            f"层厚: {self._layer_thickness_mm:.2f} mm | "
             f"顶点: {len(saved_generated_mesh.vertices)} | "
             f"四面体: {len(saved_generated_mesh.tets)}"
         )
@@ -1335,6 +1449,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # get_config() 会触发 _on_params，其内部可能清空 self._generated_mesh
         config = self._param_panel.get_config()
+        solver_diag_enabled = (
+            self._chk_solver_diag is not None
+            and self._chk_solver_diag.isChecked()
+        )
 
         # ── 恢复网格数据，确保 Worker 构造函数获取到完整 MeshState ──
         self._generated_mesh = saved_generated_mesh
@@ -1369,6 +1487,13 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._log.append_log("  [info] 使用 Python 参考求解器（用户选择）")
 
+        self._apply_solver_diagnostics_env_for_run()
+        if solver_diag_enabled:
+            self._log.append_log(
+                "  [diag] 输出求解器诊断 CSV: "
+                "outputs/gui/reports/solver_diagnostics.csv"
+            )
+
         try:
             # ── 创建异步 Worker 并移入 QThread ──
             self._worker = SimulationWorker(
@@ -1377,6 +1502,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 n_layers=self._actual_layers,
                 output_dir=Path("outputs/gui"),
                 use_cpp=_cpp_ready,
+                solver_diagnostics_enabled=solver_diag_enabled,
             )
             self._thread = QtCore.QThread(self)
 
@@ -1387,6 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.progress_update.connect(self._on_worker_progress)
             self._worker.log_message.connect(self._on_worker_log)
             self._worker.finished.connect(self._on_worker_finished)
+            self._worker.cancelled.connect(self._on_worker_cancelled)
             self._worker.error.connect(self._on_worker_error)
             self._worker.sub_progress.connect(self._on_worker_sub_progress)
             self._worker.layer_finished.connect(self._on_worker_layer_finished)
@@ -1394,7 +1521,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # ── 线程生命周期管理 ──
             self._thread.started.connect(self._worker.run)
             self._worker.finished.connect(self._thread.quit)
+            self._worker.cancelled.connect(self._thread.quit)
+            self._worker.error.connect(self._thread.quit)
             self._worker.finished.connect(self._worker.deleteLater)
+            self._worker.cancelled.connect(self._worker.deleteLater)
             self._thread.finished.connect(self._thread.deleteLater)
             self._thread.finished.connect(
                 lambda: setattr(self, "_thread", None)
@@ -1403,17 +1533,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda: setattr(self, "_worker", None)
             )
 
-            # ── 仿真期间禁用运行按钮 ──
-            self._btn_run.setEnabled(False)
-            self._btn_run.setText("仿真中...")
+            # ── 仿真期间切换运行 / 中断按钮 ──
+            self._simulation_stop_requested = False
+            self._set_simulation_running(True)
 
             self._thread.start()
 
         except Exception as exc:
+            self._restore_solver_diagnostics_env_after_run()
             import traceback
             self._log.append_log(f"\n[错误] 启动仿真线程失败: {exc}")
             self._log.append_log(traceback.format_exc())
             self._status.showMessage("仿真启动失败 ✗")
+
+    def _on_stop_simulation(self) -> None:
+        """Request the active simulation worker to stop as soon as possible."""
+        worker = self._worker
+        if worker is None:
+            return
+
+        self._simulation_stop_requested = True
+        self._btn_stop_sim.setEnabled(False)
+        self._btn_stop_sim.setText("正在中断...")
+        self._btn_run.setText("中断中...")
+        self._status.showMessage("正在中断仿真 …")
+        self._log.append_log("  ⏹ 已请求中断仿真，正在停止求解器...")
+
+        worker.request_stop()
+        if self._thread is not None:
+            self._thread.requestInterruption()
 
     # ========================================================================
     # C++ 自动编译（后台线程）
@@ -1495,10 +1643,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._anim_tets = tets.copy()
 
         # ── DVR 滑块拖动门控：拖动期间抑制实时渲染 ──
-        if not self._dv_is_slider_down:
-            self._viewer.show_deformed_mesh(
-                vertices, tets, active_mask, title=title,
-            )
+        if not self._dv_is_slider_down and not self._is_rendering_worker_frame:
+            self._is_rendering_worker_frame = True
+            try:
+                self._viewer.show_deformed_mesh(
+                    vertices, tets, active_mask, title=title,
+                )
+            finally:
+                self._is_rendering_worker_frame = False
 
         # ── 缓存动画帧 ──
         lid = -1
@@ -1564,10 +1716,10 @@ class MainWindow(QtWidgets.QMainWindow):
             仿真结果列表（来自 Worker）。
         """
         self._last_results = results
+        self._restore_solver_diagnostics_env_after_run()
 
-        # ── 恢复运行按钮 ──
-        self._btn_run.setEnabled(True)
-        self._btn_run.setText("运行仿真")
+        # ── 恢复运行 / 中断按钮 ──
+        self._set_simulation_running(False)
 
         # ── 若当前正在动画回放，先停止 ──
         self._stop_animation_timer()
@@ -1581,6 +1733,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── 触发汇总逻辑 ──
         self._on_finish(results)
 
+    @QtCore.Slot(list)
+    def _on_worker_cancelled(self, results: list[LayerResult]) -> None:
+        """Handle a user-requested simulation interruption."""
+        self._last_results = results
+        self._restore_solver_diagnostics_env_after_run()
+        self._set_simulation_running(False)
+        self._stop_animation_timer()
+        self._progress.set_sub_progress(0)
+        self._log.append_log("\n[已中断] 仿真已由用户手动停止")
+        self._status.showMessage(f"仿真已中断 | 已完成 {len(results)} 层")
+
     @QtCore.Slot(str)
     def _on_worker_error(self, error_msg: str) -> None:
         """接收 Worker 的 ``error`` 信号，显示错误信息。
@@ -1590,8 +1753,8 @@ class MainWindow(QtWidgets.QMainWindow):
         error_msg : str
             错误信息和回溯字符串。
         """
-        self._btn_run.setEnabled(True)
-        self._btn_run.setText("运行仿真")
+        self._restore_solver_diagnostics_env_after_run()
+        self._set_simulation_running(False)
         self._log.append_log(f"\n[严重错误] {error_msg}")
         self._status.showMessage("仿真线程崩溃 ✗")
         QtWidgets.QMessageBox.critical(
@@ -1744,7 +1907,6 @@ class MainWindow(QtWidgets.QMainWindow):
             frame["active_mask"],
             title=f"🔁 回放 — {frame['title']}",
         )
-        QtWidgets.QApplication.processEvents()
 
         # 更新 Slider 和帧标签（双向绑定中的主动方向）
         if self._anim_slider is not None:
@@ -1819,7 +1981,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         frame["active_mask"],
                         title=f"🔁 回放 — {frame['title']}",
                     )
-                    QtWidgets.QApplication.processEvents()
             if self._anim_frame_label is not None:
                 self._anim_frame_label.setText(
                     f"帧: {value + 1} / {n_filt}"
@@ -1870,22 +2031,43 @@ class MainWindow(QtWidgets.QMainWindow):
             全部层的仿真结果。
         """
         self._progress.set_done()
-        max_e = max(r.max_deformation for r in results)
-        rms_e = np.sqrt(
-            np.mean([r.rms_error**2 for r in results])
-        )
         success_count = sum(1 for r in results if r.success)
-        self._status.showMessage(
-            f"完成 ✓ | 层数: {len(results)} | "
-            f"最大形变: {max_e:.4f} | RMS: {rms_e:.4f} | "
-            f"成功层: {success_count}/{len(results)}"
-        )
+        plot_data = ElectricFieldPlotWindow._build_plot_data(results)
         self._log.append_log("\n===== 仿真结束 =====")
-        self._log.append_log(
-            f"汇总: 共 {len(results)} 层, "
-            f"最大形变 {max_e:.4f} m, RMS {rms_e:.4f} m, "
-            f"成功 {success_count}/{len(results)} 层"
-        )
+        if plot_data.mode == "shape":
+            primary = plot_data.primary[np.isfinite(plot_data.primary)]
+            secondary = plot_data.secondary[np.isfinite(plot_data.secondary)]
+            max_e = float(np.max(primary)) if primary.size else 0.0
+            rms_e = (
+                float(np.sqrt(np.mean(secondary**2))) if secondary.size else 0.0
+            )
+            self._status.showMessage(
+                f"完成 ✓ | 层数: {len(results)} | "
+                f"最大形状误差: {max_e:.4e} m | RMS: {rms_e:.4e} m | "
+                f"成功层: {success_count}/{len(results)}"
+            )
+            self._log.append_log(
+                f"汇总: 共 {len(results)} 层, "
+                f"最大形状误差 {max_e:.4e} m, RMS {rms_e:.4e} m, "
+                f"成功 {success_count}/{len(results)} 层"
+            )
+        else:
+            primary = plot_data.primary[np.isfinite(plot_data.primary)]
+            secondary = plot_data.secondary[np.isfinite(plot_data.secondary)]
+            max_dx = float(np.max(primary)) if primary.size else 0.0
+            avg_call_ms = float(np.mean(secondary)) if secondary.size else 0.0
+            self._status.showMessage(
+                f"完成 ✓ | 层数: {len(results)} | "
+                f"solver max_dx: {max_dx:.4e} m | "
+                f"avg call: {avg_call_ms:.2f} ms | "
+                f"成功层: {success_count}/{len(results)}"
+            )
+            self._log.append_log(
+                f"汇总: 共 {len(results)} 层, "
+                f"solver max_dx {max_dx:.4e} m, "
+                f"平均单步 {avg_call_ms:.2f} ms, "
+                f"成功 {success_count}/{len(results)} 层"
+            )
 
         # ── 弹出电场-误差分析窗口 ──
         if _HAS_MPL and results:
@@ -2064,7 +2246,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f" — {frame['title']}"
             ),
         )
-        QtWidgets.QApplication.processEvents()
 
 class ElectricFieldPlotWindow(QtWidgets.QDialog):
     """电场-误差追踪分析窗口。
@@ -2128,40 +2309,142 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
     # 数据提取
     # ────────────────────────────────────────────────────────
 
-    def _extract_data(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """从结果列表中提取绘制所需的数据列。
+    @staticmethod
+    def _metrics(result: LayerResult) -> dict[str, float]:
+        """安全取得 ``LayerResult.error_metrics``。"""
+        metrics = getattr(result, "error_metrics", None)
+        return metrics if isinstance(metrics, dict) else {}
 
-        Returns
-        -------
-        layers : np.ndarray
-            层序号 (0, 1, 2, ...)。
-        e_z_vals : np.ndarray
-            各层电场强度 E_z。
-        max_err : np.ndarray
-            各层最大形变误差。
-        rms_err : np.ndarray
-            各层 RMS 误差。
-        cum_pct : np.ndarray
-            累计误差百分比（归一化到 0-100 %）。
-        """
-        n = len(self._results)
+    @staticmethod
+    def _metric_value(
+        result: LayerResult,
+        keys: tuple[str, ...],
+        fallback: float,
+    ) -> float:
+        """按优先级从 ``error_metrics`` 中取浮点值。"""
+        metrics = ElectricFieldPlotWindow._metrics(result)
+        for key in keys:
+            value = metrics.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return float(fallback)
+
+    @staticmethod
+    def _build_plot_data(results: list[LayerResult]) -> _ElectricFieldPlotData:
+        """将 LayerResult 转成报告图数据，并区分 shape / solver 指标。"""
+        n = len(results)
         layers = np.arange(n, dtype=int)
         e_z_vals = np.array(
-            [r.error_metrics.get("E_z", 0.0) if hasattr(r, "error_metrics") else 0.0
-             for r in self._results],
+            [
+                ElectricFieldPlotWindow._metric_value(r, ("E_z",), 0.0)
+                for r in results
+            ],
             dtype=float,
         )
-        max_err = np.array([r.max_deformation for r in self._results], dtype=float)
-        rms_err = np.array([r.rms_error for r in self._results], dtype=float)
 
-        # 累计误差百分比
-        cum_sum = np.cumsum(max_err)
-        total = cum_sum[-1] if cum_sum[-1] > 0 else 1.0
-        cum_pct = cum_sum / total * 100.0
+        def _has_shape_metrics(result: LayerResult) -> bool:
+            metrics = ElectricFieldPlotWindow._metrics(result)
+            explicit = metrics.get("shape_error_available")
+            if explicit is not None:
+                try:
+                    return float(explicit) > 0.0
+                except (TypeError, ValueError):
+                    return False
+            return (
+                "shape_max_error" in metrics
+                or "shape_rms_error" in metrics
+                or "max_error" in metrics
+            )
 
-        return layers, e_z_vals, max_err, rms_err, cum_pct
+        has_shape_metrics = any(_has_shape_metrics(r) for r in results)
+        if has_shape_metrics:
+            max_err = np.array(
+                [
+                    ElectricFieldPlotWindow._metric_value(
+                        r, ("shape_max_error", "max_error"),
+                        getattr(r, "max_deformation", np.nan),
+                    )
+                    for r in results
+                ],
+                dtype=float,
+            )
+            rms_err = np.array(
+                [
+                    ElectricFieldPlotWindow._metric_value(
+                        r, ("shape_rms_error", "rms_error"),
+                        getattr(r, "rms_error", np.nan),
+                    )
+                    for r in results
+                ],
+                dtype=float,
+            )
+            cum_source = np.nan_to_num(max_err, nan=0.0, posinf=0.0, neginf=0.0)
+            cum_sum = np.cumsum(cum_source)
+            total = cum_sum[-1] if cum_sum.size and cum_sum[-1] > 0 else 1.0
+            cum_pct = cum_sum / total * 100.0
+            return _ElectricFieldPlotData(
+                layers=layers,
+                e_z=e_z_vals,
+                primary=max_err,
+                secondary=rms_err,
+                aux_pct=cum_pct,
+                mode="shape",
+                primary_label="max_error (m)",
+                secondary_label="rms_error (m)",
+                aux_label="累计误差 (%)",
+                primary_title="形状误差对比",
+                primary_ylabel="误差 (m)",
+            )
+
+        solver_max_dx = np.array(
+            [
+                ElectricFieldPlotWindow._metric_value(
+                    r, ("solver_final_max_dx", "solver_max_dx", "final_max_dx"),
+                    getattr(r, "max_deformation", np.nan),
+                )
+                for r in results
+            ],
+            dtype=float,
+        )
+        avg_call_ms = np.array(
+            [
+                ElectricFieldPlotWindow._metric_value(
+                    r, ("solver_avg_call_ms",), np.nan
+                )
+                for r in results
+            ],
+            dtype=float,
+        )
+        max_iter_pct: list[float] = []
+        for result in results:
+            metrics = ElectricFieldPlotWindow._metrics(result)
+            pct = metrics.get("solver_max_iter_hit_pct")
+            if pct is None:
+                hits = float(metrics.get("solver_max_iter_hits", 0.0))
+                steps = float(metrics.get("solver_total_steps", 0.0))
+                pct = (hits / steps * 100.0) if steps > 0.0 else 0.0
+            max_iter_pct.append(float(pct))
+
+        return _ElectricFieldPlotData(
+            layers=layers,
+            e_z=e_z_vals,
+            primary=solver_max_dx,
+            secondary=avg_call_ms,
+            aux_pct=np.array(max_iter_pct, dtype=float),
+            mode="solver",
+            primary_label="solver max_dx (m)",
+            secondary_label="avg call (ms)",
+            aux_label="max_iter 命中率 (%)",
+            primary_title="求解器诊断",
+            primary_ylabel="solver max_dx (m)",
+        )
+
+    def _extract_data(self) -> _ElectricFieldPlotData:
+        """从结果列表中提取绘制所需的数据列。"""
+        return self._build_plot_data(self._results)
 
     # ────────────────────────────────────────────────────────
     # 绘图
@@ -2176,30 +2459,31 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
         fig = self._fig
         fig.clear()
 
-        layers, e_z_vals, max_err, rms_err, cum_pct = self._extract_data()
+        plot_data = self._extract_data()
+        layers = plot_data.layers
 
         # ── 左上：E_z 电场 ──
         ax1 = fig.add_subplot(2, 2, 1)
-        ax1.plot(layers, e_z_vals, "b-o", markersize=4, linewidth=1.5, label="E_z (V/m)")
+        ax1.plot(layers, plot_data.e_z, "b-o", markersize=4, linewidth=1.5, label="E_z (V/m)")
         ax1.set_xlabel("层序号")
         ax1.set_ylabel("E_z (V/m)", color="b")
         ax1.tick_params(axis="y", labelcolor="b")
         ax1.set_title("电场强度 E_z 逐层变化")
         ax1.grid(True, alpha=0.3)
 
-        # 右侧 y 轴：累计误差百分比填充
+        # 右侧 y 轴：shape 模式显示累计误差，solver 模式显示 max_iter 命中率。
         ax1b = ax1.twinx()
         ax1b.fill_between(
             layers,
-            cum_pct,
+            plot_data.aux_pct,
             0,
             alpha=0.15,
             color="orange",
-            label="累计误差 (%)",
+            label=plot_data.aux_label,
         )
         ax1b.plot(
             layers,
-            cum_pct,
+            plot_data.aux_pct,
             "orange",
             linestyle="--",
             linewidth=1.0,
@@ -2207,7 +2491,7 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
             marker="s",
             markerfacecolor="orange",
         )
-        ax1b.set_ylabel("累计误差 (%)", color="orange")
+        ax1b.set_ylabel(plot_data.aux_label, color="orange")
         ax1b.tick_params(axis="y", labelcolor="orange")
         ax1b.set_ylim(0, 105)
 
@@ -2216,28 +2500,47 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
         lines2, labels2 = ax1b.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
 
-        # ── 右下：max_error / rms_error 对比 ──
+        # ── 右下：shape error 或 solver diagnostic ──
         ax2 = fig.add_subplot(2, 2, 4)
         ax2.plot(
             layers,
-            max_err,
+            plot_data.primary,
             "r-s",
             markersize=4,
             linewidth=1.5,
-            label="max_error (m)",
+            label=plot_data.primary_label,
         )
-        ax2.plot(
-            layers,
-            rms_err,
-            "g-^",
-            markersize=4,
-            linewidth=1.5,
-            label="rms_error (m)",
-        )
+        if plot_data.mode == "shape":
+            ax2.plot(
+                layers,
+                plot_data.secondary,
+                "g-^",
+                markersize=4,
+                linewidth=1.5,
+                label=plot_data.secondary_label,
+            )
+        elif np.any(np.isfinite(plot_data.secondary)):
+            ax2b = ax2.twinx()
+            ax2b.plot(
+                layers,
+                plot_data.secondary,
+                "g-^",
+                markersize=4,
+                linewidth=1.5,
+                label=plot_data.secondary_label,
+            )
+            ax2b.set_ylabel(plot_data.secondary_label, color="g")
+            ax2b.tick_params(axis="y", labelcolor="g")
+            lines1, labels1 = ax2.get_legend_handles_labels()
+            lines2, labels2 = ax2b.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+        else:
+            ax2.legend(loc="upper left", fontsize=8)
         ax2.set_xlabel("层序号")
-        ax2.set_ylabel("误差 (m)")
-        ax2.set_title("形状误差对比")
-        ax2.legend(loc="upper left", fontsize=8)
+        ax2.set_ylabel(plot_data.primary_ylabel)
+        ax2.set_title(plot_data.primary_title)
+        if plot_data.mode == "shape":
+            ax2.legend(loc="upper left", fontsize=8)
         ax2.grid(True, alpha=0.3)
 
         fig.tight_layout()

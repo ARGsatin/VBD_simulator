@@ -60,6 +60,7 @@ set(VBD_HEADERS
 # ═══════════════════════════════════════════════════════════════════════
 pybind11_add_module(hydrogel_vbd_cpp ${VBD_SOURCES} bindings/pybind_vbd.cpp)
 target_include_directories(hydrogel_vbd_cpp PRIVATE ${CPP_INCLUDE_DIR})
+target_compile_definitions(hydrogel_vbd_cpp PRIVATE VBD_PYBIND_MODULE_NAME=hydrogel_vbd_cpp)
 target_link_libraries(hydrogel_vbd_cpp PRIVATE Eigen3::Eigen OpenMP::OpenMP_CXX)
 install(TARGETS hydrogel_vbd_cpp DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
@@ -68,7 +69,10 @@ install(TARGETS hydrogel_vbd_cpp DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # ═══════════════════════════════════════════════════════════════════════
 pybind11_add_module(hydrogel_vbd_cpp_qt ${VBD_SOURCES} bindings/pybind_vbd.cpp)
 target_include_directories(hydrogel_vbd_cpp_qt PRIVATE ${CPP_INCLUDE_DIR})
-target_compile_definitions(hydrogel_vbd_cpp_qt PRIVATE VBD_NO_OPENMP)
+target_compile_definitions(
+    hydrogel_vbd_cpp_qt
+    PRIVATE VBD_NO_OPENMP VBD_PYBIND_MODULE_NAME=hydrogel_vbd_cpp_qt
+)
 target_link_libraries(hydrogel_vbd_cpp_qt PRIVATE Eigen3::Eigen)
 # 注意：不链接 OpenMP，不加 /openmp 标志
 install(TARGETS hydrogel_vbd_cpp_qt DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../src)

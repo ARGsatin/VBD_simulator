@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -36,13 +37,17 @@ import numpy as np
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.field_controller import PIDFieldController, PIDFieldState
 from hydrogel_vbd.physics.czm import update_czm_states
+from hydrogel_vbd.physics.local_terms import build_local_physics_terms
 from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 from hydrogel_vbd.geometry.layer_activator import LayerActivator
 from hydrogel_vbd.io.gcode_exporter import insert_pid_field_commands
 from hydrogel_vbd.io.npz_state import save_layer_state
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
-from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+from hydrogel_vbd.solver.vbd_solver import (
+    PythonReferenceVBDSolver,
+    _normal_pull_from_terms,
+)
 from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
 
 
@@ -96,6 +101,11 @@ def _command_json(layer_id: int, command: PIDFieldState) -> dict:
         "prev_error": float(command.prev_error),
         "delta_E": float(command.delta_E),
     }
+
+
+def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
+    """Return the layer-local FEP contact plane in world coordinates."""
+    return float(config.z_fep) + int(layer_id) * float(config.layer_thickness)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +163,6 @@ def run_demo(
     # 保存目标（理想）形状作为误差参照
     target_vertices = mesh.ideal_vertices.copy()
     # 2b. Chebyshev 半隐式 VBD 求解器
-    solver = PythonReferenceVBDSolver(config)
     # 2c. 逐层激活器（保形继承 + 防穿透）
     activator = LayerActivator()
     # 2d. PID 电场控制器
@@ -167,30 +176,21 @@ def run_demo(
         # ── 3a. 激活当前层 ──
         # 激活新层节点：标记为 active，初始化速度，
         # 并对离型膜（FEP）平面附近的节点进行防穿透处理
-        activator.activate_with_inheritance(mesh, layer_id, z_fep=config.z_fep)
+        layer_z_fep = _layer_contact_z(config, layer_id)
+        layer_config = replace(config, z_fep=layer_z_fep)
+        solver = PythonReferenceVBDSolver(layer_config)
+        activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
 
         # 获取当前层的底部表面节点（用于 CZM 和误差评估）
         bottom = mesh.bottom_nodes(layer_id)
 
-        # ── 3b. 更新 CZM 内聚力损伤状态 ──
-        # 对底部界面节点评估剥离应力，更新 FIXED→DAMAGING→FREE 状态机
-        update_czm_states(
-            mesh,
-            bottom,
-            internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
-            area=config.node_area,
-            t_max=config.T_max,
-            k_czm=config.K_czm,
-            delta_f=config.delta_f,
-            z_fep=config.z_fep,
-            dt=config.dt,
-        )
-
         # ── 3c. 执行 VBD 求解 ──
         # 根据是否启用平台提升选择不同的求解模式
-        if config.v_lift > 0 and np.any(mesh.is_top_fixed):
+        x_before_solve = mesh.vertices.copy()
+        did_lift = config.v_lift > 0 and np.any(mesh.is_top_fixed)
+        if did_lift:
             # 含平台提升的求解（顶部固定节点随平台上升）
-            lifting_top = np.flatnonzero(mesh.is_top_fixed)
+            lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
             solve_result = solver.solve_with_lift(
                 mesh,
                 layer_id=layer_id,
@@ -202,6 +202,23 @@ def run_demo(
             solve_result = solver.solve_until_stable(
                 mesh, layer_id=layer_id, e_z=controller.E_z
             )
+            if len(bottom):
+                terms_after = build_local_physics_terms(
+                    mesh, layer_config, e_z=controller.E_z, x_prev=x_before_solve
+                )
+                update_czm_states(
+                    mesh,
+                    bottom,
+                    internal_pull_z=_normal_pull_from_terms(
+                        terms_after.force, bottom
+                    ),
+                    area=layer_config.node_area,
+                    t_max=layer_config.T_max,
+                    k_czm=layer_config.K_czm,
+                    delta_f=layer_config.delta_f,
+                    z_fep=layer_config.z_fep,
+                    dt=layer_config.dt,
+                )
 
         # ── 3d. 计算形状误差 ──
         # 提取求解后的顶点和速度

@@ -86,11 +86,12 @@ def build_local_physics_terms(
     config: SimulationConfig,
     e_z: float,
     x_prev: np.ndarray,
+    layer_id: int | None = None,
 ) -> LocalPhysicsTerms:
     """组装当前时间步的所有局部物理贡献（每次分配新数组）。"""
     force = np.zeros_like(mesh.vertices)
     hessian = np.zeros((mesh.vertices.shape[0], 3, 3), dtype=float)
-    _assemble_physics_terms(mesh, config, e_z, x_prev, force, hessian)
+    _assemble_physics_terms(mesh, config, e_z, x_prev, force, hessian, layer_id)
     return LocalPhysicsTerms(force=force, hessian=hessian)
 
 
@@ -101,6 +102,7 @@ def update_local_physics_terms(
     x_prev: np.ndarray,
     out_force: np.ndarray,
     out_hessian: np.ndarray,
+    layer_id: int | None = None,
 ) -> None:
     """组装物理贡献到预分配的输出数组中（零新分配）。
 
@@ -120,7 +122,9 @@ def update_local_physics_terms(
     """
     out_force.fill(0.0)
     out_hessian.fill(0.0)
-    _assemble_physics_terms(mesh, config, e_z, x_prev, out_force, out_hessian)
+    _assemble_physics_terms(
+        mesh, config, e_z, x_prev, out_force, out_hessian, layer_id
+    )
 
 
 def _assemble_physics_terms(
@@ -130,6 +134,7 @@ def _assemble_physics_terms(
     x_prev: np.ndarray,
     force: np.ndarray,
     hessian: np.ndarray,
+    layer_id: int | None = None,
 ) -> None:
     """组装当前时间步的所有局部物理贡献到预分配的数组中。
 
@@ -184,7 +189,16 @@ def _assemble_physics_terms(
                 hessian[node_id] += hessian_per_vertex[local_idx]
 
     # ---- CZM 粘聚区 + 流体拖曳（逐顶点）----
-    for node_id in np.flatnonzero(active):
+    czm_nodes = active
+    if layer_id is not None:
+        bottom_nodes = mesh.bottom_nodes(int(layer_id))
+        has_layer_interfaces = np.any(mesh.is_top_surface_of_layer >= 0)
+        if bottom_nodes.size or has_layer_interfaces:
+            czm_nodes = np.zeros_like(active, dtype=bool)
+            czm_nodes[bottom_nodes] = True
+            czm_nodes &= active
+
+    for node_id in np.flatnonzero(czm_nodes):
         state = CZMState(int(mesh.czm_state[node_id]))
         if state == CZMState.DAMAGING:
             gap = max(float(mesh.vertices[node_id, 2] - config.z_fep), 0.0)

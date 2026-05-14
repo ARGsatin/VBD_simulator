@@ -323,8 +323,6 @@ class MeshViewer(QtWidgets.QWidget):
 
         self._fig.tight_layout()
         self._canvas.draw_idle()
-        # 强制刷新事件循环
-        QtWidgets.QApplication.processEvents()
 
     @staticmethod
     def _compute_face_colors(
@@ -513,4 +511,3 @@ class MeshViewer(QtWidgets.QWidget):
             )
         self._fig.tight_layout()
         self._canvas.draw_idle()
-        QtWidgets.QApplication.processEvents()

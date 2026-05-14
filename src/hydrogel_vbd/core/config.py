@@ -146,6 +146,7 @@ class SimulationConfig:
 
     # ────────── 打印工艺 ──────────
     layer_thickness: float = 5e-5    # 层厚 / 平台提升距离 (m) = 0.05mm
+    lift_multiplier: float = 1.5    # 提升距离倍数（相对于 layer_thickness），用于计算实际提升高度
     z_fep: float = 0.0              # 离型膜 Z 坐标 (m)（Solver 内部 Z = 构建轴）
     v_lift: float = 0.001           # 提升速度 (m/s)，0 则跳过提升
     C_0: float = 1.0                # 固化度比例常数

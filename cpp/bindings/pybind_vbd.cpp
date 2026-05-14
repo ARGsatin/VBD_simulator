@@ -8,6 +8,10 @@
 namespace py = pybind11;
 using namespace vbd;
 
+#ifndef VBD_PYBIND_MODULE_NAME
+#define VBD_PYBIND_MODULE_NAME hydrogel_vbd_cpp
+#endif
+
 // ============================================================================
 // Python 侧 solver 类封装：直接操作 MeshState 内存
 // ============================================================================
@@ -17,10 +21,13 @@ static py::dict solve_until_stable_py(
     py::array_t<double> vertices_in,     // (N, 3) 可写
     py::array_t<double> velocities,      // (N, 3) 可写
     py::array_t<double> ideal_vertices,  // (N, 3) 只读
-    py::array_t<double> masses,          // (N,) 只读
+    py::array_t<double> masses,
+    py::array_t<int> first_active_layer,
+    py::array_t<int> is_top_surface_of_layer,
     py::array_t<bool> active_mask,       // (N,) 只读
     py::array_t<bool> is_top_fixed,      // (N,) 只读
     py::array_t<bool> is_bottom_surface, // (N,) 只读
+    py::array_t<bool> is_current_bottom, // (N,) 只读
     py::array_t<int> czm_state,          // (N,) 可写
     py::array_t<double> damage,          // (N,) 可写
     py::array_t<double> time_free,       // (N,) 可写
@@ -38,9 +45,12 @@ static py::dict solve_until_stable_py(
     auto buf_vel = velocities.request();
     auto buf_iv = ideal_vertices.request();
     auto buf_m = masses.request();
+    auto buf_fal = first_active_layer.request();
+    auto buf_surf = is_top_surface_of_layer.request();
     auto buf_act = active_mask.request();
     auto buf_tf = is_top_fixed.request();
     auto buf_bs = is_bottom_surface.request();
+    auto buf_cb = is_current_bottom.request();
     auto buf_czm = czm_state.request();
     auto buf_dmg = damage.request();
     auto buf_tf_t = time_free.request();
@@ -62,12 +72,18 @@ static py::dict solve_until_stable_py(
         static_cast<double*>(buf_iv.ptr), nV, 3);
     Eigen::Map<Eigen::VectorXd> m_map(
         static_cast<double*>(buf_m.ptr), nV);
+    Eigen::Map<Eigen::VectorXi> fal_map(
+        static_cast<int*>(buf_fal.ptr), nV);
+    Eigen::Map<Eigen::VectorXi> surf_map(
+        static_cast<int*>(buf_surf.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> act_map(
         static_cast<bool*>(buf_act.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> tf_map(
         static_cast<bool*>(buf_tf.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> bs_map(
         static_cast<bool*>(buf_bs.ptr), nV);
+    Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> cb_map(
+        static_cast<bool*>(buf_cb.ptr), nV);
     Eigen::Map<Eigen::VectorXi> czm_map(
         static_cast<int*>(buf_czm.ptr), nV);
     Eigen::Map<Eigen::VectorXd> dmg_map(
@@ -87,7 +103,8 @@ static py::dict solve_until_stable_py(
 
     MeshData mesh(
         v_map, vel_map, iv_map, m_map,
-        act_map, tf_map, bs_map, czm_map,
+        fal_map, surf_map,
+        act_map, tf_map, bs_map, cb_map, czm_map,
         dmg_map, tf_t_map,
         tet_map, at_map, dmi_map, tv_map,
         col_map);
@@ -111,9 +128,12 @@ static py::dict solve_lift_and_relax_py(
     py::array_t<double> velocities,
     py::array_t<double> ideal_vertices,
     py::array_t<double> masses,
+    py::array_t<int> first_active_layer,
+    py::array_t<int> is_top_surface_of_layer,
     py::array_t<bool> active_mask,
     py::array_t<bool> is_top_fixed,
     py::array_t<bool> is_bottom_surface,
+    py::array_t<bool> is_current_bottom,
     py::array_t<int> czm_state,
     py::array_t<double> damage,
     py::array_t<double> time_free,
@@ -131,9 +151,12 @@ static py::dict solve_lift_and_relax_py(
     auto buf_vel = velocities.request();
     auto buf_iv = ideal_vertices.request();
     auto buf_m = masses.request();
+    auto buf_fal = first_active_layer.request();
+    auto buf_surf = is_top_surface_of_layer.request();
     auto buf_act = active_mask.request();
     auto buf_tf = is_top_fixed.request();
     auto buf_bs = is_bottom_surface.request();
+    auto buf_cb = is_current_bottom.request();
     auto buf_czm = czm_state.request();
     auto buf_dmg = damage.request();
     auto buf_tf_t = time_free.request();
@@ -154,12 +177,18 @@ static py::dict solve_lift_and_relax_py(
         static_cast<double*>(buf_iv.ptr), nV, 3);
     Eigen::Map<Eigen::VectorXd> m_map(
         static_cast<double*>(buf_m.ptr), nV);
+    Eigen::Map<Eigen::VectorXi> fal_map(
+        static_cast<int*>(buf_fal.ptr), nV);
+    Eigen::Map<Eigen::VectorXi> surf_map(
+        static_cast<int*>(buf_surf.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> act_map(
         static_cast<bool*>(buf_act.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> tf_map(
         static_cast<bool*>(buf_tf.ptr), nV);
     Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> bs_map(
         static_cast<bool*>(buf_bs.ptr), nV);
+    Eigen::Map<Eigen::Matrix<bool, Eigen::Dynamic, 1>> cb_map(
+        static_cast<bool*>(buf_cb.ptr), nV);
     Eigen::Map<Eigen::VectorXi> czm_map(
         static_cast<int*>(buf_czm.ptr), nV);
     Eigen::Map<Eigen::VectorXd> dmg_map(
@@ -179,7 +208,8 @@ static py::dict solve_lift_and_relax_py(
 
     MeshData mesh(
         v_map, vel_map, iv_map, m_map,
-        act_map, tf_map, bs_map, czm_map,
+        fal_map, surf_map,
+        act_map, tf_map, bs_map, cb_map, czm_map,
         dmg_map, tf_t_map,
         tet_map, at_map, dmi_map, tv_map,
         col_map);
@@ -199,7 +229,7 @@ static py::dict solve_lift_and_relax_py(
 // ============================================================================
 // 模块定义
 // ============================================================================
-PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
+PYBIND11_MODULE(VBD_PYBIND_MODULE_NAME, m) {
     m.doc() = "C++ accelerated VBD solver for hydrogel DLP simulation";
 
     // 配置结构体
@@ -236,8 +266,9 @@ PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
     // 求解函数
     m.def("solve_until_stable", &solve_until_stable_py,
           py::arg("vertices"), py::arg("velocities"), py::arg("ideal_vertices"),
-          py::arg("masses"), py::arg("active_mask"), py::arg("is_top_fixed"),
-          py::arg("is_bottom_surface"), py::arg("czm_state"), py::arg("damage"),
+          py::arg("masses"), py::arg("first_active_layer"), py::arg("is_top_surface_of_layer"), py::arg("active_mask"), py::arg("is_top_fixed"),
+          py::arg("is_bottom_surface"), py::arg("is_current_bottom"),
+          py::arg("czm_state"), py::arg("damage"),
           py::arg("time_free"), py::arg("tets"), py::arg("active_tet_mask"),
           py::arg("dm_inv"), py::arg("tet_volumes"), py::arg("colors"),
           py::arg("config"), py::arg("e_z"), py::arg("layer_id"),
@@ -245,8 +276,9 @@ PYBIND11_MODULE(hydrogel_vbd_cpp, m) {
 
     m.def("solve_lift_and_relax", &solve_lift_and_relax_py,
           py::arg("vertices"), py::arg("velocities"), py::arg("ideal_vertices"),
-          py::arg("masses"), py::arg("active_mask"), py::arg("is_top_fixed"),
-          py::arg("is_bottom_surface"), py::arg("czm_state"), py::arg("damage"),
+          py::arg("masses"), py::arg("first_active_layer"), py::arg("is_top_surface_of_layer"), py::arg("active_mask"), py::arg("is_top_fixed"),
+          py::arg("is_bottom_surface"), py::arg("is_current_bottom"),
+          py::arg("czm_state"), py::arg("damage"),
           py::arg("time_free"), py::arg("tets"), py::arg("active_tet_mask"),
           py::arg("dm_inv"), py::arg("tet_volumes"), py::arg("colors"),
           py::arg("config"), py::arg("e_z"), py::arg("layer_id"),

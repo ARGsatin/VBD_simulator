@@ -134,11 +134,13 @@ def update_czm_states(
         state = CZMState(int(mesh.czm_state[node_id]))
 
         if state == CZMState.FIXED:
-            # ── 弹性牵引力准则（与 C++ 对齐）──
-            # FIXED→DAMAGING 当 gap > delta_f 或弹性牵引力 > 强度
+            # ── 损伤起始准则 ──
+            # 固定阶段节点位移被锁定，gap 可能仍为 0；此时应使用
+            # 外部传入的法向拉力判断界面是否超过强度。
             gap = max(float(mesh.vertices[node_id, 2] - z_fep), 0.0)
             traction = k_czm * gap
-            if gap > delta_f or traction > t_max:
+            pull_stress = abs(float(pulls[local_idx])) / max(float(area), 1e-12)
+            if gap > delta_f or traction > t_max or pull_stress > t_max:
                 mesh.czm_state[node_id] = CZMState.DAMAGING
                 mesh.damage[node_id] = 0.0
 

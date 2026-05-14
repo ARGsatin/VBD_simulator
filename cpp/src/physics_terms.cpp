@@ -104,6 +104,7 @@ void build_local_physics_terms(
     // ---- CZM 粘聚区 + 流体拖曳（逐顶点） ----
     for (int i = 0; i < nV; ++i) {
         if (!mesh.active_mask(i)) continue;
+        if (!mesh.is_current_bottom(i)) continue;
 
         CZMState state = static_cast<CZMState>(mesh.czm_state(i));
         double z = mesh.vertices(i, 2);
