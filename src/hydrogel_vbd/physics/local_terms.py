@@ -189,6 +189,9 @@ def _assemble_physics_terms(
                 hessian[node_id] += hessian_per_vertex[local_idx]
 
     # ---- CZM 粘聚区 + 流体拖曳（逐顶点）----
+    if not bool(getattr(config, "enable_czm", True)):
+        return LocalPhysicsTerms(force=force, hessian=hessian)
+
     czm_nodes = active
     if layer_id is not None:
         bottom_nodes = mesh.bottom_nodes(int(layer_id))

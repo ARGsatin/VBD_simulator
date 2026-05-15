@@ -1,9 +1,11 @@
 #include "vbd_solver.h"
 #include "physics_terms.h"
+#include "elastic_energy.h"
 #include <Eigen/LU>
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 // GUI 安全模式：编译时强制禁用 OpenMP，避免 QThread 中 vcomp.dll
@@ -43,10 +45,26 @@ static double chebyshev_omega(int iteration, double rho_cheb)
     return std::min(0.5, rho_k / (1.0 + rho_k));
 }
 
+static std::pair<double, double> poisson_to_lame(double mu, double kappa)
+{
+    double lam = kappa - (2.0 / 3.0) * mu;
+    return {mu, lam};
+}
+
 static bool is_current_czm_state(const MeshData& mesh, int node_id, CZMState state)
 {
     return mesh.is_current_bottom(node_id) &&
            (static_cast<CZMState>(mesh.czm_state(node_id)) == state);
+}
+
+static bool current_czm_fixed(const MeshData& mesh, const SolverConfig& cfg, int node_id)
+{
+    return cfg.enable_czm && is_current_czm_state(mesh, node_id, CZMState::FIXED);
+}
+
+static bool current_czm_damaging(const MeshData& mesh, const SolverConfig& cfg, int node_id)
+{
+    return cfg.enable_czm && is_current_czm_state(mesh, node_id, CZMState::DAMAGING);
 }
 
 static bool fep_floor_for_node(
@@ -57,14 +75,7 @@ static bool fep_floor_for_node(
     double& floor_z)
 {
     if (mesh.active_mask(node_id)) {
-        const double base_z_fep =
-            cfg.z_fep - static_cast<double>(layer_id) * cfg.layer_thickness;
-        int node_layer = mesh.first_active_layer(node_id);
-        const int surface_layer = mesh.is_top_surface_of_layer(node_id);
-        if (surface_layer >= 0 && surface_layer > node_layer) {
-            node_layer = surface_layer;
-        }
-        floor_z = base_z_fep + static_cast<double>(node_layer) * cfg.layer_thickness;
+        floor_z = cfg.z_fep;
     } else {
         return false;
     }
@@ -73,7 +84,7 @@ static bool fep_floor_for_node(
         return true;
     }
     if (mesh.is_bottom_surface(node_id)) {
-        floor_z = cfg.z_fep - static_cast<double>(layer_id) * cfg.layer_thickness;
+        floor_z = cfg.z_fep;
         return true;
     }
     return true;
@@ -90,6 +101,121 @@ static void apply_fep_floor(
         mesh.vertices(node_id, 2) < floor_z) {
         mesh.vertices(node_id, 2) = floor_z;
     }
+}
+
+static std::vector<std::vector<int>> build_vertex_to_tets(const MeshData& mesh)
+{
+    std::vector<std::vector<int>> vertex_to_tets(mesh.num_vertices);
+    for (int tet_id = 0; tet_id < mesh.num_tets; ++tet_id) {
+        if (!mesh.active_tet_mask(tet_id)) continue;
+        for (int a = 0; a < 4; ++a) {
+            int vid = mesh.tets(tet_id, a);
+            if (vid >= 0 && vid < mesh.num_vertices) {
+                vertex_to_tets[vid].push_back(tet_id);
+            }
+        }
+    }
+    return vertex_to_tets;
+}
+
+static double tet_elastic_energy(
+    const MeshData& mesh,
+    const SolverConfig& cfg,
+    int tet_id)
+{
+    Eigen::Matrix<double, 4, 3> tet_verts;
+    for (int a = 0; a < 4; ++a) {
+        tet_verts.row(a) = mesh.vertices.row(mesh.tets(tet_id, a));
+    }
+
+    Eigen::Matrix3d dm_inv_tet;
+    dm_inv_tet << mesh.dm_inv(tet_id, 0), mesh.dm_inv(tet_id, 1), mesh.dm_inv(tet_id, 2),
+                  mesh.dm_inv(tet_id, 3), mesh.dm_inv(tet_id, 4), mesh.dm_inv(tet_id, 5),
+                  mesh.dm_inv(tet_id, 6), mesh.dm_inv(tet_id, 7), mesh.dm_inv(tet_id, 8);
+    dm_inv_tet /= cfg.c_shrink;
+
+    auto [mu_lame, lam_lame] = poisson_to_lame(cfg.mu, cfg.kappa);
+    Eigen::Matrix3d F = compute_deformation_gradient(tet_verts, dm_inv_tet);
+    return mesh.tet_volumes(tet_id) *
+           neo_hookean_energy_density(F, mu_lame, lam_lame, 1e8);
+}
+
+static double vertex_local_elastic_energy(
+    const MeshData& mesh,
+    const SolverConfig& cfg,
+    int node_id,
+    const std::vector<std::vector<int>>& vertex_to_tets)
+{
+    double energy = 0.0;
+    for (int tet_id : vertex_to_tets[node_id]) {
+        energy += tet_elastic_energy(mesh, cfg, tet_id);
+    }
+    return energy;
+}
+
+static double vertex_local_step_objective(
+    const MeshData& mesh,
+    const SolverConfig& cfg,
+    int node_id,
+    const std::vector<std::vector<int>>& vertex_to_tets,
+    const Eigen::Vector3d& y_node,
+    const Eigen::Vector3d& x_prev_node,
+    const Eigen::Matrix3d& h_elastic,
+    double mass,
+    double inv_dt2,
+    double damp_factor)
+{
+    const Eigen::Vector3d x = mesh.vertices.row(node_id).transpose();
+    const Eigen::Vector3d dx_inertia = x - y_node;
+    const Eigen::Vector3d dx_damp = x - x_prev_node;
+    return vertex_local_elastic_energy(mesh, cfg, node_id, vertex_to_tets)
+         + 0.5 * mass * inv_dt2 * dx_inertia.squaredNorm()
+         + 0.5 * damp_factor * dx_damp.dot(h_elastic * dx_damp);
+}
+
+static double apply_backtracking_line_search(
+    MeshData& mesh,
+    const SolverConfig& cfg,
+    int layer_id,
+    int node_id,
+    const Eigen::Vector3d& dx,
+    const std::vector<std::vector<int>>& vertex_to_tets,
+    const Eigen::Vector3d& y_node,
+    const Eigen::Vector3d& x_prev_node,
+    const Eigen::Matrix3d& h_elastic,
+    double mass,
+    double inv_dt2,
+    double damp_factor)
+{
+    Eigen::Vector3d x_saved = mesh.vertices.row(node_id).transpose();
+    const double e_before =
+        vertex_local_step_objective(
+            mesh, cfg, node_id, vertex_to_tets, y_node, x_prev_node,
+            h_elastic, mass, inv_dt2, damp_factor);
+    constexpr int max_trials = 12;
+    constexpr double min_alpha = 1.0 / 4096.0;
+    constexpr double energy_tol = 1e-10;
+
+    double alpha = 1.0;
+    for (int trial = 0; trial < max_trials; ++trial) {
+        mesh.vertices.row(node_id) = (x_saved + alpha * dx).transpose();
+        if (!mesh.is_top_fixed(node_id)) {
+            apply_fep_floor(mesh, cfg, layer_id, node_id);
+        }
+
+        const double e_after =
+            vertex_local_step_objective(
+                mesh, cfg, node_id, vertex_to_tets, y_node, x_prev_node,
+                h_elastic, mass, inv_dt2, damp_factor);
+        if (std::isfinite(e_after) && e_after <= e_before + energy_tol) {
+            return (mesh.vertices.row(node_id).transpose() - x_saved).norm();
+        }
+        alpha *= 0.5;
+        if (alpha < min_alpha) break;
+    }
+
+    mesh.vertices.row(node_id) = x_saved.transpose();
+    return 0.0;
 }
 
 // ============================================================================
@@ -160,7 +286,7 @@ VBDSolveResult solve_until_stable(
     std::vector<char> fixed(nV, 0);
     for (int i = 0; i < nV; ++i) {
         fixed[i] = mesh.is_top_fixed(i) ||
-                   is_current_czm_state(mesh, i, CZMState::FIXED) ||
+                   current_czm_fixed(mesh, cfg, i) ||
                    !mesh.active_mask(i);
     }
 
@@ -174,6 +300,7 @@ VBDSolveResult solve_until_stable(
     std::vector<std::vector<int>> color_groups(max_color + 1);
     for (int i = 0; i < nV; ++i)
         color_groups[mesh.colors(i)].push_back(i);
+    const auto vertex_to_tets = build_vertex_to_tets(mesh);
 
     // ── 构建初始物理项 ──
     LocalPhysicsTerms terms(nV);
@@ -214,20 +341,19 @@ VBDSolveResult solve_until_stable(
         // 重新计算物理项
         build_local_physics_terms(mesh, cfg, e_z, x_prev, terms);
 
-        // Thread-local max_dx accumulator for OpenMP reduction equivalent
-        std::vector<double> local_max_dx(max_color + 1, 0.0);
+        max_dx = 0.0;
 
         // ── 按颜色分组遍历（OpenMP 并行化）──
         // 注意：不同颜色组之间无数据依赖，可安全并行
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic, 1)
-        #endif
         for (int c = 0; c <= max_color; ++c) {
             const auto& group = color_groups[c];
             const int gsize = static_cast<int>(group.size());
-            double thread_max_dx = 0.0;
+            std::vector<double> group_dx(static_cast<size_t>(gsize), 0.0);
 
             // 使用整数索引遍历以满足 OpenMP 要求
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
             for (int idx = 0; idx < gsize; ++idx) {
                 int node_id = group[idx];
                 if (fixed[node_id]) continue;
@@ -266,39 +392,62 @@ VBDSolveResult solve_until_stable(
                 // 步长限制收紧至 0.002（2 mm），适配毫米级网格
                 if (length > dx_clip) {
                     dx *= dx_clip / length;
-                    length = dx_clip;
                 }
+                const Eigen::Vector3d y_node = Y.row(node_id).transpose();
+                const Eigen::Vector3d x_prev_node = x_prev.row(node_id).transpose();
 
-                Eigen::Vector3d x_saved = mesh.vertices.row(node_id).transpose();
-                mesh.vertices.row(node_id) += dx.transpose();
+                group_dx[static_cast<size_t>(idx)] =
+                    apply_backtracking_line_search(
+                        mesh, cfg, layer_id, node_id, dx, vertex_to_tets,
+                        y_node,
+                        x_prev_node,
+                        h_elastic, mesh.masses(node_id), inv_dt2,
+                        cfg.k_d * inv_dt);
 
-                // 再次 FEP 检查
-                if (!mesh.is_top_fixed(node_id))
-                    apply_fep_floor(mesh, cfg, layer_id, node_id);
-
-                length = (mesh.vertices.row(node_id).transpose() - x_saved).norm();
-                if (length > thread_max_dx) thread_max_dx = length;
             }
-            local_max_dx[c] = thread_max_dx;
+            for (double length : group_dx) {
+                if (length > max_dx) max_dx = length;
+            }
         }
 
-        // 归约各线程的 max_dx
-        max_dx = 0.0;
-        for (int c = 0; c <= max_color; ++c) {
-            if (local_max_dx[c] > max_dx) max_dx = local_max_dx[c];
-        }
 
         // ── Chebyshev 加速 ──
         if (iteration > 5) {
             double omega = chebyshev_omega(iteration, cfg.rho_cheb);
-            #ifdef _OPENMP
-            #pragma omp parallel for
-            #endif
-            for (int i = 0; i < nV; ++i) {
-                if (fixed[i]) continue;
-                if (is_current_czm_state(mesh, i, CZMState::DAMAGING)) continue;
-                mesh.vertices.row(i) += omega * (mesh.vertices.row(i) - x_old_iter.row(i));
-                apply_fep_floor(mesh, cfg, layer_id, i);
+            for (int c = 0; c <= max_color; ++c) {
+                const auto& group = color_groups[c];
+                const int gsize = static_cast<int>(group.size());
+                std::vector<double> group_dx(static_cast<size_t>(gsize), 0.0);
+
+                #ifdef _OPENMP
+                #pragma omp parallel for schedule(static)
+                #endif
+                for (int idx = 0; idx < gsize; ++idx) {
+                    int node_id = group[idx];
+                    if (fixed[node_id]) continue;
+                    if (current_czm_damaging(mesh, cfg, node_id)) continue;
+
+                    Eigen::Vector3d dx =
+                        omega * (mesh.vertices.row(node_id) - x_old_iter.row(node_id)).transpose();
+                    double length = dx.norm();
+                    if (length > dx_clip) {
+                        dx *= dx_clip / length;
+                    }
+                    const Eigen::Vector3d y_node = Y.row(node_id).transpose();
+                    const Eigen::Vector3d x_prev_node = x_prev.row(node_id).transpose();
+
+                    group_dx[static_cast<size_t>(idx)] =
+                        apply_backtracking_line_search(
+                            mesh, cfg, layer_id, node_id, dx, vertex_to_tets,
+                            y_node,
+                            x_prev_node,
+                            make_psd(terms.hessian[node_id]),
+                            mesh.masses(node_id), inv_dt2,
+                            cfg.k_d * inv_dt);
+                }
+                for (double length : group_dx) {
+                    if (length > max_dx) max_dx = length;
+                }
             }
         }
 
@@ -322,11 +471,13 @@ VBDSolveResult solve_until_stable(
 
     // ── all_free ──
     bool all_free = true;
-    for (int i = 0; i < nV; ++i) {
-        if (mesh.is_current_bottom(i) && mesh.active_mask(i)) {
-            if (static_cast<CZMState>(mesh.czm_state(i)) != CZMState::FREE) {
-                all_free = false;
-                break;
+    if (cfg.enable_czm) {
+        for (int i = 0; i < nV; ++i) {
+            if (mesh.is_current_bottom(i) && mesh.active_mask(i)) {
+                if (static_cast<CZMState>(mesh.czm_state(i)) != CZMState::FREE) {
+                    all_free = false;
+                    break;
+                }
             }
         }
     }
@@ -342,7 +493,7 @@ VBDSolveResult solve_until_stable(
     // ── damaging 计数 ──
     int damaging_count = 0;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.active_mask(i) && is_current_czm_state(mesh, i, CZMState::DAMAGING))
+        if (mesh.active_mask(i) && current_czm_damaging(mesh, cfg, i))
             damaging_count++;
     }
 
@@ -401,6 +552,7 @@ VBDSolveResult solve_lift_and_relax(
     std::vector<std::vector<int>> color_groups(max_color + 1);
     for (int i = 0; i < nV; ++i)
         color_groups[mesh.colors(i)].push_back(i);
+    const auto vertex_to_tets = build_vertex_to_tets(mesh);
 
     // ════════════════════════════════════════════════════════════════════
     // Step 1: 单次微小增量驱动 —— 将 lifting_top 沿 Z 轴提升
@@ -422,7 +574,7 @@ VBDSolveResult solve_lift_and_relax(
     std::vector<char> fixed(nV, 0);
     for (int i = 0; i < nV; ++i) {
         fixed[i] = mesh.is_top_fixed(i) ||
-                   is_current_czm_state(mesh, i, CZMState::FIXED) ||
+                   current_czm_fixed(mesh, cfg, i) ||
                    !mesh.active_mask(i);
     }
 
@@ -465,17 +617,17 @@ VBDSolveResult solve_lift_and_relax(
         build_local_physics_terms(mesh, cfg, e_z, x_prev, terms);
 
         // Thread-local max_dx accumulator
-        std::vector<double> local_max_dx(max_color + 1, 0.0);
+        max_dx = 0.0;
 
         // ── 按颜色分组遍历（OpenMP 并行化）──
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic, 1)
-        #endif
         for (int c = 0; c <= max_color; ++c) {
             const auto& group = color_groups[c];
             const int gsize = static_cast<int>(group.size());
-            double thread_max_dx = 0.0;
+            std::vector<double> group_dx(static_cast<size_t>(gsize), 0.0);
 
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
             for (int idx = 0; idx < gsize; ++idx) {
                 int node_id = group[idx];
                 if (fixed[node_id]) continue;
@@ -514,39 +666,61 @@ VBDSolveResult solve_lift_and_relax(
                 // 步长限制收紧至 0.002（2 mm），适配毫米级网格
                 if (length > dx_clip) {
                     dx *= dx_clip / length;
-                    length = dx_clip;
                 }
+                const Eigen::Vector3d y_node = Y.row(node_id).transpose();
+                const Eigen::Vector3d x_prev_node = x_prev.row(node_id).transpose();
 
-                Eigen::Vector3d x_saved = mesh.vertices.row(node_id).transpose();
-                mesh.vertices.row(node_id) += dx.transpose();
+                group_dx[static_cast<size_t>(idx)] =
+                    apply_backtracking_line_search(
+                        mesh, cfg, layer_id, node_id, dx, vertex_to_tets,
+                        y_node,
+                        x_prev_node,
+                        h_elastic, mesh.masses(node_id), inv_dt2,
+                        cfg.k_d * inv_dt);
 
-                // 再次 FEP 检查
-                if (!mesh.is_top_fixed(node_id))
-                    apply_fep_floor(mesh, cfg, layer_id, node_id);
-
-                length = (mesh.vertices.row(node_id).transpose() - x_saved).norm();
-                if (length > thread_max_dx) thread_max_dx = length;
             }
-            local_max_dx[c] = thread_max_dx;
-        }
-
-        // 归约各线程的 max_dx
-        max_dx = 0.0;
-        for (int c = 0; c <= max_color; ++c) {
-            if (local_max_dx[c] > max_dx) max_dx = local_max_dx[c];
+            for (double length : group_dx) {
+                if (length > max_dx) max_dx = length;
+            }
         }
 
         // ── Chebyshev 加速 ──
         if (iteration > 5) {
             double omega = chebyshev_omega(iteration, cfg.rho_cheb);
-            #ifdef _OPENMP
-            #pragma omp parallel for
-            #endif
-            for (int i = 0; i < nV; ++i) {
-                if (fixed[i]) continue;
-                if (is_current_czm_state(mesh, i, CZMState::DAMAGING)) continue;
-                mesh.vertices.row(i) += omega * (mesh.vertices.row(i) - x_old_iter.row(i));
-                apply_fep_floor(mesh, cfg, layer_id, i);
+            for (int c = 0; c <= max_color; ++c) {
+                const auto& group = color_groups[c];
+                const int gsize = static_cast<int>(group.size());
+                std::vector<double> group_dx(static_cast<size_t>(gsize), 0.0);
+
+                #ifdef _OPENMP
+                #pragma omp parallel for schedule(static)
+                #endif
+                for (int idx = 0; idx < gsize; ++idx) {
+                    int node_id = group[idx];
+                    if (fixed[node_id]) continue;
+                    if (current_czm_damaging(mesh, cfg, node_id)) continue;
+
+                    Eigen::Vector3d dx =
+                        omega * (mesh.vertices.row(node_id) - x_old_iter.row(node_id)).transpose();
+                    double length = dx.norm();
+                    if (length > dx_clip) {
+                        dx *= dx_clip / length;
+                    }
+                    const Eigen::Vector3d y_node = Y.row(node_id).transpose();
+                    const Eigen::Vector3d x_prev_node = x_prev.row(node_id).transpose();
+
+                    group_dx[static_cast<size_t>(idx)] =
+                        apply_backtracking_line_search(
+                            mesh, cfg, layer_id, node_id, dx, vertex_to_tets,
+                            y_node,
+                            x_prev_node,
+                            make_psd(terms.hessian[node_id]),
+                            mesh.masses(node_id), inv_dt2,
+                            cfg.k_d * inv_dt);
+                }
+                for (double length : group_dx) {
+                    if (length > max_dx) max_dx = length;
+                }
             }
         }
 
@@ -573,7 +747,7 @@ VBDSolveResult solve_lift_and_relax(
     // ════════════════════════════════════════════════════════════════════
     // Step 7: 更新底部 CZM 损伤状态
     // ════════════════════════════════════════════════════════════════════
-    if (!bottom.empty()) {
+    if (cfg.enable_czm && !bottom.empty()) {
         build_local_physics_terms(mesh, cfg, e_z, x_prev, terms);
         for (size_t i = 0; i < bottom.size(); ++i) {
             int node_id = bottom[i];
@@ -588,10 +762,12 @@ VBDSolveResult solve_lift_and_relax(
     // Step 8: 检查剥离退出条件
     // ════════════════════════════════════════════════════════════════════
     bool all_free_flag = true;
-    for (int b : bottom) {
-        if (static_cast<CZMState>(mesh.czm_state(b)) != CZMState::FREE) {
-            all_free_flag = false;
-            break;
+    if (cfg.enable_czm) {
+        for (int b : bottom) {
+            if (static_cast<CZMState>(mesh.czm_state(b)) != CZMState::FREE) {
+                all_free_flag = false;
+                break;
+            }
         }
     }
 
@@ -606,7 +782,7 @@ VBDSolveResult solve_lift_and_relax(
     // ── damaging 计数 ──
     int damaging_count = 0;
     for (int i = 0; i < nV; ++i) {
-        if (mesh.active_mask(i) && is_current_czm_state(mesh, i, CZMState::DAMAGING))
+        if (mesh.active_mask(i) && current_czm_damaging(mesh, cfg, i))
             damaging_count++;
     }
 

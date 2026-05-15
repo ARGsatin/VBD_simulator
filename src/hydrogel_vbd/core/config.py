@@ -125,6 +125,7 @@ class SimulationConfig:
     t_fluid_max: float = 0.5        # 流体阻尼最大持续时间 (s)
     fluid_radius: float = 0.001     # 流体作用半径 (m)
     node_area: float = 1.0          # 节点有效面积 (m²)
+    enable_czm: bool = True         # 是否启用 CZM / 流体脱粘影响
 
     # ────────── 求解器 ──────────
     dt: float = 0.01             # 时间步长 (s)

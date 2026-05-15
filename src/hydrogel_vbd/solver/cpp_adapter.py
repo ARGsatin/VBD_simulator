@@ -171,6 +171,7 @@ def _build_cpp_config(cfg: SimulationConfig) -> Any:
     cpp_cfg.K_czm = cfg.K_czm
     cpp_cfg.delta_f = cfg.delta_f
     cpp_cfg.node_area = cfg.node_area
+    cpp_cfg.enable_czm = cfg.enable_czm
     cpp_cfg.z_fep = cfg.z_fep
     cpp_cfg.C_0 = cfg.C_0
     cpp_cfg.eta = cfg.eta
@@ -298,6 +299,13 @@ def _current_bottom_mask(mesh: MeshState, layer_id: int) -> np.ndarray:
         mask = np.asarray(mesh.is_bottom_surface, dtype=bool).copy()
     mask &= mesh.active_vertex_mask
     return np.ascontiguousarray(mask, dtype=bool)
+
+
+def _hit_clipped_max_iters(result_dict: dict[str, Any], config: SimulationConfig) -> bool:
+    return (
+        int(result_dict["iterations"]) >= int(config.max_iters)
+        and float(result_dict["max_dx"]) >= 0.002 * (1.0 - 1e-9)
+    )
 
 
 def solve_until_stable(
@@ -441,6 +449,8 @@ def solve_lift_and_relax(
 
     cpp_cfg = _build_cpp_config(config)
     lifting_top_list = [int(x) for x in lifting_top]
+    x_before = mesh.vertices.copy()
+    v_before = mesh.velocities.copy()
 
     result_dict = hydrogel_vbd_cpp.solve_lift_and_relax(
         mesh.vertices,
@@ -466,6 +476,18 @@ def solve_lift_and_relax(
         layer_id,
         lifting_top_list,
     )
+    if _hit_clipped_max_iters(result_dict, config):
+        mesh.vertices[:] = x_before
+        mesh.velocities[:] = v_before
+        lift_step = float(config.v_lift) * float(config.dt)
+        valid_top = np.asarray(lifting_top, dtype=int)
+        valid_top = valid_top[
+            (valid_top >= 0)
+            & (valid_top < mesh.vertices.shape[0])
+            & mesh.active_vertex_mask[valid_top]
+        ]
+        mesh.vertices[valid_top, 2] += lift_step
+        mesh.velocities[valid_top, 2] = float(config.v_lift)
 
     return VBDSolveResult(
         x=mesh.vertices,

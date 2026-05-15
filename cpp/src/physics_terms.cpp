@@ -101,6 +101,8 @@ void build_local_physics_terms(
         }
     }
 
+    if (!cfg.enable_czm) return;
+
     // ---- CZM 粘聚区 + 流体拖曳（逐顶点） ----
     for (int i = 0; i < nV; ++i) {
         if (!mesh.active_mask(i)) continue;

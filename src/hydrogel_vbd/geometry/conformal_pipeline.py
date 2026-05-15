@@ -102,12 +102,11 @@ class ConformalMeshPipeline:
                     [1.0, 1.0, z],   # v3: 右上
                 ]
             )
-            # 每个顶点的首次激活层 = max(surface_id - 1, 0)
-            #   surface 0 → layer 0（底层顶点在仿真开始时即激活）
-            #   surface k → layer k-1（上层顶点在上一层曝光时激活）
-            first = max(surface_id - 1, 0)
+            # Top-down printing: layer 0 is the geometric top layer attached to
+            # the build platform, then later layers grow downward toward the FEP.
+            first = max(layers - surface_id - 1, 0)
             first_active.extend([first] * 4)
-            interface_ids.extend([surface_id] * 4)
+            interface_ids.extend([layers - surface_id] * 4)
             # 只有 surface 0 的顶点标记为"底面"
             is_bottom.extend([surface_id == 0] * 4)
 
@@ -127,7 +126,7 @@ class ConformalMeshPipeline:
                 [b + 1, b + 2, t + 0, t + 3],  # 中心对角
             ]
             tets.extend(layer_tets)
-            tet_layers.extend([layer] * len(layer_tets))
+            tet_layers.extend([layers - 1 - layer] * len(layer_tets))
 
         # ── 构造 MeshState ──
         mesh = MeshState(

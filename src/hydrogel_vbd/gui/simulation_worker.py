@@ -294,7 +294,7 @@ class SimulationWorker(QtCore.QObject):
 
     @staticmethod
     def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
-        return float(config.z_fep) + int(layer_id) * float(config.layer_thickness)
+        return float(config.z_fep)
 
     @staticmethod
     def _update_czm_from_current_terms(
@@ -303,21 +303,24 @@ class SimulationWorker(QtCore.QObject):
         layer_id: int,
         e_z: float,
         x_prev: np.ndarray,
-    ) -> bool:
+    ) -> np.ndarray | None:
         """Update current layer CZM using the assembled post-solve normal pull."""
+        if not bool(getattr(config, "enable_czm", True)):
+            return None
         bottom = mesh.bottom_nodes(layer_id)
         if len(bottom) == 0:
-            return False
+            return None
 
         from hydrogel_vbd.physics.czm import update_czm_states
         from hydrogel_vbd.physics.local_terms import build_local_physics_terms
         from hydrogel_vbd.solver.vbd_solver import _normal_pull_from_terms
 
         terms = build_local_physics_terms(mesh, config, e_z=e_z, x_prev=x_prev)
+        pull = _normal_pull_from_terms(terms.force, bottom)
         update_czm_states(
             mesh,
             bottom,
-            internal_pull_z=_normal_pull_from_terms(terms.force, bottom),
+            internal_pull_z=pull,
             area=config.node_area,
             t_max=config.T_max,
             k_czm=config.K_czm,
@@ -325,7 +328,7 @@ class SimulationWorker(QtCore.QObject):
             z_fep=config.z_fep,
             dt=config.dt,
         )
-        return True
+        return pull
 
     def _validate_lift_plan(
         self, layer_id: int, lift_max: float, lift_step: float, expected_steps: int
@@ -543,6 +546,7 @@ class SimulationWorker(QtCore.QObject):
             "dt", "max_iters", "N_stable", "epsilon", "k_d", "rho_cheb",
             "mu", "kappa", "c_shrink", "q_ion", "g",
             "T_max", "K_czm", "delta_f", "node_area",
+            "enable_czm",
             "z_fep", "C_0", "eta", "fluid_radius",
             "d_min", "d_fluid_max", "t_fluid_max",
             "v_lift", "layer_thickness", "lift_multiplier", "c_init",
@@ -630,6 +634,7 @@ class SimulationWorker(QtCore.QObject):
             SolverRunawayGuard,
             SolverStepDiagnostics,
             diagnostics_enabled,
+            prepare_solver_diagnostics_csv,
             write_solver_diagnostics_csv,
         )
 
@@ -651,7 +656,11 @@ class SimulationWorker(QtCore.QObject):
         self.log_message.emit("  [info] 使用 Python 参考求解器")
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
-        self._trace(f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers}")
+        self._trace(
+            f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers} "
+            f"enable_czm={getattr(self._config, 'enable_czm', True)} "
+            f"rho_cheb={getattr(self._config, 'rho_cheb', None)}"
+        )
 
         results: list[LayerResult] = []
         step_counter = 0
@@ -667,6 +676,12 @@ class SimulationWorker(QtCore.QObject):
             if self._solver_diagnostics_stride is None
             else max(1, int(self._solver_diagnostics_stride))
         )
+        self.log_message.emit(
+            f"  [diag] solver CSV enabled={diag_enabled} path={diag_path}"
+        )
+        if diag_enabled:
+            prepare_solver_diagnostics_csv(diag_path)
+            self._trace(f"diagnostic_csv_prepared path={diag_path}")
         diag_guard = SolverRunawayGuard(
             limit=50,
             max_iters=int(self._config.max_iters),
@@ -694,6 +709,7 @@ class SimulationWorker(QtCore.QObject):
             result: Any,
             call_ms: float,
             x_before: np.ndarray | None = None,
+            czm_pull: np.ndarray | None = None,
         ) -> bool:
             nonlocal diag_stop_reason
             if not diag_enabled:
@@ -710,6 +726,10 @@ class SimulationWorker(QtCore.QObject):
                 dx_clip=self.DX_CLIP_DIAGNOSTIC,
                 z_fep=self._layer_contact_z(self._config, layer_id),
                 x_before=x_before,
+                czm_pull=czm_pull,
+                czm_area=self._config.node_area,
+                czm_t_max=self._config.T_max,
+                czm_delta_f=self._config.delta_f,
             )
             write_solver_diagnostics_csv(diag_path, [diag])
             if diag_guard.observe(diag):
@@ -862,7 +882,9 @@ class SimulationWorker(QtCore.QObject):
                     self.sub_progress.emit(layer_id, lift_pct, step_counter)
 
                     # ── 全部脱膜则退出提升循环 ──
-                    if result.all_free:
+                    if result.all_free and bool(
+                        getattr(self._config, "enable_czm", True)
+                    ):
                         self._raise_if_detached_before_convergence(
                             layer_id, layer_steps, result, self._config
                         )

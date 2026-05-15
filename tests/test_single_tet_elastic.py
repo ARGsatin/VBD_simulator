@@ -41,6 +41,14 @@ from tests.validator import (
 )
 
 
+def _require_cpp_module():
+    from hydrogel_vbd.solver import cpp_adapter
+
+    if not cpp_adapter.is_cpp_available():
+        pytest.skip(f"C++ module unavailable: {cpp_adapter.get_import_error()}")
+    return cpp_adapter.hydrogel_vbd_cpp
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                           工厂函数                                           ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -353,6 +361,108 @@ class TestFiniteDifferenceHessian:
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                    测试 6：Lagrangian 单调下降                                ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+class TestCppElasticAlignment:
+    """C++ elastic kernel must match the Python reference on a single tet."""
+
+    def test_cpp_identity_force_is_zero(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        mu, lam = 5e4, 1e7 - (2.0 / 3.0) * 5e4
+
+        forces, _ = cpp.debug_tet_force_hessian(
+            verts, dm_inv, 1.0 / 6.0, mu, lam
+        )
+
+        assert np.linalg.norm(forces) < 1e-8
+
+    def test_cpp_force_and_hessian_match_python_after_deformation(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        verts_deformed = verts.copy()
+        verts_deformed[1] += np.array([0.08, -0.02, 0.01])
+        verts_deformed[2] += np.array([0.01, 0.05, -0.015])
+        verts_deformed[3] += np.array([0.04, 0.03, 0.06])
+        mu, lam = 5e4, 1e7 - (2.0 / 3.0) * 5e4
+
+        cpp_force, cpp_hessian = cpp.debug_tet_force_hessian(
+            verts_deformed, dm_inv, 1.0 / 6.0, mu, lam
+        )
+        cpp_hessian = np.asarray(cpp_hessian).reshape(4, 3, 3)
+        py_force, py_hessian = compute_tet_force_and_hessian_contributions(
+            verts_deformed, dm_inv, rest_volume=1.0 / 6.0, mu=mu, lam=lam
+        )
+
+        np.testing.assert_allclose(cpp_force, py_force, rtol=1e-10, atol=1e-8)
+        np.testing.assert_allclose(cpp_hessian, py_hessian, rtol=1e-10, atol=1e-6)
+
+    def test_cpp_hessian_matches_force_finite_difference_trend(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        verts[1] += np.array([0.04, -0.01, 0.02])
+        verts[2] += np.array([0.02, 0.03, 0.01])
+        verts[3] += np.array([0.03, -0.02, 0.05])
+        mu, lam = 5e4, 1e7 - (2.0 / 3.0) * 5e4
+        eps = 1e-7
+
+        f0, h0 = cpp.debug_tet_force_hessian(verts, dm_inv, 1.0 / 6.0, mu, lam)
+        h0 = np.asarray(h0).reshape(4, 3, 3)
+        perturbed = verts.copy()
+        perturbed[3, 2] += eps
+        f1, _ = cpp.debug_tet_force_hessian(perturbed, dm_inv, 1.0 / 6.0, mu, lam)
+
+        predicted = -(h0[3] @ np.array([0.0, 0.0, eps]))
+        observed = f1[3] - f0[3]
+        np.testing.assert_allclose(observed, predicted, rtol=2e-3, atol=1e-4)
+
+
+class TestCppLineSearch:
+    """Debug line-search helper verifies accept, backtrack, and restore paths."""
+
+    def test_cpp_line_search_accepts_non_increasing_elastic_step(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        verts[3, 2] -= 0.08
+        direction = np.array([0.0, 0.0, 0.02], dtype=np.float64)
+
+        out = cpp.debug_single_tet_line_search(
+            verts, dm_inv, 1.0 / 6.0, 5e4, 1e7 - (2.0 / 3.0) * 5e4,
+            3, direction, -1.0e9,
+        )
+
+        assert out["accepted"]
+        assert out["alpha"] == pytest.approx(1.0)
+        assert out["energy_after"] <= out["energy_before"] + 1e-10
+
+    def test_cpp_line_search_backtracks_energy_increase(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        verts[3, 2] -= 0.08
+        direction = np.array([0.0, 0.0, 0.20], dtype=np.float64)
+
+        out = cpp.debug_single_tet_line_search(
+            verts, dm_inv, 1.0 / 6.0, 5e4, 1e7 - (2.0 / 3.0) * 5e4,
+            3, direction, -1.0e9,
+        )
+
+        assert out["accepted"]
+        assert out["alpha"] < 1.0
+        assert out["energy_after"] <= out["energy_before"] + 1e-10
+
+    def test_cpp_line_search_restores_when_no_step_is_acceptable(self) -> None:
+        cpp = _require_cpp_module()
+        verts, _, dm_inv = make_unit_tet(scale=1.0)
+        direction = np.array([0.0, 0.0, -0.02], dtype=np.float64)
+
+        out = cpp.debug_single_tet_line_search(
+            verts, dm_inv, 1.0 / 6.0, 5e4, 1e7 - (2.0 / 3.0) * 5e4,
+            3, direction, verts[3, 2] + 0.01,
+        )
+
+        assert not out["accepted"]
+        assert out["alpha"] == pytest.approx(0.0)
+        np.testing.assert_allclose(out["position_after"], verts[3])
+
 
 class TestLagrangianMonotonicity:
     """验证 VBD Newton 迭代使 Lagrangian 单调下降。"""

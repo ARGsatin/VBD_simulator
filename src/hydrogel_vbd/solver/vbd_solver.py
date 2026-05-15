@@ -73,6 +73,10 @@ def _current_czm_masks(mesh: MeshState, layer_id: int) -> tuple[np.ndarray, np.n
     return fixed, damaging
 
 
+def _czm_enabled(config: SimulationConfig) -> bool:
+    return bool(getattr(config, "enable_czm", True))
+
+
 def _current_bottom_mask(mesh: MeshState, layer_id: int) -> np.ndarray:
     """Return the nodes that can contact the FEP for the current layer only."""
     current_bottom = np.zeros(mesh.vertices.shape[0], dtype=bool)
@@ -95,15 +99,7 @@ def _fep_floor_for_nodes(
     """Return which nodes have a FEP collision floor and the floor z value."""
     node_ids = np.asarray(nodes, dtype=int)
     applies = np.asarray(mesh.active_vertex_mask[node_ids], dtype=bool).copy()
-    base_z_fep = float(config.z_fep) - int(layer_id) * float(config.layer_thickness)
-    node_layers = np.asarray(mesh.first_active_layer[node_ids], dtype=int)
-    surface_layers = np.asarray(mesh.is_top_surface_of_layer[node_ids], dtype=int)
-    node_layers = np.where(
-        surface_layers >= 0,
-        np.maximum(node_layers, surface_layers),
-        node_layers,
-    ).astype(float)
-    floor_z = base_z_fep + node_layers * float(config.layer_thickness)
+    floor_z = np.full(node_ids.shape, float(config.z_fep), dtype=float)
 
     current = np.asarray(current_bottom[node_ids], dtype=bool)
     floor_z[current] = float(config.z_fep)
@@ -111,7 +107,7 @@ def _fep_floor_for_nodes(
     global_bottom = np.asarray(mesh.is_bottom_surface[node_ids], dtype=bool)
     previous_global_bottom = global_bottom & ~current
     if np.any(previous_global_bottom):
-        floor_z[previous_global_bottom] = base_z_fep
+        floor_z[previous_global_bottom] = float(config.z_fep)
         applies[previous_global_bottom] = True
 
     return applies, floor_z
@@ -167,6 +163,28 @@ def _vertex_local_elastic_energy(
         F = compute_tet_deformation_gradient(v, dmi)
         energy += mesh.tet_volumes[tet_id] * neo_hookean_energy_density(F, mu, lam)
     return energy
+
+
+def _vertex_local_step_objective(
+    mesh: MeshState,
+    node_id: int,
+    mu: float,
+    lam: float,
+    y_node: np.ndarray,
+    x_prev_node: np.ndarray,
+    h_elastic: np.ndarray,
+    mass: float,
+    inv_dt2: float,
+    damp_factor: float,
+) -> float:
+    x = mesh.vertices[node_id]
+    dx_inertia = x - y_node
+    dx_damp = x - x_prev_node
+    return (
+        _vertex_local_elastic_energy(mesh, node_id, mu, lam)
+        + 0.5 * float(mass) * float(inv_dt2) * float(dx_inertia @ dx_inertia)
+        + 0.5 * float(damp_factor) * float(dx_damp @ (h_elastic @ dx_damp))
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -383,7 +401,11 @@ class PythonReferenceVBDSolver:
         )
 
         # ── 固定节点：平台夹持、CZM 固定、未激活 ──
-        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        if _czm_enabled(config):
+            czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        else:
+            czm_fixed = np.zeros(mesh.vertices.shape[0], dtype=bool)
+            czm_damaging = np.zeros(mesh.vertices.shape[0], dtype=bool)
         fixed = (
             mesh.is_top_fixed
             | czm_fixed
@@ -497,6 +519,10 @@ class PythonReferenceVBDSolver:
                 dx_batch = np.linalg.solve(
                     h_total_batch, f_total_batch[..., None]
                 ).squeeze(-1)  # (K, 3)
+                lengths = np.linalg.norm(dx_batch, axis=1)
+                too_large = lengths > 0.002
+                if np.any(too_large):
+                    dx_batch[too_large] *= (0.002 / lengths[too_large])[:, None]
 
                 # ── Per-node line search（能量评估无法批量） ──
                 x_saved_batch = mesh.vertices[active_nodes].copy()       # (K, 3)
@@ -506,8 +532,17 @@ class PythonReferenceVBDSolver:
                     dx = dx_batch[i]
                     x_saved = x_saved_batch[i]
 
-                    e_before = _vertex_local_elastic_energy(
-                        mesh, node_id, mu_lame, lam_lame
+                    e_before = _vertex_local_step_objective(
+                        mesh,
+                        node_id,
+                        mu_lame,
+                        lam_lame,
+                        y[node_id],
+                        x_prev[node_id],
+                        h_elastic_batch[i],
+                        mass_batch[i],
+                        inv_dt2,
+                        damp_factor,
                     )
                     alpha = 1.0
                     accepted = False
@@ -518,10 +553,19 @@ class PythonReferenceVBDSolver:
                                 mesh, config, layer_id, node_id, current_bottom
                             )
 
-                        e_after = _vertex_local_elastic_energy(
-                            mesh, node_id, mu_lame, lam_lame
+                        e_after = _vertex_local_step_objective(
+                            mesh,
+                            node_id,
+                            mu_lame,
+                            lam_lame,
+                            y[node_id],
+                            x_prev[node_id],
+                            h_elastic_batch[i],
+                            mass_batch[i],
+                            inv_dt2,
+                            damp_factor,
                         )
-                        if e_after <= e_before + 1e-10 or alpha < 1e-6:
+                        if e_after <= e_before + 1e-10:
                             accepted = True
                             break
                         alpha *= 0.5
@@ -544,12 +588,29 @@ class PythonReferenceVBDSolver:
                     & ~fixed
                     & ~czm_damaging
                 )
-                mesh.vertices[free_mask] += omega * (
-                    mesh.vertices[free_mask] - x_old_iter[free_mask]
-                )
+                free_ids = np.flatnonzero(free_mask)
+                if len(free_ids):
+                    x_saved = mesh.vertices[free_ids].copy()
+                    extrap_dx = omega * (
+                        mesh.vertices[free_ids] - x_old_iter[free_ids]
+                    )
+                    lengths = np.linalg.norm(extrap_dx, axis=1)
+                    too_large = lengths > 0.002
+                    if np.any(too_large):
+                        extrap_dx[too_large] *= (
+                            0.002 / lengths[too_large]
+                        )[:, None]
+                    mesh.vertices[free_ids] += extrap_dx
                 _apply_fep_floor_to_mask(
                     mesh, config, layer_id, free_mask, current_bottom
                 )
+                if len(free_ids):
+                    actual = np.linalg.norm(
+                        mesh.vertices[free_ids] - x_saved,
+                        axis=1,
+                    )
+                    if actual.size:
+                        max_dx = max(max_dx, float(np.max(actual)))
 
             # ── 收敛判定 ──
             if max_dx < target_epsilon:
@@ -574,7 +635,7 @@ class PythonReferenceVBDSolver:
 
         # ── 检查底部脱膜状态 ──
         free_bottom = mesh.bottom_nodes(layer_id)
-        all_free = bool(
+        all_free = (not _czm_enabled(config)) or bool(
             len(free_bottom) == 0
             or np.all(mesh.czm_state[free_bottom] == CZMState.FREE)
         )
@@ -639,7 +700,11 @@ class PythonReferenceVBDSolver:
         config = self.config
         x_prev = mesh.vertices.copy()
         masses = mesh.masses
-        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        if _czm_enabled(config):
+            czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        else:
+            czm_fixed = np.zeros(mesh.vertices.shape[0], dtype=bool)
+            czm_damaging = np.zeros(mesh.vertices.shape[0], dtype=bool)
         fixed = (
             mesh.is_top_fixed
             | czm_fixed
@@ -658,7 +723,11 @@ class PythonReferenceVBDSolver:
         )
 
         # ════════════════════ 静平衡迭代 ════════════════════
-        czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        if _czm_enabled(config):
+            czm_fixed, czm_damaging = _current_czm_masks(mesh, layer_id)
+        else:
+            czm_fixed = np.zeros(mesh.vertices.shape[0], dtype=bool)
+            czm_damaging = np.zeros(mesh.vertices.shape[0], dtype=bool)
         fixed[:] = (
             mesh.is_top_fixed
             | czm_fixed
@@ -734,14 +803,26 @@ class PythonReferenceVBDSolver:
                     )
                     f_total = terms.force[node_id] + f_inertia + f_damp
                     dx = np.linalg.solve(h_total, f_total)
+                    length = float(np.linalg.norm(dx))
+                    if length > 0.002:
+                        dx *= 0.002 / length
 
                     # ── Backtracking line search ──
                     mu_lame, lam_lame = _poisson_to_lame(
                         config.mu, config.kappa
                     )
                     x_saved = mesh.vertices[node_id].copy()
-                    e_before = _vertex_local_elastic_energy(
-                        mesh, node_id, mu_lame, lam_lame
+                    e_before = _vertex_local_step_objective(
+                        mesh,
+                        node_id,
+                        mu_lame,
+                        lam_lame,
+                        y[node_id],
+                        x_prev[node_id],
+                        h_elastic,
+                        masses[node_id],
+                        1.0 / max(config.dt ** 2, 1e-24),
+                        config.k_d / max(config.dt, 1e-12),
                     )
 
                     alpha = 1.0
@@ -752,10 +833,19 @@ class PythonReferenceVBDSolver:
                             _apply_fep_floor(
                                 mesh, config, layer_id, node_id, current_bottom
                             )
-                        e_after = _vertex_local_elastic_energy(
-                            mesh, node_id, mu_lame, lam_lame
+                        e_after = _vertex_local_step_objective(
+                            mesh,
+                            node_id,
+                            mu_lame,
+                            lam_lame,
+                            y[node_id],
+                            x_prev[node_id],
+                            h_elastic,
+                            masses[node_id],
+                            1.0 / max(config.dt ** 2, 1e-24),
+                            config.k_d / max(config.dt, 1e-12),
                         )
-                        if e_after <= e_before + 1e-10 or alpha < 1e-6:
+                        if e_after <= e_before + 1e-10:
                             accepted = True
                             break
                         alpha *= 0.5
@@ -780,12 +870,29 @@ class PythonReferenceVBDSolver:
                     & ~fixed
                     & ~czm_damaging
                 )
-                mesh.vertices[free_mask] += omega * (
-                    mesh.vertices[free_mask] - x_old_iter[free_mask]
-                )
+                free_ids = np.flatnonzero(free_mask)
+                if len(free_ids):
+                    x_saved = mesh.vertices[free_ids].copy()
+                    extrap_dx = omega * (
+                        mesh.vertices[free_ids] - x_old_iter[free_ids]
+                    )
+                    lengths = np.linalg.norm(extrap_dx, axis=1)
+                    too_large = lengths > 0.002
+                    if np.any(too_large):
+                        extrap_dx[too_large] *= (
+                            0.002 / lengths[too_large]
+                        )[:, None]
+                    mesh.vertices[free_ids] += extrap_dx
                 _apply_fep_floor_to_mask(
                     mesh, config, layer_id, free_mask, current_bottom
                 )
+                if len(free_ids):
+                    actual = np.linalg.norm(
+                        mesh.vertices[free_ids] - x_saved,
+                        axis=1,
+                    )
+                    if actual.size:
+                        max_dx = max(max_dx, float(np.max(actual)))
 
             if max_dx < target_epsilon:
                 stable_counter += 1
@@ -807,7 +914,7 @@ class PythonReferenceVBDSolver:
         mesh.prev_vertices = x_prev
 
         free_bottom = mesh.bottom_nodes(layer_id)
-        if len(free_bottom):
+        if _czm_enabled(config) and len(free_bottom):
             from hydrogel_vbd.physics.czm import update_czm_states
 
             terms_after = build_local_physics_terms(
@@ -827,7 +934,7 @@ class PythonReferenceVBDSolver:
                 dt=config.dt,
             )
 
-        all_free = bool(
+        all_free = (not _czm_enabled(config)) or bool(
             len(free_bottom) == 0
             or np.all(mesh.czm_state[free_bottom] == CZMState.FREE)
         )

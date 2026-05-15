@@ -105,7 +105,7 @@ def _command_json(layer_id: int, command: PIDFieldState) -> dict:
 
 def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
     """Return the layer-local FEP contact plane in world coordinates."""
-    return float(config.z_fep) + int(layer_id) * float(config.layer_thickness)
+    return float(config.z_fep)
 
 
 # ---------------------------------------------------------------------------

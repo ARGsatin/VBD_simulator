@@ -83,23 +83,18 @@ class LayerActivator:
         if current_layer <= 0:
             return
         active = np.asarray(mesh.active_vertex_mask, dtype=bool).copy()
-        contact = mesh.bottom_nodes(current_layer)
-        contact = contact[active[contact]] if len(contact) else contact
-        if len(contact):
-            dz = float(z_fep) - float(np.median(mesh.vertices[contact, 2]))
+        previous_bottom = mesh.bottom_nodes(current_layer - 1)
+        previous_bottom = (
+            previous_bottom[active[previous_bottom]]
+            if len(previous_bottom)
+            else previous_bottom
+        )
+        thickness = LayerActivator._infer_layer_thickness(mesh, current_layer)
+        if len(previous_bottom) and thickness > 0.0:
+            target_z = float(z_fep) + thickness
+            dz = target_z - float(np.median(mesh.vertices[previous_bottom, 2]))
             mesh.vertices[active, 2] += dz
             mesh.velocities[active] = 0.0
-
-        thickness = LayerActivator._infer_layer_thickness(mesh, current_layer)
-        previous_z_fep = float(z_fep) - thickness if thickness > 0.0 else float(z_fep)
-        previous_bottom = mesh.bottom_nodes(current_layer - 1)
-        previous_bottom = previous_bottom[active[previous_bottom]] if len(previous_bottom) else previous_bottom
-        if len(previous_bottom):
-            collided = previous_bottom[
-                mesh.vertices[previous_bottom, 2] < previous_z_fep
-            ]
-            mesh.vertices[collided, 2] = previous_z_fep
-            mesh.velocities[collided, 2] = 0.0
 
     def activate(self, mesh: MeshState, current_layer: int) -> MeshState:
         """激活指定层（轻量版，不处理继承）。
@@ -181,13 +176,15 @@ class LayerActivator:
             top = self._geometric_layer_top_nodes(mesh, current_layer)
 
         # ── 顶层节点：z 不超过理想构型 ──
-        if len(top):
-            mesh.vertices[top] = np.minimum(
-                mesh.vertices[top], mesh.ideal_vertices[top]
-            )
-
         # ── 底面节点：z 锁定在离型膜面 ──
+        face_nodes = np.union1d(top, bottom)
+        if len(face_nodes):
+            mesh.active_vertex_mask[face_nodes] = True
+            new_nodes = np.union1d(new_nodes, face_nodes)
+
         if len(bottom):
+            dz_new = float(z_fep) - float(np.median(mesh.ideal_vertices[bottom, 2]))
+            mesh.vertices[new_nodes, 2] = mesh.ideal_vertices[new_nodes, 2] + dz_new
             mesh.vertices[bottom, 2] = z_fep
 
         # ── 内部节点：z 钳位在 [z_fep, ideal_z] ──
@@ -195,17 +192,15 @@ class LayerActivator:
             new_nodes, np.union1d(top, bottom), assume_unique=False
         )
         for idx in interior:
-            ideal_z = mesh.ideal_vertices[idx, 2]
-            mesh.vertices[idx, 2] = min(
-                max(ideal_z, z_fep), ideal_z  # 钳位逻辑
-            )
+            mesh.vertices[idx, 2] = max(mesh.vertices[idx, 2], z_fep)
 
         # ── 重置运动学状态 ──
         mesh.velocities[new_nodes] = 0.0
 
         # ── 固定顶层节点（模拟平台夹持） ──
-        mesh.is_top_fixed[:] = False
-        mesh.is_top_fixed[top] = True
+        if current_layer == 0 or not np.any(mesh.is_top_fixed & mesh.active_vertex_mask):
+            mesh.is_top_fixed[:] = False
+            mesh.is_top_fixed[top] = True
 
         # ── 初始化 CZM 状态 ──
         mesh.czm_state[new_nodes] = CZMState.FREE       # 默认自由

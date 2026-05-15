@@ -84,11 +84,11 @@ Eigen::Matrix<double, 9, 9> neo_hookean_material_tangent_9x9(
                     // μ · δ_{ik} · δ_{jl}
                     if (i == k && j == l) val += mu;
 
-                    // (λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
+                    // -(λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
                     val += coeff * FinvT(i, l) * FinvT(k, j);
 
                     // λ · F^{-T}_{ij} · F^{-T}_{lk}
-                    val += lam * FinvT(i, j) * FinvT(l, k);
+                    val += lam * FinvT(i, j) * FinvT(k, l);
 
                     C(row, col) = val;
                 }

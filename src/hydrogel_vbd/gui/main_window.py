@@ -42,7 +42,11 @@ from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.field_controller import PIDFieldController
 from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.geometry.layer_activator import LayerActivator
-from hydrogel_vbd.geometry.stl_mesher import create_demo_or_stl, STLMesher
+from hydrogel_vbd.geometry.stl_mesher import (
+    create_demo_or_stl,
+    STLMesher,
+    transform_points_to_print_z,
+)
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
@@ -86,6 +90,7 @@ _PARAM_META: list[dict[str, Any]] = [
     {"key": "T_max", "label": "最大附着力 T_max (Pa)", "default": 3000.0, "min": 100.0, "max": 50000.0},
     {"key": "K_czm", "label": "CZM 刚度 (Pa/m)", "default": 1.0e7, "min": 1e6, "max": 1e10},
     {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 5.0e-4, "min": 1e-6, "max": 1e-2},
+    {"key": "node_area", "label": "CZM node area (m^2)", "default": 1.0e-6, "min": 1e-10, "max": 1e-3},
     {"key": "dt", "label": "时间步长 dt (s)", "default": 0.001, "min": 0.0001, "max": 0.05},
     {"key": "max_iters", "label": "最大迭代次数", "default": 20, "min": 5, "max": 200},
     {"key": "N_stable", "label": "稳定步数判决", "default": 10, "min": 2, "max": 50},
@@ -299,6 +304,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._combo_mesh_algo: QtWidgets.QComboBox | None = None
         self._chk_use_cpp: QtWidgets.QCheckBox | None = None
         self._chk_solver_diag: QtWidgets.QCheckBox | None = None
+        self._combo_print_z_axis: QtWidgets.QComboBox | None = None
+        self._chk_disable_czm: QtWidgets.QCheckBox | None = None
+        self._chk_disable_chebyshev: QtWidgets.QCheckBox | None = None
         self._solver_diag_env_backup: dict[str, str | None] | None = None
 
         # ── 后处理动画回放状态 ──
@@ -507,6 +515,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "标准非结构化算法: 跳过切片，直接生成自由四面体网格"
         )
         info_2.addWidget(self._combo_mesh_algo)
+        info_2.addSpacing(12)
+        info_2.addWidget(QtWidgets.QLabel("打印 Z:"))
+        self._combo_print_z_axis = QtWidgets.QComboBox()
+        self._combo_print_z_axis.addItem("model Y", "y")
+        self._combo_print_z_axis.addItem("model -Y", "-y")
+        self._combo_print_z_axis.addItem("model Z", "z")
+        self._combo_print_z_axis.addItem("model -Z", "-z")
+        self._combo_print_z_axis.addItem("model X", "x")
+        self._combo_print_z_axis.addItem("model -X", "-x")
+        self._combo_print_z_axis.setToolTip("选择模型哪个轴作为打印/切片 Z 方向")
+        self._combo_print_z_axis.currentIndexChanged.connect(self._on_model_axis_changed)
+        info_2.addWidget(self._combo_print_z_axis)
         info_2.addStretch()
         left_layout.addLayout(info_2)
 
@@ -526,6 +546,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "勾选后本次仿真写入 outputs/gui/reports/solver_diagnostics.csv"
         )
         info_3.addWidget(self._chk_solver_diag)
+        info_3.addSpacing(12)
+        self._chk_disable_czm = QtWidgets.QCheckBox("禁用 CZM")
+        self._chk_disable_czm.setChecked(False)
+        self._chk_disable_czm.setToolTip("调试用：跳过 CZM/流体脱粘力、状态更新和 CZM 固定约束")
+        self._chk_disable_czm.toggled.connect(self._on_czm_toggle_changed)
+        info_3.addWidget(self._chk_disable_czm)
+        info_3.addSpacing(12)
+        self._chk_disable_chebyshev = QtWidgets.QCheckBox("禁用 Chebyshev")
+        self._chk_disable_chebyshev.setChecked(False)
+        self._chk_disable_chebyshev.setToolTip("调试用：将 rho_cheb 置为 0，跳过 Chebyshev 加速")
+        self._chk_disable_chebyshev.toggled.connect(self._on_chebyshev_toggle_changed)
+        info_3.addWidget(self._chk_disable_chebyshev)
         info_3.addStretch()
         left_layout.addLayout(info_3)
 
@@ -795,6 +827,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_params(self, params: dict[str, Any]) -> None:
         """参数面板变更：更新当前配置。"""
         self._config = SimulationConfig(**ParameterPanel._config_values_from_ui(params))
+        self._apply_debug_solver_toggles(self._config)
         # 动态更新层厚显示
         lt_mm = float(params.get("layer_thickness", self._layer_thickness_mm))
         self._lbl_thickness.setText(f"{lt_mm:.2f}")
@@ -845,6 +878,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mesh = None
         self._actual_layers = 0
         self._update_button_states()
+
+    def _on_model_axis_changed(self, _index: int) -> None:
+        self._generated_mesh = None
+        self.mesh = None
+        self._actual_layers = 0
+        if self._stl_path is not None:
+            self._auto_calculate_mesh_params()
+            self._show_stl_preview()
+        self._update_button_states()
+
+    def _on_czm_toggle_changed(self, _checked: bool) -> None:
+        self._apply_debug_solver_toggles(self._config)
+
+    def _on_chebyshev_toggle_changed(self, _checked: bool) -> None:
+        self._apply_debug_solver_toggles(self._config)
+
+    def _print_z_axis(self) -> str:
+        if self._combo_print_z_axis is None:
+            return "z"
+        return str(self._combo_print_z_axis.currentData() or "z")
+
+    def _is_czm_disabled(self) -> bool:
+        return bool(self._chk_disable_czm and self._chk_disable_czm.isChecked())
+
+    def _is_chebyshev_disabled(self) -> bool:
+        return bool(
+            self._chk_disable_chebyshev
+            and self._chk_disable_chebyshev.isChecked()
+        )
+
+    def _apply_debug_solver_toggles(self, config: SimulationConfig) -> None:
+        config.enable_czm = not self._is_czm_disabled()
+        if self._is_chebyshev_disabled():
+            config.rho_cheb = 0.0
 
     def _auto_calculate_demo_resolution(self) -> None:
         """根据 Demo 模型（1x1 m 正方体）和当前层数自动计算推荐分辨率。
@@ -981,6 +1048,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # STL 坐标从 mm 转换为 m
             loaded.vertices *= 0.001
+            loaded.vertices = transform_points_to_print_z(
+                loaded.vertices, self._print_z_axis()
+            )
             self._stl_trimesh = loaded
 
             bounds = loaded.bounds
@@ -1057,6 +1127,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Gmsh OCC 无法导入模型: {self._stl_path}"
                 )
             _gmsh.model.occ.synchronize()
+            if self._print_z_axis() != "z":
+                from hydrogel_vbd.geometry.stl_mesher import _apply_gmsh_print_z_transform
+
+                _apply_gmsh_print_z_transform(self._print_z_axis())
+                _gmsh.model.occ.synchronize()
 
             # ── 遍历所有导入的 OCC 实体，分别获取包围盒后合并 ──
             # 避免 dim=-1, tag=-1 全局查询对某些 STEP 拓扑的兼容性问题
@@ -1167,6 +1242,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not imported:
                     raise RuntimeError("Gmsh OCC 无法导入 STEP 模型")
                 _gmsh.model.occ.synchronize()
+                if self._print_z_axis() != "z":
+                    from hydrogel_vbd.geometry.stl_mesher import _apply_gmsh_print_z_transform
+
+                    _apply_gmsh_print_z_transform(self._print_z_axis())
+                    _gmsh.model.occ.synchronize()
 
                 # ── 极粗网格尺寸：包围盒对角线的 1/20 ──
                 coarse_size = max(diag_mm / 20.0, 0.1)
@@ -1274,6 +1354,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log.append_log("===== 划分网格 =====")
 
         config = self._param_panel.get_config()
+        self._apply_debug_solver_toggles(config)
         lt_m = self._layer_thickness_m
         lt_mm = self._layer_thickness_mm
         config.layer_thickness = lt_m
@@ -1305,6 +1386,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     stl_path=str(self._stl_path),
                     layer_thickness=lt_m,
                     resolution=user_res_mm * 1e-3,
+                    print_z_axis=self._print_z_axis(),
                 )
                 mesh, actual_layers = mesher.build_layered_mesh(config, algo_type=algo_type)
                 self._actual_layers = actual_layers
@@ -1449,6 +1531,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # get_config() 会触发 _on_params，其内部可能清空 self._generated_mesh
         config = self._param_panel.get_config()
+        self._apply_debug_solver_toggles(config)
         solver_diag_enabled = (
             self._chk_solver_diag is not None
             and self._chk_solver_diag.isChecked()
@@ -1487,11 +1570,18 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._log.append_log("  [info] 使用 Python 参考求解器（用户选择）")
 
+        self._log.append_log(
+            f"  [debug] enable_czm={config.enable_czm}, "
+            f"rho_cheb={config.rho_cheb}"
+        )
+
+        output_dir = (Path(__file__).resolve().parents[3] / "outputs" / "gui")
+
         self._apply_solver_diagnostics_env_for_run()
         if solver_diag_enabled:
+            diag_csv_path = output_dir / "reports" / "solver_diagnostics.csv"
             self._log.append_log(
-                "  [diag] 输出求解器诊断 CSV: "
-                "outputs/gui/reports/solver_diagnostics.csv"
+                f"  [diag] 输出求解器诊断 CSV: {diag_csv_path}"
             )
 
         try:
@@ -1500,7 +1590,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mesh=self._generated_mesh,
                 config=config,
                 n_layers=self._actual_layers,
-                output_dir=Path("outputs/gui"),
+                output_dir=output_dir,
                 use_cpp=_cpp_ready,
                 solver_diagnostics_enabled=solver_diag_enabled,
             )

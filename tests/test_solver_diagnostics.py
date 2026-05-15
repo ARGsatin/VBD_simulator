@@ -96,7 +96,7 @@ class SolverDiagnosticsTests(unittest.TestCase):
             layer_id_per_vertex=np.array([0, 1], dtype=int),
             layer_id_per_tet=np.zeros(0, dtype=int),
             first_active_layer=np.array([0, 1], dtype=int),
-            is_top_surface_of_layer=np.array([0, 1], dtype=int),
+            is_top_surface_of_layer=np.array([1, 2], dtype=int),
         )
         mesh.active_vertex_mask[:] = True
         mesh.czm_state[:] = [CZMState.FIXED, CZMState.FREE]
@@ -114,6 +114,21 @@ class SolverDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(diag.bottom_count, 1)
         self.assertEqual(diag.czm_counts, "fixed:0,damaging:0,free:1")
+
+    def test_prepare_solver_diagnostics_csv_replaces_stale_header(self) -> None:
+        from hydrogel_vbd.solver.diagnostics import (
+            SolverStepDiagnostics,
+            prepare_solver_diagnostics_csv,
+        )
+
+        out = ROOT / "outputs" / "test_solver_diagnostics_stale.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("layer_id,step,call_ms\n1,1,2.0\n", encoding="utf-8")
+
+        prepare_solver_diagnostics_csv(out)
+
+        lines = out.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines, [",".join(SolverStepDiagnostics.csv_fields())])
 
     def test_diagnostic_runaway_guard_triggers_after_repeated_clipped_steps(self) -> None:
         from hydrogel_vbd.solver.diagnostics import (
@@ -152,6 +167,11 @@ class SolverDiagnosticsTests(unittest.TestCase):
             max_move_dz=float("nan"),
             max_move_norm=float("nan"),
             max_move_z=float("nan"),
+            czm_pull_max=float("nan"),
+            czm_pull_stress_max=float("nan"),
+            czm_gap_max=float("nan"),
+            czm_onset_candidates=0,
+            czm_failure_candidates=0,
             call_ms=1.0,
         )
         good = SolverStepDiagnostics(
@@ -184,6 +204,11 @@ class SolverDiagnosticsTests(unittest.TestCase):
             max_move_dz=float("nan"),
             max_move_norm=float("nan"),
             max_move_z=float("nan"),
+            czm_pull_max=float("nan"),
+            czm_pull_stress_max=float("nan"),
+            czm_gap_max=float("nan"),
+            czm_onset_candidates=0,
+            czm_failure_candidates=0,
             call_ms=1.0,
         )
 

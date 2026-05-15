@@ -38,7 +38,7 @@ class ConformalArchitectureTests(unittest.TestCase):
             for neighbor_id in neighbors:
                 self.assertNotEqual(mesh.colors[node_id], mesh.colors[neighbor_id])
 
-    def test_layer_activation_lowers_stack_to_current_layer_contact_plane(self):
+    def test_layer_activation_leaves_one_layer_gap_above_fixed_fep(self):
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
 
@@ -54,17 +54,65 @@ class ConformalArchitectureTests(unittest.TestCase):
         mesh.velocities[:] = 3.0
 
         LayerActivator().activate_with_inheritance(
-            mesh, current_layer=1, z_fep=layer_thickness
+            mesh, current_layer=1, z_fep=0.0
         )
 
-        np.testing.assert_allclose(mesh.vertices[current_bottom, 2], layer_thickness)
-        np.testing.assert_allclose(mesh.vertices[previous_bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.vertices[current_bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.vertices[previous_bottom, 2], layer_thickness)
         np.testing.assert_allclose(mesh.velocities[active_before], 0.0)
         new_nodes = np.flatnonzero(mesh.first_active_layer == 1)
         self.assertGreater(len(new_nodes), 0)
         np.testing.assert_allclose(mesh.velocities[new_nodes], 0.0)
-        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] >= layer_thickness))
-        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] <= mesh.ideal_vertices[new_nodes, 2]))
+        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] >= 0.0))
+        self.assertTrue(np.all(mesh.vertices[new_nodes, 2] <= layer_thickness))
+
+    def test_top_down_activation_keeps_fixed_fep_and_platform_surface(self):
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+
+        layer_thickness = 0.05
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=3, layer_thickness=layer_thickness
+        )
+        activator = LayerActivator()
+
+        activator.activate_with_inheritance(mesh, current_layer=0, z_fep=0.0)
+        first_bottom = mesh.bottom_nodes(0)
+        platform = mesh.top_nodes(0)
+
+        np.testing.assert_allclose(
+            mesh.ideal_vertices[first_bottom, 2],
+            2.0 * layer_thickness,
+        )
+        np.testing.assert_allclose(mesh.vertices[first_bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.vertices[platform, 2], layer_thickness)
+        np.testing.assert_array_equal(np.flatnonzero(mesh.is_top_fixed), platform)
+
+        activator.activate_with_inheritance(mesh, current_layer=1, z_fep=0.0)
+        second_bottom = mesh.bottom_nodes(1)
+
+        np.testing.assert_allclose(
+            mesh.ideal_vertices[second_bottom, 2],
+            layer_thickness,
+        )
+        np.testing.assert_allclose(mesh.vertices[second_bottom, 2], 0.0)
+        np.testing.assert_allclose(mesh.vertices[first_bottom, 2], layer_thickness)
+        np.testing.assert_allclose(mesh.vertices[platform, 2], 2.0 * layer_thickness)
+        np.testing.assert_array_equal(np.flatnonzero(mesh.is_top_fixed), platform)
+
+    def test_activation_forces_platform_surface_active_on_first_layer(self):
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+
+        mesh, _ = ConformalMeshPipeline.create_demo(layers=2, layer_thickness=0.05)
+        platform = mesh.top_nodes(0)
+        self.assertGreater(len(platform), 0)
+        mesh.first_active_layer[platform] = 1
+
+        LayerActivator().activate_with_inheritance(mesh, current_layer=0, z_fep=0.0)
+
+        lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
+        np.testing.assert_array_equal(lifting_top, platform)
 
 
 if __name__ == "__main__":

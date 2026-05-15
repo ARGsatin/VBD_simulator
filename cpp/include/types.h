@@ -43,6 +43,7 @@ struct SolverConfig {
     double K_czm = 1e7;
     double delta_f = 1e-4;
     double node_area = 1e-8;
+    bool enable_czm = true;
     double z_fep = 0.0;
 
     // 流体拖曳

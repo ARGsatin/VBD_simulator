@@ -474,7 +474,7 @@ class MeshState:
         np.ndarray
             底面节点索引数组。
         """
-        return np.flatnonzero(self.is_top_surface_of_layer == layer_id)
+        return np.flatnonzero(self.is_top_surface_of_layer == layer_id + 1)
 
     def top_nodes(self, layer_id: int) -> np.ndarray:
         """获取指定层顶面节点的索引。
@@ -489,7 +489,7 @@ class MeshState:
         np.ndarray
             顶面节点索引数组。
         """
-        return np.flatnonzero(self.is_top_surface_of_layer == layer_id + 1)
+        return np.flatnonzero(self.is_top_surface_of_layer == layer_id)
 
     def layer_interface_nodes(self, interface_id: int) -> np.ndarray:
         """获取指定层面（接口）上的所有节点索引。

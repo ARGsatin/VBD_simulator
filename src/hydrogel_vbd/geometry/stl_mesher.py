@@ -80,6 +80,68 @@ from hydrogel_vbd.core.state import MeshState
 # ---------------------------------------------------------------------------
 _STL_UNIT_SCALE = 0.001  # mm → m（trimesh 加载时自动应用）
 
+PRINT_Z_AXIS_MAP: dict[str, tuple[int, int, int, float, float, float]] = {
+    "x": (2, 1, 0, -1.0, 1.0, 1.0),
+    "-x": (2, 1, 0, 1.0, 1.0, -1.0),
+    "y": (0, 2, 1, 1.0, -1.0, 1.0),
+    "-y": (0, 2, 1, 1.0, 1.0, -1.0),
+    "z": (0, 1, 2, 1.0, 1.0, 1.0),
+    "-z": (0, 1, 2, 1.0, -1.0, -1.0),
+}
+
+
+def transform_points_to_print_z(
+    points: np.ndarray,
+    print_z_axis: str = "z",
+) -> np.ndarray:
+    """Return points with the selected model axis mapped to simulation Z."""
+    axis = str(print_z_axis or "z").lower()
+    if axis not in PRINT_Z_AXIS_MAP:
+        raise ValueError(f"unsupported print_z_axis: {print_z_axis!r}")
+    x_axis, y_axis, z_axis, x_sign, y_sign, z_sign = PRINT_Z_AXIS_MAP[axis]
+    if axis == "z":
+        return np.asarray(points, dtype=float)
+
+    arr = np.asarray(points, dtype=float)
+    out = arr.copy()
+    out[:, 0] = x_sign * arr[:, x_axis]
+    out[:, 1] = y_sign * arr[:, y_axis]
+    out[:, 2] = z_sign * arr[:, z_axis]
+    return out
+
+
+def _apply_gmsh_print_z_transform(print_z_axis: str) -> None:
+    """Rotate imported Gmsh geometry so the selected model axis becomes Z."""
+    axis = str(print_z_axis or "z").lower()
+    if axis == "z":
+        return
+    if axis == "-z":
+        gmsh.model.occ.rotate(
+            gmsh.model.occ.getEntities(dim=-1), 0, 0, 0, 1, 0, 0, math.pi
+        )
+        return
+    if axis == "x":
+        angle = -math.pi / 2.0
+    elif axis == "-x":
+        angle = math.pi / 2.0
+    elif axis == "y":
+        angle = math.pi / 2.0
+    elif axis == "-y":
+        angle = -math.pi / 2.0
+    else:
+        raise ValueError(f"unsupported print_z_axis: {print_z_axis!r}")
+    rotate_axis = (0, 1, 0) if axis.endswith("x") else (1, 0, 0)
+    gmsh.model.occ.rotate(
+        gmsh.model.occ.getEntities(dim=-1),
+        0,
+        0,
+        0,
+        rotate_axis[0],
+        rotate_axis[1],
+        rotate_axis[2],
+        angle,
+    )
+
 # ---------------------------------------------------------------------------
 # Gmsh 可用性检测
 # ---------------------------------------------------------------------------
@@ -230,14 +292,15 @@ def _classify_points_to_layers(
         每个顶点最近的上层界面编号。
     """
     rel_z = z_coords - z_min
-    # 首次激活层 = floor(rel_z / layer_thickness)
-    layer_id = np.clip(
+    geometric_layer = np.clip(
         np.floor(rel_z / layer_thickness).astype(int), 0, n_layers - 1
     )
+    layer_id = n_layers - 1 - geometric_layer
     # 所属界面编号 = round(rel_z / layer_thickness) → 0..n_layers
-    interface_id = np.clip(
+    geometric_interface = np.clip(
         np.round(rel_z / layer_thickness).astype(int), 0, n_layers
     )
+    interface_id = n_layers - geometric_interface
     return layer_id, interface_id
 
 
@@ -266,9 +329,10 @@ def _classify_tets_to_layers(
         每个四面体的层号。
     """
     rel_z = tet_centroids_z - z_min
-    layer_id = np.clip(
+    geometric_layer = np.clip(
         np.floor(rel_z / layer_thickness).astype(int), 0, n_layers - 1
     )
+    layer_id = n_layers - 1 - geometric_layer
     return layer_id
 
 
@@ -344,18 +408,19 @@ def _classify_occ_vertices(
 
         if k == 0:
             # 底面（surface 0）—— 第一层即激活
-            first_active_layer[on_interface] = 0
-            is_top_surface_of_layer[on_interface] = 0
-        elif k == n_layers:
-            # 顶面（surface n_layers）—— 由最后一层激活
             first_active_layer[on_interface] = n_layers - 1
             is_top_surface_of_layer[on_interface] = n_layers
+        elif k == n_layers:
+            # 顶面（surface n_layers）—— 由最后一层激活
+            first_active_layer[on_interface] = 0
+            is_top_surface_of_layer[on_interface] = 0
         else:
             # 内部切割平面（interface k）
             # 该平面上的顶点是 layer k-1 的顶面，也是 layer k 的底面
             # 因此当 layer k-1 被激活时即应被激活
-            first_active_layer[on_interface] = k - 1
-            is_top_surface_of_layer[on_interface] = k
+            interface_id = n_layers - k
+            first_active_layer[on_interface] = max(interface_id - 1, 0)
+            is_top_surface_of_layer[on_interface] = interface_id
 
         classified[on_interface] = True
 
@@ -363,11 +428,11 @@ def _classify_occ_vertices(
     interior = ~classified
     if np.any(interior):
         interior_rel_z = rel_z[interior]
-        layer_ids = np.clip(
+        geometric_layer_ids = np.clip(
             np.floor(interior_rel_z / layer_thickness_m).astype(int),
             0, n_layers - 1,
         )
-        first_active_layer[interior] = layer_ids
+        first_active_layer[interior] = n_layers - 1 - geometric_layer_ids
         # 内部顶点的 is_top_surface_of_layer 保持 -1（不属于任何层面）
 
     return first_active_layer, is_top_surface_of_layer
@@ -433,12 +498,22 @@ class OCCFragmentMesher:
         resolution: float = 0.02,
         quality_factor: float = 1.0,
         max_points: int = 30000,
+        print_z_axis: str = "z",
     ) -> None:
         self.stl_path = stl_path
         self.layer_thickness = float(layer_thickness)
         self.resolution = max(float(resolution), 0.001)
         self.quality_factor = float(quality_factor)
         self.max_points = int(max_points)
+        self.print_z_axis = str(print_z_axis or "z").lower()
+        self._gmsh_print_z_aligned = False
+
+    def _align_gmsh_to_print_z(self) -> None:
+        self._gmsh_print_z_aligned = False
+        if self.print_z_axis != "z":
+            _apply_gmsh_print_z_transform(self.print_z_axis)
+            gmsh.model.occ.synchronize()
+            self._gmsh_print_z_aligned = True
 
     # ------------------------------------------------------------------
     # 辅助：检测文件格式
@@ -525,6 +600,7 @@ class OCCFragmentMesher:
             cfg.layer_thickness = self.layer_thickness
 
         layer_thickness_m = float(cfg.layer_thickness)
+        self._gmsh_print_z_aligned = False
 
         # ── 标准非结构化网格：跳过切片，直接自由四面体剖分 ──
         if algo_type == "standard":
@@ -621,6 +697,8 @@ class OCCFragmentMesher:
             )
 
         gmsh.model.occ.synchronize()
+        if self.print_z_axis != "z":
+            self._align_gmsh_to_print_z()
 
         # ── 2. 动态筛选 3D 实体（volumes）──
         all_entities = gmsh.model.occ.getEntities(dim=-1)
@@ -816,10 +894,18 @@ class OCCFragmentMesher:
             bbox = None
 
         if bbox and len(bbox) >= 6:
-            x_min, y_min, z_min_mm = bbox[0], bbox[1], bbox[2]
-            _x_max, _y_max, z_max_mm = bbox[3], bbox[4], bbox[5]
-            z_min_m = z_min_mm * _STL_UNIT_SCALE
-            z_max_m = z_max_mm * _STL_UNIT_SCALE
+            corners = np.array(
+                [
+                    [x, y, z]
+                    for x in (bbox[0], bbox[3])
+                    for y in (bbox[1], bbox[4])
+                    for z in (bbox[2], bbox[5])
+                ],
+                dtype=float,
+            ) * _STL_UNIT_SCALE
+            corners = transform_points_to_print_z(corners, self.print_z_axis)
+            z_min_m = float(np.min(corners[:, 2]))
+            z_max_m = float(np.max(corners[:, 2]))
             extent_z_m = z_max_m - z_min_m
         else:
             # 回退方案：使用 trimesh 加载 STL 获取包围盒
@@ -834,6 +920,9 @@ class OCCFragmentMesher:
                         raise ValueError("STL 场景中无几何体")
                 if isinstance(loaded, trimesh.Trimesh):
                     loaded.vertices *= _STL_UNIT_SCALE
+                    loaded.vertices = transform_points_to_print_z(
+                        loaded.vertices, self.print_z_axis
+                    )
                     z_min_m = float(np.min(loaded.vertices[:, 2]))
                     z_max_m = float(np.max(loaded.vertices[:, 2]))
                     extent_z_m = z_max_m - z_min_m
@@ -939,6 +1028,8 @@ class OCCFragmentMesher:
         # 坐标重塑为 (N, 3)，单位 mm → m
         vertices_mm = node_coords_flat.reshape(-1, 3)
         vertices = vertices_mm * _STL_UNIT_SCALE  # mm → m
+        if not self._gmsh_print_z_aligned:
+            vertices = transform_points_to_print_z(vertices, self.print_z_axis)
 
         # ── 构建 Gmsh 节点标签 → 数组索引映射 ──
         tag_to_idx: dict[int, int] = {}
@@ -1085,6 +1176,8 @@ class OCCFragmentMesher:
                         f"无法导入 STEP 模型: {self.stl_path}"
                     )
                 gmsh.model.occ.synchronize()
+                if self.print_z_axis != "z":
+                    self._align_gmsh_to_print_z()
             else:
                 # STL → GEO/Merge 导入
                 import warnings as _w
@@ -1102,8 +1195,20 @@ class OCCFragmentMesher:
                         dim=-1, tag=-1
                     )
                     if bbox and len(bbox) >= 6:
-                        z_min_m = bbox[2] * _STL_UNIT_SCALE
-                        z_max_m = bbox[5] * _STL_UNIT_SCALE
+                        corners = np.array(
+                            [
+                                [x, y, z]
+                                for x in (bbox[0], bbox[3])
+                                for y in (bbox[1], bbox[4])
+                                for z in (bbox[2], bbox[5])
+                            ],
+                            dtype=float,
+                        ) * _STL_UNIT_SCALE
+                        corners = transform_points_to_print_z(
+                            corners, self.print_z_axis
+                        )
+                        z_min_m = float(np.min(corners[:, 2]))
+                        z_max_m = float(np.max(corners[:, 2]))
                         extent_z_m = z_max_m - z_min_m
                     else:
                         raise ValueError("BBox 不完整")
@@ -1120,6 +1225,9 @@ class OCCFragmentMesher:
                                 raise ValueError("STL 场景中无几何体")
                         if isinstance(loaded, trimesh.Trimesh):
                             loaded.vertices *= _STL_UNIT_SCALE
+                            loaded.vertices = transform_points_to_print_z(
+                                loaded.vertices, self.print_z_axis
+                            )
                             z_min_m = float(np.min(loaded.vertices[:, 2]))
                             z_max_m = float(np.max(loaded.vertices[:, 2]))
                             extent_z_m = z_max_m - z_min_m
@@ -1238,6 +1346,7 @@ class OCCFragmentMesher:
             resolution=self.resolution,
             quality_factor=self.quality_factor,
             max_points=self.max_points,
+            print_z_axis=self.print_z_axis,
         )
         return fallback.build_layered_mesh(cfg)
 
@@ -1288,12 +1397,14 @@ class DelaunayTetMesher:
         resolution: float = 0.02,
         quality_factor: float = 1.0,
         max_points: int = 30000,
+        print_z_axis: str = "z",
     ) -> None:
         self.stl_path = stl_path
         self.layer_thickness = float(layer_thickness)
         self.resolution = max(float(resolution), 0.001)
         self.quality_factor = float(quality_factor)
         self.max_points = int(max_points)
+        self.print_z_axis = str(print_z_axis or "z").lower()
         self._mesh: Any = None  # trimesh 对象
 
     def _load(self) -> None:
@@ -1321,6 +1432,9 @@ class DelaunayTetMesher:
                 "Expected trimesh.Trimesh."
             )
         loaded.vertices *= _STL_UNIT_SCALE
+        loaded.vertices = transform_points_to_print_z(
+            loaded.vertices, self.print_z_axis
+        )
         self._mesh = loaded
 
     @property
@@ -1671,11 +1785,13 @@ class STLMesher:
         layer_thickness: float = 5e-5,
         resolution: float = 0.02,
         max_points: int = 50000,
+        print_z_axis: str = "z",
     ) -> None:
         self._stl_path = stl_path
         self._layer_thickness = float(layer_thickness)
         self._resolution = float(resolution)
         self._max_points = int(max_points)
+        self._print_z_axis = str(print_z_axis or "z").lower()
 
     @property
     def stl_path(self) -> str:
@@ -1716,6 +1832,7 @@ class STLMesher:
                     layer_thickness=self._layer_thickness,
                     resolution=self._resolution,
                     max_points=self._max_points,
+                    print_z_axis=self._print_z_axis,
                 )
                 return occ_mesher.build_layered_mesh(config)
             except Exception:
@@ -1728,6 +1845,7 @@ class STLMesher:
             layer_thickness=self._layer_thickness,
             resolution=self._resolution,
             max_points=self._max_points,
+            print_z_axis=self._print_z_axis,
         ).build_layered_mesh(config)
 
 
@@ -1783,6 +1901,7 @@ def create_demo_or_stl(
                 layer_thickness=layer_thickness,
                 resolution=resolution,
                 max_points=kwargs.get('max_points', 30000),
+                print_z_axis=kwargs.get("print_z_axis", "z"),
             )
             return mesher.build_layered_mesh(config)
         else:
@@ -1798,6 +1917,7 @@ def create_demo_or_stl(
                 layer_thickness=layer_thickness,
                 resolution=resolution,
                 max_points=kwargs.get('max_points', 30000),
+                print_z_axis=kwargs.get("print_z_axis", "z"),
             )
             return mesher.build_layered_mesh(config)
 

@@ -111,7 +111,7 @@ def _expected_lift_steps(lift_max: float, lift_step: float) -> int:
 
 
 def _layer_contact_z(config: Any, layer_id: int) -> float:
-    return float(config.z_fep) + int(layer_id) * float(config.layer_thickness)
+    return float(config.z_fep)
 
 
 def _validate_lift_plan(
@@ -230,6 +230,7 @@ def _run_simulation(
         SolverRunawayGuard,
         SolverStepDiagnostics,
         diagnostics_enabled,
+        prepare_solver_diagnostics_csv,
         write_solver_diagnostics_csv,
     )
     from hydrogel_vbd.solver.vbd_solver import VBDSolveResult, _normal_pull_from_terms
@@ -272,8 +273,22 @@ def _run_simulation(
 
     _trace("subprocess_simulation_start")
     _trace(f"subprocess_cpp_available=True n_layers={n_layers}")
+    _trace(
+        f"config enable_czm={getattr(config, 'enable_czm', True)} "
+        f"rho_cheb={getattr(config, 'rho_cheb', None)}"
+    )
     _trace(f"subprocess_runtime threads={runtime_info['threads']}")
+    _trace("cpp_line_search=True")
     conn.send(_LogMsg(text=f"  [C++] module {cpp_module_info()}"))
+    conn.send(_LogMsg(text="  [debug] cpp_line_search=True"))
+    conn.send(
+        _LogMsg(
+            text=(
+                f"  [debug] enable_czm={getattr(config, 'enable_czm', True)}, "
+                f"rho_cheb={getattr(config, 'rho_cheb', None)}"
+            )
+        )
+    )
 
     diag_enabled = (
         diagnostics_enabled()
@@ -286,6 +301,10 @@ def _run_simulation(
         if diag_stride_override is None
         else max(1, int(diag_stride_override))
     )
+    conn.send(_LogMsg(text=f"  [diag] solver CSV enabled={diag_enabled} path={diag_path}"))
+    if diag_enabled:
+        prepare_solver_diagnostics_csv(diag_path)
+        _trace(f"diagnostic_csv_prepared path={diag_path}")
     diag_guard = SolverRunawayGuard(
         limit=50, max_iters=int(config.max_iters), dx_clip=DX_CLIP_DIAGNOSTIC
     )
@@ -311,6 +330,7 @@ def _run_simulation(
         result: Any,
         call_ms: float,
         x_before: np.ndarray | None = None,
+        czm_pull: np.ndarray | None = None,
     ) -> bool:
         nonlocal diag_stopped
         if not diag_enabled:
@@ -327,6 +347,10 @@ def _run_simulation(
             dx_clip=DX_CLIP_DIAGNOSTIC,
             z_fep=_layer_contact_z(config, layer_id),
             x_before=x_before,
+            czm_pull=czm_pull,
+            czm_area=config.node_area,
+            czm_t_max=config.T_max,
+            czm_delta_f=config.delta_f,
         )
         write_solver_diagnostics_csv(diag_path, [diag])
         if diag_guard.observe(diag):
@@ -424,7 +448,7 @@ def _run_simulation(
             )
             # CZM 更新（提升后）
             bottom = mesh.bottom_nodes(layer_id)
-            if len(bottom) > 0:
+            if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
                 terms_after = build_local_physics_terms(
                     mesh, layer_config, e_z=e_z, x_prev=x_before_solve,
                     layer_id=layer_id,
@@ -475,7 +499,8 @@ def _run_simulation(
                 result = cpp_solve_lift_and_relax(
                     mesh, layer_config, e_z, layer_id, top_ids,
                 )
-                if len(bottom) > 0:
+                pull_after = None
+                if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
                     mesh.czm_state[bottom] = bottom_state
                     mesh.damage[bottom] = bottom_damage
                     mesh.time_free[bottom] = bottom_time_free
@@ -483,10 +508,11 @@ def _run_simulation(
                         mesh, layer_config, e_z=e_z, x_prev=x_before_solve,
                         layer_id=layer_id,
                     )
+                    pull_after = _normal_pull_from_terms(terms_after.force, bottom)
                     update_czm_states(
                         mesh,
                         bottom,
-                        internal_pull_z=_normal_pull_from_terms(terms_after.force, bottom),
+                        internal_pull_z=pull_after,
                         area=layer_config.node_area,
                         t_max=layer_config.T_max,
                         k_czm=layer_config.K_czm,
@@ -521,6 +547,7 @@ def _run_simulation(
                         result,
                         call_elapsed * 1000.0,
                         x_before_solve,
+                        pull_after,
                     ):
                         break
                 step_counter += result.iterations
@@ -530,7 +557,7 @@ def _run_simulation(
                     break
 
                 # 全部脱膜则退出提升循环
-                if result.all_free:
+                if result.all_free and bool(getattr(layer_config, "enable_czm", True)):
                     _raise_if_detached_before_convergence(
                         layer_id, layer_steps, result, config
                     )

@@ -105,6 +105,11 @@ class SolverStepDiagnostics:
     max_move_dz: float
     max_move_norm: float
     max_move_z: float
+    czm_pull_max: float
+    czm_pull_stress_max: float
+    czm_gap_max: float
+    czm_onset_candidates: int
+    czm_failure_candidates: int
     call_ms: float
 
     @classmethod
@@ -139,6 +144,11 @@ class SolverStepDiagnostics:
             "max_move_dz",
             "max_move_norm",
             "max_move_z",
+            "czm_pull_max",
+            "czm_pull_stress_max",
+            "czm_gap_max",
+            "czm_onset_candidates",
+            "czm_failure_candidates",
             "call_ms",
         ]
 
@@ -157,6 +167,10 @@ class SolverStepDiagnostics:
         dx_clip: float = DX_CLIP_DIAGNOSTIC,
         z_fep: float | None = None,
         x_before: np.ndarray | None = None,
+        czm_pull: np.ndarray | None = None,
+        czm_area: float | None = None,
+        czm_t_max: float | None = None,
+        czm_delta_f: float | None = None,
     ) -> "SolverStepDiagnostics":
         active = np.asarray(mesh.active_vertex_mask, dtype=bool)
         active_tets = np.asarray(mesh.active_tet_mask, dtype=bool)
@@ -203,6 +217,21 @@ class SolverStepDiagnostics:
             "damaging": int(np.sum(czm_mask & (czm_state == int(CZMState.DAMAGING)))),
             "free": int(np.sum(czm_mask & (czm_state == int(CZMState.FREE)))),
         }
+        (
+            czm_pull_max,
+            czm_pull_stress_max,
+            czm_gap_max,
+            czm_onset_candidates,
+            czm_failure_candidates,
+        ) = _czm_transition_diagnostics(
+            mesh,
+            bottom_nodes,
+            czm_pull=czm_pull,
+            area=czm_area,
+            t_max=czm_t_max,
+            delta_f=czm_delta_f,
+            z_fep=z_fep,
+        )
         max_dx = float(getattr(result, "max_dx", 0.0))
         return cls(
             layer_id=int(layer_id),
@@ -238,6 +267,11 @@ class SolverStepDiagnostics:
             max_move_dz=max_move_dz,
             max_move_norm=max_move_norm,
             max_move_z=max_move_z,
+            czm_pull_max=czm_pull_max,
+            czm_pull_stress_max=czm_pull_stress_max,
+            czm_gap_max=czm_gap_max,
+            czm_onset_candidates=czm_onset_candidates,
+            czm_failure_candidates=czm_failure_candidates,
             call_ms=float(call_ms),
         )
 
@@ -314,6 +348,77 @@ def _czm_state_name(mesh: MeshState, node_id: int) -> str:
         return str(value)
 
 
+def _czm_transition_diagnostics(
+    mesh: MeshState,
+    bottom_nodes: np.ndarray,
+    *,
+    czm_pull: np.ndarray | None,
+    area: float | None,
+    t_max: float | None,
+    delta_f: float | None,
+    z_fep: float | None,
+) -> tuple[float, float, float, int, int]:
+    nodes = np.asarray(bottom_nodes, dtype=int)
+    if nodes.size == 0:
+        return (float("nan"), float("nan"), float("nan"), 0, 0)
+
+    pulls = (
+        np.asarray(czm_pull, dtype=float)
+        if czm_pull is not None
+        else np.zeros(nodes.size, dtype=float)
+    )
+    if pulls.shape != (nodes.size,):
+        pulls = np.resize(pulls, nodes.size)
+
+    safe_area = max(float(area), 1e-12) if area is not None else float("nan")
+    stresses = np.abs(pulls) / safe_area if math.isfinite(safe_area) else np.full(nodes.size, np.nan)
+    z0 = float("nan") if z_fep is None else float(z_fep)
+    gaps = (
+        np.maximum(mesh.vertices[nodes, 2] - z0, 0.0)
+        if math.isfinite(z0)
+        else np.full(nodes.size, np.nan)
+    )
+    states = np.asarray(mesh.czm_state[nodes], dtype=int)
+    onset = 0
+    failure = 0
+    if t_max is not None and math.isfinite(float(t_max)):
+        onset = int(
+            np.sum(
+                (states == int(CZMState.FIXED))
+                & (
+                    (stresses > float(t_max))
+                    | (
+                        np.isfinite(gaps)
+                        & (delta_f is not None)
+                        & (gaps > float(delta_f))
+                    )
+                )
+            )
+        )
+    if delta_f is not None and math.isfinite(float(delta_f)):
+        failure = int(
+            np.sum(
+                (states == int(CZMState.DAMAGING))
+                & np.isfinite(gaps)
+                & (gaps > 5.0 * float(delta_f))
+            )
+        )
+    return (
+        _nanmax_or_nan(np.abs(pulls)),
+        _nanmax_or_nan(stresses),
+        _nanmax_or_nan(gaps),
+        onset,
+        failure,
+    )
+
+
+def _nanmax_or_nan(values: np.ndarray) -> float:
+    array = np.asarray(values, dtype=float)
+    if array.size == 0 or not np.any(np.isfinite(array)):
+        return float("nan")
+    return float(np.nanmax(array))
+
+
 def write_solver_diagnostics_csv(
     path: str | Path,
     rows: list[SolverStepDiagnostics],
@@ -330,6 +435,15 @@ def write_solver_diagnostics_csv(
             writer.writeheader()
         for row in rows:
             writer.writerow(row.as_csv_row())
+
+
+def prepare_solver_diagnostics_csv(path: str | Path) -> None:
+    """Start a diagnostic run with the current stable CSV header."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SolverStepDiagnostics.csv_fields())
+        writer.writeheader()
 
 
 class SolverRunawayGuard:

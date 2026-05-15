@@ -225,12 +225,12 @@ def neo_hookean_material_tangent_9x9(
 
     FinvT = np.linalg.inv(F).T   # F^{-T}，形状 (3,3)
     log_J = float(np.log(J))
-    coeff = lam * log_J - mu     # (λ ln(J) - μ)
+    coeff = mu - lam * log_J     # -(λ ln(J) - μ)
 
     # ── 向量化 9×9 材料切线模量 ──
     # C_{(i,j),(k,l)} = term1 + term2 + term3
     #   term1: μ · δ_{ik} · δ_{jl}
-    #   term2: (λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
+    #   term2: -(λ ln(J) - μ) · F^{-T}_{il} · F^{-T}_{kj}
     #   term3: λ · F^{-T}_{ij} · F^{-T}_{kl}
     C = mu * np.eye(9, dtype=np.float64)
 
@@ -327,7 +327,7 @@ def compute_tet_force_and_hessian_contributions(
     hessian = np.zeros((4, 3, 3), dtype=np.float64)
     for a in range(4):
         hessian[a] = rest_volume * np.einsum(
-            'n,pnsq,s->pq', g[a], C_reshaped, g[a]
+            'n,pnqs,s->pq', g[a], C_reshaped, g[a]
         )
 
     return forces, hessian

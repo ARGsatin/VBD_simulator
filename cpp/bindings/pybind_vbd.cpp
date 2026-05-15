@@ -1,9 +1,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <cmath>
 
 #include "types.h"
 #include "vbd_solver.h"
+#include "elastic_energy.h"
 
 namespace py = pybind11;
 using namespace vbd;
@@ -229,6 +232,106 @@ static py::dict solve_lift_and_relax_py(
 // ============================================================================
 // 模块定义
 // ============================================================================
+static py::tuple debug_tet_force_hessian_py(
+    py::array_t<double> vertices_in,
+    py::array_t<double> dm_inv_in,
+    double rest_volume,
+    double mu,
+    double lam)
+{
+    auto v = vertices_in.unchecked<2>();
+    auto dmi = dm_inv_in.unchecked<2>();
+
+    Eigen::Matrix<double, 4, 3> verts;
+    Eigen::Matrix3d dm_inv;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 3; ++j)
+            verts(i, j) = v(i, j);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            dm_inv(i, j) = dmi(i, j);
+
+    Eigen::Matrix<double, 4, 3> forces;
+    Eigen::Matrix<double, 4, 9> hessian_flat;
+    compute_tet_force_and_hessian_contributions(
+        verts, dm_inv, rest_volume, mu, lam, 1e8, forces, hessian_flat);
+
+    Eigen::Matrix<double, 12, 3, Eigen::RowMajor> hessian_rows;
+    for (int a = 0; a < 4; ++a)
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                hessian_rows(a * 3 + r, c) = hessian_flat(a, r * 3 + c);
+
+    return py::make_tuple(forces, hessian_rows);
+}
+
+static py::dict debug_single_tet_line_search_py(
+    py::array_t<double> vertices_in,
+    py::array_t<double> dm_inv_in,
+    double rest_volume,
+    double mu,
+    double lam,
+    int node_id,
+    py::array_t<double> dx_in,
+    double floor_z)
+{
+    auto v = vertices_in.unchecked<2>();
+    auto dmi = dm_inv_in.unchecked<2>();
+    auto dx_buf = dx_in.unchecked<1>();
+
+    Eigen::Matrix<double, 4, 3> verts;
+    Eigen::Matrix3d dm_inv;
+    Eigen::Vector3d dx;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 3; ++j)
+            verts(i, j) = v(i, j);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            dm_inv(i, j) = dmi(i, j);
+    for (int i = 0; i < 3; ++i)
+        dx(i) = dx_buf(i);
+
+    auto energy = [&]() {
+        Eigen::Matrix3d F = compute_deformation_gradient(verts, dm_inv);
+        return rest_volume * neo_hookean_energy_density(F, mu, lam, 1e8);
+    };
+
+    const Eigen::Vector3d x_saved = verts.row(node_id).transpose();
+    const double e_before = energy();
+    double alpha = 1.0;
+    bool accepted = false;
+    constexpr int max_trials = 12;
+    constexpr double min_alpha = 1.0 / 4096.0;
+    constexpr double energy_tol = 1e-10;
+
+    for (int trial = 0; trial < max_trials; ++trial) {
+        verts.row(node_id) = (x_saved + alpha * dx).transpose();
+        if (verts(node_id, 2) < floor_z) {
+            verts(node_id, 2) = floor_z;
+        }
+        const double e_after = energy();
+        if (std::isfinite(e_after) && e_after <= e_before + energy_tol) {
+            accepted = true;
+            break;
+        }
+        alpha *= 0.5;
+        if (alpha < min_alpha) break;
+    }
+
+    if (!accepted) {
+        alpha = 0.0;
+        verts.row(node_id) = x_saved.transpose();
+    }
+
+    py::dict out;
+    out["accepted"] = accepted;
+    out["alpha"] = alpha;
+    out["energy_before"] = e_before;
+    out["energy_after"] = energy();
+    out["position_after"] = verts.row(node_id).transpose();
+    return out;
+}
+
 PYBIND11_MODULE(VBD_PYBIND_MODULE_NAME, m) {
     m.doc() = "C++ accelerated VBD solver for hydrogel DLP simulation";
 
@@ -252,6 +355,7 @@ PYBIND11_MODULE(VBD_PYBIND_MODULE_NAME, m) {
         .def_readwrite("K_czm", &SolverConfig::K_czm)
         .def_readwrite("delta_f", &SolverConfig::delta_f)
         .def_readwrite("node_area", &SolverConfig::node_area)
+        .def_readwrite("enable_czm", &SolverConfig::enable_czm)
         .def_readwrite("z_fep", &SolverConfig::z_fep)
         .def_readwrite("C_0", &SolverConfig::C_0)
         .def_readwrite("eta", &SolverConfig::eta)
@@ -284,4 +388,15 @@ PYBIND11_MODULE(VBD_PYBIND_MODULE_NAME, m) {
           py::arg("config"), py::arg("e_z"), py::arg("layer_id"),
           py::arg("lifting_top"),
           "Single-step lift + relax (Python side controls time loop)");
+
+    m.def("debug_tet_force_hessian", &debug_tet_force_hessian_py,
+          py::arg("vertices"), py::arg("dm_inv"), py::arg("rest_volume"),
+          py::arg("mu"), py::arg("lam"),
+          "Debug helper: single-tet elastic force and diagonal Hessian blocks");
+
+    m.def("debug_single_tet_line_search", &debug_single_tet_line_search_py,
+          py::arg("vertices"), py::arg("dm_inv"), py::arg("rest_volume"),
+          py::arg("mu"), py::arg("lam"), py::arg("node_id"),
+          py::arg("dx"), py::arg("floor_z"),
+          "Debug helper: single-tet elastic backtracking line search");
 }
