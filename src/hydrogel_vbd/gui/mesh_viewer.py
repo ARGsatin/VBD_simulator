@@ -103,6 +103,18 @@ class MeshViewer(QtWidgets.QWidget):
         boundary_mask = counts[inverse] == 1
         return faces[boundary_mask]
 
+    @staticmethod
+    def _visible_tets(
+        tets: np.ndarray,
+        active_tet_mask: np.ndarray | None,
+    ) -> np.ndarray:
+        if active_tet_mask is None:
+            return tets
+        mask = np.asarray(active_tet_mask, dtype=bool)
+        if mask.shape != (len(tets),):
+            return tets
+        return tets[mask]
+
     def show_initial_mesh(
         self,
         vertices: np.ndarray,
@@ -204,6 +216,7 @@ class MeshViewer(QtWidgets.QWidget):
         vertices_deformed: np.ndarray,
         tets: np.ndarray,
         active_mask: np.ndarray | None = None,
+        active_tet_mask: np.ndarray | None = None,
         title: str = "变形网格",
         color_mode: str = "active",
         layer_id_per_vertex: np.ndarray | None = None,
@@ -245,11 +258,17 @@ class MeshViewer(QtWidgets.QWidget):
             return
 
         # 复用缓存的边界面（拓扑不变，避免每帧 O(N log N) 的 unique 操作）
-        if self._boundary_faces is not None:
+        visible_tets = self._visible_tets(tets, active_tet_mask)
+        if len(visible_tets) == 0:
+            self._canvas.draw_idle()
+            return
+
+        if active_tet_mask is None and self._boundary_faces is not None:
             boundary_faces = self._boundary_faces
         else:
-            boundary_faces = self._extract_boundary_faces(tets)
-            self._boundary_faces = boundary_faces
+            boundary_faces = self._extract_boundary_faces(visible_tets)
+            if active_tet_mask is None:
+                self._boundary_faces = boundary_faces
 
         # ── 根据着色模式计算面颜色 ──
         cmap_name, face_values = self._compute_face_colors(

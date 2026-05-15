@@ -370,6 +370,32 @@ class WorkerLiftControlTests(unittest.TestCase):
         config_dict = captured["config_dict"]
         self.assertEqual(config_dict["lift_multiplier"], 1.5)
 
+    def test_push_frame_includes_active_tet_mask(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=SimulationConfig(),
+            n_layers=0,
+            output_dir="outputs/gui",
+            use_cpp=False,
+        )
+        frames: list[dict] = []
+        worker.frame_ready.connect(frames.append)
+        active_tet_mask = np.array([True, False], dtype=bool)
+
+        worker._push_frame(
+            vertices=np.zeros((4, 3), dtype=float),
+            tets=np.zeros((2, 4), dtype=int),
+            active_mask=np.ones(4, dtype=bool),
+            active_tet_mask=active_tet_mask,
+            title="frame",
+        )
+
+        np.testing.assert_array_equal(frames[-1]["active_tet_mask"], active_tet_mask)
+
     def test_cpp_subprocess_config_includes_enable_czm(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
@@ -793,6 +819,29 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertFalse(win._chk_solver_diag.isChecked())
         self.assertTrue(win.isVisible() is False)
         app.quit()
+
+    def test_mesh_viewer_filters_deformed_mesh_to_active_tets(self) -> None:
+        from hydrogel_vbd.gui.mesh_viewer import MeshViewer
+
+        tets = np.array(
+            [
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+                [8, 9, 10, 11],
+            ],
+            dtype=int,
+        )
+        active_tets = np.array([False, True, False], dtype=bool)
+
+        np.testing.assert_array_equal(
+            MeshViewer._visible_tets(tets, active_tets),
+            tets[[1]],
+        )
+        self.assertEqual(
+            len(MeshViewer._visible_tets(tets, np.zeros(3, dtype=bool))),
+            0,
+        )
+        np.testing.assert_array_equal(MeshViewer._visible_tets(tets, None), tets)
 
     def test_solver_diagnostics_checkbox_controls_run_environment(self) -> None:
         from hydrogel_vbd.gui.main_window import MainWindow
@@ -1294,6 +1343,7 @@ class CppAdapterStateWritebackTests(unittest.TestCase):
             mesh.vertices[1],
             original[1] + np.array([0.0, 0.0, config.v_lift * config.dt]),
         )
+        np.testing.assert_allclose(mesh.velocities[1], 0.0)
         self.assertEqual(result.iterations, config.max_iters)
         self.assertEqual(result.max_dx, 0.002)
 

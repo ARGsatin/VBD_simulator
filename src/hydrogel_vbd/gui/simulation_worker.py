@@ -583,6 +583,7 @@ class SimulationWorker(QtCore.QObject):
                         "vertices": msg.vertices,
                         "tets": msg.tets,
                         "active_mask": msg.active_mask,
+                        "active_tet_mask": msg.active_tet_mask,
                         "title": msg.title,
                     })
                 elif isinstance(msg, _ErrorMsg):
@@ -866,6 +867,7 @@ class SimulationWorker(QtCore.QObject):
                             vertices=self._mesh.vertices.copy(),
                             tets=self._mesh.tets,
                             active_mask=self._mesh.active_vertex_mask.copy(),
+                            active_tet_mask=self._mesh.active_tet_mask.copy(),
                             title=(
                                 f"第 {layer_id + 1}/{self._n_layers} 层"
                                 f" — 提升 {lift_distance:.3e} m"
@@ -1032,6 +1034,7 @@ class SimulationWorker(QtCore.QObject):
             vertices=self._mesh.vertices.copy(),
             tets=self._mesh.tets,
             active_mask=self._mesh.active_vertex_mask.copy(),
+            active_tet_mask=self._mesh.active_tet_mask.copy(),
             title=f"仿真完成 — {self._n_layers} 层",
         )
 
@@ -1061,6 +1064,7 @@ class SimulationWorker(QtCore.QObject):
                 vertices=self._mesh.vertices.copy(),
                 tets=self._mesh.tets,
                 active_mask=self._mesh.active_vertex_mask.copy(),
+                active_tet_mask=self._mesh.active_tet_mask.copy(),
                 title=(
                     f"第 {layer_id + 1}/{self._n_layers} 层"
                     f" — 迭代 {iteration} — max_dx={max_dx:.4e}"
@@ -1081,6 +1085,7 @@ class SimulationWorker(QtCore.QObject):
         vertices: np.ndarray,
         tets: np.ndarray,
         active_mask: np.ndarray,
+        active_tet_mask: np.ndarray,
         title: str,
     ) -> None:
         """通过 signal 推送一帧 3D 渲染数据到主线程。
@@ -1100,6 +1105,7 @@ class SimulationWorker(QtCore.QObject):
             "vertices": vertices,
             "tets": tets,
             "active_mask": active_mask,
+            "active_tet_mask": active_tet_mask,
             "title": title,
         }
         self.frame_ready.emit(payload)

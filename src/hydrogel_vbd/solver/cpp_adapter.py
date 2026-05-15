@@ -487,7 +487,7 @@ def solve_lift_and_relax(
             & mesh.active_vertex_mask[valid_top]
         ]
         mesh.vertices[valid_top, 2] += lift_step
-        mesh.velocities[valid_top, 2] = float(config.v_lift)
+        mesh.velocities[valid_top] = 0.0
 
     return VBDSolveResult(
         x=mesh.vertices,

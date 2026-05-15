@@ -336,6 +336,22 @@ def _classify_tets_to_layers(
     return layer_id
 
 
+def _classify_occ_tets_to_layers(
+    tet_centroids_z: np.ndarray,
+    z_min_m: float,
+    n_layers: int,
+    layer_thickness_m: float,
+) -> np.ndarray:
+    eps_z = float(layer_thickness_m) * 1e-6
+    rel_z = np.asarray(tet_centroids_z, dtype=float) - float(z_min_m) + eps_z
+    geometric_layer = np.clip(
+        np.floor(rel_z / float(layer_thickness_m)).astype(int),
+        0,
+        int(n_layers) - 1,
+    )
+    return int(n_layers) - 1 - geometric_layer
+
+
 # ============================================================================
 # OCC Boolean Fragment 顶点分类 —— 正确处理共享接口节点
 # ============================================================================
@@ -1088,10 +1104,8 @@ class OCCFragmentMesher:
         # OCC Boolean Fragment 保证四面体完全位于单层内，不跨层
         tet_centroids = np.mean(vertices[tets], axis=1)
         tet_z = tet_centroids[:, 2]
-        eps_z = layer_thickness_m * 1e-6  # 微小偏移处理浮点边界情况
-        layer_id_per_tet = np.clip(
-            np.floor((tet_z - z_min_m + eps_z) / layer_thickness_m).astype(int),
-            0, n_layers - 1,
+        layer_id_per_tet = _classify_occ_tets_to_layers(
+            tet_z, z_min_m, n_layers, layer_thickness_m
         )
 
         # 顶点层号与表面编号（OCC Boolean Fragment 专用分类）

@@ -77,6 +77,7 @@ class _FrameMsg:
     vertices: np.ndarray
     tets: np.ndarray
     active_mask: np.ndarray
+    active_tet_mask: np.ndarray
     title: str
 
 
@@ -584,6 +585,11 @@ def _run_simulation(
                             mesh.active_vertex_mask.copy()
                             if mesh.active_vertex_mask is not None
                             else np.zeros(v.shape[0] if v is not None else 0, dtype=bool)
+                        ),
+                        active_tet_mask=(
+                            mesh.active_tet_mask.copy()
+                            if mesh.active_tet_mask is not None
+                            else np.zeros(t.shape[0] if t is not None else 0, dtype=bool)
                         ),
                         title=f"第 {layer_id + 1} 层 — 步 {layer_steps}",
                     ))

@@ -1727,6 +1727,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vertices: np.ndarray = payload["vertices"]
         tets: np.ndarray | None = payload.get("tets")
         active_mask: np.ndarray = payload["active_mask"]
+        active_tet_mask: np.ndarray | None = payload.get("active_tet_mask")
         title: str = payload.get("title", "")
 
         if self._anim_tets is None and tets is not None:
@@ -1737,7 +1738,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._is_rendering_worker_frame = True
             try:
                 self._viewer.show_deformed_mesh(
-                    vertices, tets, active_mask, title=title,
+                    vertices,
+                    tets,
+                    active_mask,
+                    active_tet_mask=active_tet_mask,
+                    title=title,
                 )
             finally:
                 self._is_rendering_worker_frame = False
@@ -1755,6 +1760,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.animation_frames.append({
             "vertices": vertices.copy(),
             "active_mask": active_mask.copy(),
+            "active_tet_mask": (
+                active_tet_mask.copy() if active_tet_mask is not None else None
+            ),
             "title": title,
             "layer_id": lid,
         })
@@ -1995,6 +2003,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frame["vertices"],
             self._anim_tets,
             frame["active_mask"],
+            active_tet_mask=frame.get("active_tet_mask"),
             title=f"🔁 回放 — {frame['title']}",
         )
 
@@ -2069,6 +2078,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         frame["vertices"],
                         self._anim_tets,
                         frame["active_mask"],
+                        active_tet_mask=frame.get("active_tet_mask"),
                         title=f"🔁 回放 — {frame['title']}",
                     )
             if self._anim_frame_label is not None:
@@ -2331,6 +2341,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frame["vertices"],
             tets,
             frame["active_mask"],
+            active_tet_mask=frame.get("active_tet_mask"),
             title=(
                 f"📽 DVR 定位 — 第 {target_layer + 1} 层"
                 f" — {frame['title']}"

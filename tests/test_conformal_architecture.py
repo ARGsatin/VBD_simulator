@@ -114,6 +114,20 @@ class ConformalArchitectureTests(unittest.TestCase):
         lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
         np.testing.assert_array_equal(lifting_top, platform)
 
+    def test_occ_tet_layer_classifier_matches_top_down_print_order(self):
+        from hydrogel_vbd.geometry.stl_mesher import _classify_occ_tets_to_layers
+
+        tet_z = np.array([0.0005, 0.0015, 0.0025], dtype=float)
+
+        layer_id = _classify_occ_tets_to_layers(
+            tet_z,
+            z_min_m=0.0,
+            n_layers=3,
+            layer_thickness_m=0.001,
+        )
+
+        np.testing.assert_array_equal(layer_id, np.array([2, 1, 0], dtype=int))
+
 
 if __name__ == "__main__":
     unittest.main()
