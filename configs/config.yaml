@@ -2,7 +2,7 @@ g: [0, 0, -9.81]
 rho: 1050.0
 mu: 50000.0
 kappa: 1.0e7
-k_d: 0.5
+k_d: 0.01
 c_shrink: 0.98
 T_max: 5000.0
 K_czm: 1.0e8
@@ -13,8 +13,8 @@ d_fluid_max: 2.0e-3
 t_fluid_max: 0.5
 dt: 0.01
 epsilon: 1.0e-6
-max_iters: 20
-N_stable: 10
+max_iters: 50
+N_stable: 3
 rho_cheb: 0.95
 c_init: 0.1
 err_target: 5.0e-4
@@ -26,7 +26,7 @@ E_max: 500.0
 layer_thickness: 5e-5
 lift_multiplier: 1.5
 z_fep: 0.0
-v_lift: 0.001
+v_lift: 0.01
 C_0: 1.0
 fluid_radius: 0.001
 node_area: 1e-6

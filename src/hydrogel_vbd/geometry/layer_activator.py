@@ -75,6 +75,24 @@ class LayerActivator:
         return float(np.median(diffs)) if len(diffs) else 0.0
 
     @staticmethod
+    def _reset_reference_for_tets(mesh: MeshState, tet_ids: np.ndarray) -> None:
+        if mesh.tets is None or mesh.dm_inv is None or mesh.tet_volumes is None:
+            return
+        for tet_id in np.asarray(tet_ids, dtype=int):
+            if tet_id < 0 or tet_id >= mesh.tets.shape[0]:
+                continue
+            tet = mesh.tets[tet_id]
+            p0, p1, p2, p3 = mesh.vertices[tet]
+            matrix = np.column_stack((p1 - p0, p2 - p0, p3 - p0))
+            det = float(np.linalg.det(matrix))
+            if abs(det) <= 1e-12:
+                continue
+            if mesh.dm is not None:
+                mesh.dm[tet_id] = matrix
+            mesh.dm_inv[tet_id] = np.linalg.inv(matrix)
+            mesh.tet_volumes[tet_id] = abs(det) / 6.0
+
+    @staticmethod
     def _lower_active_stack_to_contact(
         mesh: MeshState,
         current_layer: int,
@@ -161,15 +179,17 @@ class LayerActivator:
           其余节点为 ``FREE``。
         * ``is_top_fixed`` 掩码在每个新层激活时被重新覆盖。
         """
+        active_before = np.asarray(mesh.active_vertex_mask, dtype=bool).copy()
         self._lower_active_stack_to_contact(mesh, current_layer, z_fep)
 
         # ── 激活新层 ──
         mesh.activate_layer(current_layer)
 
         # ── 获取新激活节点的各子集 ──
-        new_nodes = np.flatnonzero(
+        born_nodes = np.flatnonzero(
             mesh.first_active_layer == current_layer
         )
+        new_nodes = born_nodes
         top = mesh.top_nodes(current_layer)       # 新层顶层（平台夹持面）
         bottom = mesh.bottom_nodes(current_layer)  # 新层底面（离型膜接触面）
         if len(top) == 0:
@@ -184,7 +204,13 @@ class LayerActivator:
 
         if len(bottom):
             dz_new = float(z_fep) - float(np.median(mesh.ideal_vertices[bottom, 2]))
-            mesh.vertices[new_nodes, 2] = mesh.ideal_vertices[new_nodes, 2] + dz_new
+            coordinate_nodes = np.union1d(born_nodes, bottom)
+            if len(top):
+                fresh_top = top[~active_before[top]]
+                coordinate_nodes = np.union1d(coordinate_nodes, fresh_top)
+            mesh.vertices[coordinate_nodes, 2] = (
+                mesh.ideal_vertices[coordinate_nodes, 2] + dz_new
+            )
             mesh.vertices[bottom, 2] = z_fep
 
         # ── 内部节点：z 钳位在 [z_fep, ideal_z] ──
@@ -193,6 +219,9 @@ class LayerActivator:
         )
         for idx in interior:
             mesh.vertices[idx, 2] = max(mesh.vertices[idx, 2], z_fep)
+
+        layer_tets = np.flatnonzero(mesh.layer_id_per_tet == current_layer)
+        self._reset_reference_for_tets(mesh, layer_tets)
 
         # ── 重置运动学状态 ──
         mesh.velocities[new_nodes] = 0.0

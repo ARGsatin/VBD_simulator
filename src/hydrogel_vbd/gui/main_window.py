@@ -45,6 +45,7 @@ from hydrogel_vbd.geometry.layer_activator import LayerActivator
 from hydrogel_vbd.geometry.stl_mesher import (
     create_demo_or_stl,
     STLMesher,
+    _effective_top_down_layer_count,
     transform_points_to_print_z,
 )
 from hydrogel_vbd.io.report_writer import write_metrics_csv
@@ -85,18 +86,18 @@ class _ElectricFieldPlotData:
 _PARAM_META: list[dict[str, Any]] = [
     {"key": "mu", "label": "剪切模量 μ (Pa)", "default": 5000.0, "min": 500.0, "max": 1e6},
     {"key": "kappa", "label": "体积模量 κ (Pa)", "default": 25000.0, "min": 2000.0, "max": 1e7},
-    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.8, "min": 0.0, "max": 1.0},
-    {"key": "c_shrink", "label": "收缩因子 c_shrink", "default": 0.98, "min": 0.8, "max": 1.0},
+    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.01, "min": 0.0, "max": 1.0},
+    {"key": "c_shrink", "label": "收缩因子 c_shrink", "default": 1.0, "min": 0.8, "max": 1.0},
     {"key": "T_max", "label": "最大附着力 T_max (Pa)", "default": 3000.0, "min": 100.0, "max": 50000.0},
     {"key": "K_czm", "label": "CZM 刚度 (Pa/m)", "default": 1.0e7, "min": 1e6, "max": 1e10},
     {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 5.0e-4, "min": 1e-6, "max": 1e-2},
     {"key": "node_area", "label": "CZM node area (m^2)", "default": 1.0e-6, "min": 1e-10, "max": 1e-3},
     {"key": "dt", "label": "时间步长 dt (s)", "default": 0.001, "min": 0.0001, "max": 0.05},
-    {"key": "max_iters", "label": "最大迭代次数", "default": 20, "min": 5, "max": 200},
-    {"key": "N_stable", "label": "稳定步数判决", "default": 10, "min": 2, "max": 50},
-    {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.10, "min": 0.01, "max": 10.0},
+    {"key": "max_iters", "label": "最大迭代次数", "default": 50, "min": 5, "max": 200},
+    {"key": "N_stable", "label": "稳定步数判决", "default": 3, "min": 2, "max": 50},
+    {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.7993, "min": 0.01, "max": 10.0},
     {"key": "lift_multiplier", "label": "提升距离倍数", "default": 1.5, "min": 0.1, "max": 5.0},
-    {"key": "v_lift", "label": "提升速度 (m/s)", "default": 0.001, "min": 0.0, "max": 0.01},
+    {"key": "v_lift", "label": "提升速度 (m/s)", "default": 0.01, "min": 0.0, "max": 0.01},
     {"key": "K_p", "label": "PID K_p", "default": 150.0, "min": 0.0, "max": 1000.0},
     {"key": "K_i", "label": "PID K_i", "default": 20.0, "min": 0.0, "max": 200.0},
     {"key": "K_d", "label": "PID K_d", "default": 5.0, "min": 0.0, "max": 100.0},
@@ -1060,7 +1061,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         model_height = z_max - z_min
         lt_m = self._layer_thickness_m
-        self._actual_layers = max(1, int(np.ceil(model_height / lt_m)))
+        self._actual_layers = _effective_top_down_layer_count(
+            model_height,
+            lt_m,
+        )
 
         # 分辨率自适应：根据 XY 包围盒面积，目标单层 max_points=50000
         xy_area = (x_max - x_min) * (y_max - y_min)

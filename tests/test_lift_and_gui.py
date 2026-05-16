@@ -319,6 +319,18 @@ class WorkerLiftControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SimulationWorker._expected_lift_steps(lift_max, 0.0)
 
+    def test_platform_return_distance_removes_temporary_lift(self) -> None:
+        from hydrogel_vbd.solver.cpp_subprocess import _platform_return_distance
+
+        self.assertAlmostEqual(
+            _platform_return_distance(actual_lift=2.0e-6, next_gap=1.0e-6),
+            2.0e-6,
+        )
+        self.assertEqual(
+            _platform_return_distance(actual_lift=0.8e-6, next_gap=1.0e-6),
+            0.8e-6,
+        )
+
     def test_layer_contact_z_stays_at_fixed_fep(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
@@ -798,7 +810,12 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertIsNotNone(config.kappa)
         self.assertIsNotNone(config.v_lift)
         self.assertIsNotNone(config.K_p)
-        self.assertAlmostEqual(config.layer_thickness, 1.0e-4)
+        self.assertAlmostEqual(config.k_d, 0.01)
+        self.assertAlmostEqual(config.c_shrink, 1.0)
+        self.assertEqual(config.max_iters, 50)
+        self.assertEqual(config.N_stable, 3)
+        self.assertAlmostEqual(config.layer_thickness, 0.7993e-3)
+        self.assertAlmostEqual(config.v_lift, 0.01)
         self.assertIn("lift_multiplier", panel._spin_map)
         self.assertAlmostEqual(config.lift_multiplier, 1.5)
         self.assertIn("node_area", panel._spin_map)
@@ -1459,6 +1476,256 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
         self.assertTrue(
             any(np.array_equal(nodes, expected_layer1_bottom) for nodes in updated_node_sets)
         )
+
+    def test_cpp_subprocess_emits_activation_frame_and_trace_before_lift(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _FrameMsg, _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=False,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            lift_multiplier=1.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "enable_czm": config.enable_czm,
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+        out_dir = Path("outputs/test_cpp_activation_snapshot")
+        trace_path = out_dir / "worker_trace.log"
+        trace_path.unlink(missing_ok=True)
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        conn = FakeConn()
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_solve,
+        ):
+            _run_simulation(conn, mesh_dict, config_dict, n_layers=2, output_dir=out_dir)
+
+        frame_titles = [
+            msg.title for msg in conn.messages if isinstance(msg, _FrameMsg)
+        ]
+        self.assertIn("第 1 层 — 激活后/上提前", frame_titles)
+        self.assertIn("第 2 层 — 激活后/上提前", frame_titles)
+
+        trace_text = trace_path.read_text(encoding="utf-8")
+        self.assertIn("layer_1_activation_state", trace_text)
+        self.assertIn("previous_bottom_z=", trace_text)
+        self.assertIn("current_bottom_z=", trace_text)
+        self.assertIn("target_gap=", trace_text)
+
+    def test_cpp_subprocess_returns_platform_before_next_layer_activation(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=False,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            lift_multiplier=1.5,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "enable_czm": config.enable_czm,
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+        observed_calls: list[tuple[int, float]] = []
+
+        class FakeConn:
+            def send(self, msg) -> None:  # noqa: ANN001
+                pass
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            observed_calls.append((int(layer_id), float(cfg_arg.v_lift)))
+            step = float(cfg_arg.v_lift) * float(cfg_arg.dt)
+            mesh_arg.vertices[np.asarray(lifting_top, dtype=int), 2] += step
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_solve,
+        ):
+            _run_simulation(
+                FakeConn(), mesh_dict, config_dict,
+                n_layers=2, output_dir="outputs/test_cpp_platform_return",
+            )
+
+        layer0_calls = [v_lift for layer, v_lift in observed_calls if layer == 0]
+        self.assertIn(config.v_lift, layer0_calls)
+        return_calls = [v_lift for v_lift in layer0_calls if v_lift < 0.0]
+        self.assertEqual(len(return_calls), 2)
+        for v_lift in return_calls:
+            self.assertAlmostEqual(v_lift, -config.v_lift)
+
+    def test_cpp_subprocess_traces_hit_rate_quality_and_scaled_lift_epsilon(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _DoneMsg, _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=False,
+            dt=1.0e-3,
+            v_lift=1.0,
+            layer_thickness=1.0e-3,
+            lift_multiplier=1.0,
+            max_iters=3,
+            N_stable=1,
+            epsilon=1.0e-9,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=1, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "enable_czm": config.enable_czm,
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+            "epsilon": config.epsilon,
+        }
+        out_dir = Path("outputs/test_cpp_lift_epsilon_trace")
+        trace_path = out_dir / "worker_trace.log"
+        trace_path.unlink(missing_ok=True)
+        observed_epsilons: list[float] = []
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            observed_epsilons.append(float(cfg_arg.epsilon))
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=cfg_arg.max_iters,
+                max_dx=2.0e-6,
+                kinetic_energy=0.0,
+                stable_steps=0,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        conn = FakeConn()
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_solve,
+        ):
+            _run_simulation(conn, mesh_dict, config_dict, n_layers=1, output_dir=out_dir)
+
+        self.assertEqual(len(observed_epsilons), 1)
+        self.assertAlmostEqual(observed_epsilons[0], 1.5e-6)
+        done_messages = [msg for msg in conn.messages if isinstance(msg, _DoneMsg)]
+        self.assertEqual(done_messages[0].results[0]["max_iter_hit_rate"], 100.0)
+
+        trace_text = trace_path.read_text(encoding="utf-8")
+        self.assertIn("active_tets=", trace_text)
+        self.assertIn("tet_quality=", trace_text)
+        self.assertIn("solver_epsilon=1.500000e-06", trace_text)
+        self.assertIn("max_iter_hit_rate=100.00%", trace_text)
 
     def test_cpp_lift_rejects_detach_before_solver_convergence(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig

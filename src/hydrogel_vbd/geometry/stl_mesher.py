@@ -80,6 +80,8 @@ from hydrogel_vbd.core.state import MeshState
 # ---------------------------------------------------------------------------
 _STL_UNIT_SCALE = 0.001  # mm → m（trimesh 加载时自动应用）
 
+_MIN_RESIDUAL_LAYER_FRACTION = 0.10
+
 PRINT_Z_AXIS_MAP: dict[str, tuple[int, int, int, float, float, float]] = {
     "x": (2, 1, 0, -1.0, 1.0, 1.0),
     "-x": (2, 1, 0, 1.0, 1.0, -1.0),
@@ -88,6 +90,39 @@ PRINT_Z_AXIS_MAP: dict[str, tuple[int, int, int, float, float, float]] = {
     "z": (0, 1, 2, 1.0, 1.0, 1.0),
     "-z": (0, 1, 2, 1.0, -1.0, -1.0),
 }
+
+
+def _effective_top_down_layer_count(
+    extent_z_m: float,
+    layer_thickness_m: float,
+    min_residual_fraction: float = _MIN_RESIDUAL_LAYER_FRACTION,
+) -> int:
+    """Return a print-order layer count without creating a tiny first layer."""
+    extent = max(0.0, float(extent_z_m))
+    thickness = float(layer_thickness_m)
+    if extent <= 0.0 or thickness <= 0.0:
+        return 1
+
+    full_layers = int(math.floor(extent / thickness))
+    if full_layers <= 0:
+        return 1
+
+    residual = extent - full_layers * thickness
+    min_residual = max(1e-12, float(min_residual_fraction) * thickness)
+    if residual <= min_residual:
+        return max(1, full_layers)
+    return full_layers + 1
+
+
+def _top_aligned_slice_origin(
+    z_min_m: float,
+    z_max_m: float,
+    n_layers: int,
+    layer_thickness_m: float,
+) -> float:
+    """Place regular layer planes from the geometric top downward."""
+    del z_min_m
+    return float(z_max_m) - int(n_layers) * float(layer_thickness_m)
 
 
 def transform_points_to_print_z(
@@ -362,6 +397,8 @@ def _classify_occ_vertices(
     n_layers: int,
     layer_thickness_m: float,
     tol: float | None = None,
+    model_z_min_m: float | None = None,
+    model_z_max_m: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """对 OCC Boolean Fragment 输出的顶点进行层归属分类。
 
@@ -414,7 +451,32 @@ def _classify_occ_vertices(
     # 遍历每个接口表面（从底面到顶面）
     classified = np.zeros(n_vertices, dtype=bool)
 
+    if model_z_min_m is not None:
+        on_model_bottom = np.isclose(
+            point_z,
+            float(model_z_min_m),
+            atol=tol,
+        )
+        first_active_layer[on_model_bottom] = n_layers - 1
+        is_top_surface_of_layer[on_model_bottom] = n_layers
+        classified[on_model_bottom] = True
+
+    if model_z_max_m is not None:
+        on_model_top = (
+            np.isclose(point_z, float(model_z_max_m), atol=tol)
+            & ~classified
+        )
+        first_active_layer[on_model_top] = 0
+        is_top_surface_of_layer[on_model_top] = 0
+        classified[on_model_top] = True
+
     for k in range(n_layers + 1):
+        if (
+            k == 0
+            and model_z_min_m is not None
+            and float(z_min_m) > float(model_z_min_m) + float(tol)
+        ):
+            continue
         interface_z = float(k) * layer_thickness_m
         on_interface = (
             np.isclose(rel_z, interface_z, atol=tol) & ~classified
@@ -773,11 +835,21 @@ class OCCFragmentMesher:
         extent_z_m = extent_z * _STL_UNIT_SCALE
 
         # ── 4. 计算层数 ──
-        n_layers = max(1, int(math.ceil(extent_z_m / layer_thickness_m)))
+        n_layers = _effective_top_down_layer_count(
+            extent_z_m,
+            layer_thickness_m,
+        )
+        z_grid_min_m = _top_aligned_slice_origin(
+            z_min_m,
+            z_max_m,
+            n_layers,
+            layer_thickness_m,
+        )
+        z_grid_min = z_grid_min_m / _STL_UNIT_SCALE
         if n_layers <= 1:
             # 单层：无需碎片化，直接划分网格
             return self._mesh_and_extract(
-                layer_thickness_m, z_min_m, n_layers, cfg
+                layer_thickness_m, z_min_m, n_layers, cfg, z_grid_min_m
             )
 
         # ── 5. 生成切片平面组 ──
@@ -790,7 +862,7 @@ class OCCFragmentMesher:
 
         cutting_plane_tags: list[int] = []
         for k in range(1, n_layers):
-            z_mm = z_min + k * layer_thickness_mm
+            z_mm = z_grid_min + k * layer_thickness_mm
             if z_mm <= z_min + 1e-6 or z_mm >= z_max - 1e-6:
                 continue
             plane_tag = gmsh.model.occ.addRectangle(
@@ -800,7 +872,7 @@ class OCCFragmentMesher:
 
         if not cutting_plane_tags:
             return self._mesh_and_extract(
-                layer_thickness_m, z_min_m, n_layers, cfg
+                layer_thickness_m, z_min_m, n_layers, cfg, z_grid_min_m
             )
 
         gmsh.model.occ.synchronize()
@@ -838,7 +910,7 @@ class OCCFragmentMesher:
         gmsh.model.occ.synchronize()
 
         return self._mesh_and_extract(
-            layer_thickness_m, z_min_m, n_layers, cfg
+            layer_thickness_m, z_min_m, n_layers, cfg, z_grid_min_m
         )
 
     # ------------------------------------------------------------------
@@ -951,7 +1023,16 @@ class OCCFragmentMesher:
                 z_max_m = extent_z_m
 
         # ── 4. 计算层数 ──
-        n_layers = max(1, int(math.ceil(extent_z_m / layer_thickness_m)))
+        n_layers = _effective_top_down_layer_count(
+            extent_z_m,
+            layer_thickness_m,
+        )
+        z_grid_min_m = _top_aligned_slice_origin(
+            z_min_m,
+            z_max_m,
+            n_layers,
+            layer_thickness_m,
+        )
 
         # ── 5. (可选) 尝试将 STL 表面封闭为体 ──
         # 这对于获得 3D 四面体网格至关重要。
@@ -976,7 +1057,7 @@ class OCCFragmentMesher:
 
         # ── 6. 统一网格生成 ──
         return self._mesh_and_extract(
-            layer_thickness_m, z_min_m, n_layers, cfg
+            layer_thickness_m, z_min_m, n_layers, cfg, z_grid_min_m
         )
 
     # ------------------------------------------------------------------
@@ -988,6 +1069,7 @@ class OCCFragmentMesher:
         z_min_m: float,
         n_layers: int,
         cfg: SimulationConfig,
+        z_grid_min_m: float | None = None,
     ) -> tuple[MeshState, int]:
         """对当前 Gmsh 模型执行网格划分，提取顶点和四面体，
         并构建 :class:`MeshState`。
@@ -1104,8 +1186,13 @@ class OCCFragmentMesher:
         # OCC Boolean Fragment 保证四面体完全位于单层内，不跨层
         tet_centroids = np.mean(vertices[tets], axis=1)
         tet_z = tet_centroids[:, 2]
+        classification_z_min_m = (
+            float(z_grid_min_m)
+            if z_grid_min_m is not None
+            else float(z_min_m)
+        )
         layer_id_per_tet = _classify_occ_tets_to_layers(
-            tet_z, z_min_m, n_layers, layer_thickness_m
+            tet_z, classification_z_min_m, n_layers, layer_thickness_m
         )
 
         # 顶点层号与表面编号（OCC Boolean Fragment 专用分类）
@@ -1113,7 +1200,12 @@ class OCCFragmentMesher:
         # 其 first_active_layer = max(interface_id - 1, 0)
         point_z = vertices[:, 2]
         first_active_layer, surface_ids = _classify_occ_vertices(
-            point_z, z_min_m, n_layers, layer_thickness_m,
+            point_z,
+            classification_z_min_m,
+            n_layers,
+            layer_thickness_m,
+            model_z_min_m=float(np.min(point_z)),
+            model_z_max_m=float(np.max(point_z)),
         )
         # layer_id_per_vertex 与 first_active_layer 保持一致
         layer_id_per_vertex_arr = first_active_layer.copy()
@@ -1253,9 +1345,15 @@ class OCCFragmentMesher:
                         z_max_m = extent_z_m
 
                 # 计算层数
-                n_layers = max(
-                    1,
-                    int(math.ceil(extent_z_m / layer_thickness_m)),
+                n_layers = _effective_top_down_layer_count(
+                    extent_z_m,
+                    layer_thickness_m,
+                )
+                z_grid_min_m = _top_aligned_slice_origin(
+                    z_min_m,
+                    z_max_m,
+                    n_layers,
+                    layer_thickness_m,
                 )
 
                 # 尝试封闭面片为体
@@ -1277,6 +1375,7 @@ class OCCFragmentMesher:
                     z_min_m,
                     n_layers,
                     cfg,
+                    z_grid_min_m,
                 )
 
             # STEP 路径：安全遍历所有 OCC 实体获取包围盒（mm 单位）
@@ -1312,9 +1411,15 @@ class OCCFragmentMesher:
             z_min_m = z_min_val * _STL_UNIT_SCALE
             z_max_m = z_max_val * _STL_UNIT_SCALE
             extent_z_m = z_max_m - z_min_m
-            n_layers = max(
-                1,
-                int(math.ceil(extent_z_m / layer_thickness_m)),
+            n_layers = _effective_top_down_layer_count(
+                extent_z_m,
+                layer_thickness_m,
+            )
+            z_grid_min_m = _top_aligned_slice_origin(
+                z_min_m,
+                z_max_m,
+                n_layers,
+                layer_thickness_m,
             )
 
             # 直接自由四面体网格划分，无布尔切片
@@ -1323,6 +1428,7 @@ class OCCFragmentMesher:
                 z_min_m,
                 n_layers,
                 cfg,
+                z_grid_min_m,
             )
 
         except Exception as exc:
@@ -1671,7 +1777,16 @@ class DelaunayTetMesher:
         model_volume = float(np.prod(model_dims))
 
         # ── 1. 计算层数 ──
-        n_layers = max(1, int(math.ceil((z_max - z_min) / cfg.layer_thickness)))
+        n_layers = _effective_top_down_layer_count(
+            z_max - z_min,
+            cfg.layer_thickness,
+        )
+        z_grid_min = _top_aligned_slice_origin(
+            z_min,
+            z_max,
+            n_layers,
+            cfg.layer_thickness,
+        )
 
         # ── 2. 自适应采样预算分配 ──
         r = self.resolution   # 目标边长 (m)
@@ -1694,7 +1809,7 @@ class DelaunayTetMesher:
         interior_pts = self._sample_interior_points(r * 1.2, bounds)
 
         # ── 5. 层切面约束点 ──
-        z_interfaces = z_min + np.arange(n_layers + 1) * cfg.layer_thickness
+        z_interfaces = z_grid_min + np.arange(1, n_layers) * cfg.layer_thickness
         layer_pts = self._sample_layer_interface_points(
             z_interfaces, spacing=r * 1.5, bounds=bounds
         ) if n_layers >= 1 else np.zeros((0, 3), dtype=float)
@@ -1748,13 +1863,18 @@ class DelaunayTetMesher:
         # ── 9. 层归属分类 ──
         tet_centroids = np.mean(all_points[tets], axis=1)
         tet_z = tet_centroids[:, 2]
-        layer_id_per_tet = _classify_tets_to_layers(
-            tet_z, z_min, n_layers, cfg.layer_thickness
+        layer_id_per_tet = _classify_occ_tets_to_layers(
+            tet_z, z_grid_min, n_layers, cfg.layer_thickness
         )
 
         point_z = all_points[:, 2]
-        layer_id_per_vertex, interface_id = _classify_points_to_layers(
-            point_z, z_min, n_layers, cfg.layer_thickness
+        layer_id_per_vertex, interface_id = _classify_occ_vertices(
+            point_z,
+            z_grid_min,
+            n_layers,
+            cfg.layer_thickness,
+            model_z_min_m=float(np.min(point_z)),
+            model_z_max_m=float(np.max(point_z)),
         )
 
         is_bottom_surface = np.isclose(point_z, z_min, atol=cfg.layer_thickness * 0.2)

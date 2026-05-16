@@ -36,6 +36,8 @@ import numpy as np
 
 MAX_EXPECTED_LIFT_STEPS = 100_000
 DX_CLIP_DIAGNOSTIC = 0.002
+LIFT_EPSILON_STEP_FRACTION = 0.12
+LIFT_EPSILON_LAYER_FRACTION = 1.5e-3
 
 
 def _configure_cpp_runtime_for_subprocess() -> dict[str, int]:
@@ -111,8 +113,103 @@ def _expected_lift_steps(lift_max: float, lift_step: float) -> int:
     return int(math.ceil(ratio - max(1e-12, abs(ratio) * 1e-12)))
 
 
+def _platform_return_distance(actual_lift: float, next_gap: float) -> float:
+    actual_lift = max(0.0, float(actual_lift))
+    _ = next_gap
+    return actual_lift
+
+
+def _positive_step_distances(total: float, max_step: float) -> list[float]:
+    total = max(0.0, float(total))
+    max_step = max(0.0, float(max_step))
+    if total <= 0.0 or max_step <= 0.0:
+        return []
+    steps: list[float] = []
+    remaining = total
+    while remaining > max(1e-15, total * 1e-12):
+        step = min(max_step, remaining)
+        steps.append(step)
+        remaining -= step
+    return steps
+
+
 def _layer_contact_z(config: Any, layer_id: int) -> float:
     return float(config.z_fep)
+
+
+def _format_z_stats(label: str, values: np.ndarray) -> str:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return f"{label}=empty"
+    return (
+        f"{label}=n:{values.size},"
+        f"min:{float(np.min(values)):.6e},"
+        f"median:{float(np.median(values)):.6e},"
+        f"max:{float(np.max(values)):.6e}"
+    )
+
+
+def _lift_convergence_epsilon(config: Any, lift_step: float, target_gap: float) -> float:
+    base = max(0.0, float(getattr(config, "epsilon", 0.0)))
+    lift_step = abs(float(lift_step))
+    target_gap = abs(float(target_gap))
+    if lift_step <= 0.0 or target_gap <= 0.0:
+        return base
+    scaled = min(
+        LIFT_EPSILON_STEP_FRACTION * lift_step,
+        LIFT_EPSILON_LAYER_FRACTION * target_gap,
+    )
+    return max(base, scaled)
+
+
+def _active_tet_quality_values(mesh: Any) -> np.ndarray:
+    vertices = np.asarray(getattr(mesh, "vertices", np.zeros((0, 3))), dtype=float)
+    tets = np.asarray(getattr(mesh, "tets", np.zeros((0, 4), dtype=int)), dtype=int)
+    active_mask = np.asarray(
+        getattr(mesh, "active_tet_mask", np.zeros(tets.shape[0], dtype=bool)),
+        dtype=bool,
+    )
+    if vertices.size == 0 or tets.size == 0 or active_mask.size == 0:
+        return np.zeros(0, dtype=float)
+    active_tets = tets[active_mask]
+    if active_tets.size == 0:
+        return np.zeros(0, dtype=float)
+
+    p = vertices[active_tets]
+    edge_vectors = np.stack(
+        (
+            p[:, 1] - p[:, 0],
+            p[:, 2] - p[:, 0],
+            p[:, 3] - p[:, 0],
+            p[:, 2] - p[:, 1],
+            p[:, 3] - p[:, 1],
+            p[:, 3] - p[:, 2],
+        ),
+        axis=1,
+    )
+    max_edge = np.max(np.linalg.norm(edge_vectors, axis=2), axis=1)
+    dm = np.stack((p[:, 1] - p[:, 0], p[:, 2] - p[:, 0], p[:, 3] - p[:, 0]), axis=2)
+    volume = np.abs(np.linalg.det(dm)) / 6.0
+    quality = np.zeros(active_tets.shape[0], dtype=float)
+    valid = max_edge > 0.0
+    quality[valid] = 6.0 * math.sqrt(2.0) * volume[valid] / (max_edge[valid] ** 3)
+    return np.clip(quality, 0.0, 1.0)
+
+
+def _format_tet_quality_stats(label: str, mesh: Any) -> str:
+    quality = _active_tet_quality_values(mesh)
+    quality = quality[np.isfinite(quality)]
+    if quality.size == 0:
+        return f"{label}=empty"
+    thin_count = int(np.count_nonzero(quality < 1.0e-3))
+    return (
+        f"{label}=n:{quality.size},"
+        f"min:{float(np.min(quality)):.6e},"
+        f"median:{float(np.median(quality)):.6e},"
+        f"max:{float(np.max(quality)):.6e},"
+        f"thin_lt1e-3:{thin_count}"
+    )
 
 
 def _validate_lift_plan(
@@ -380,6 +477,34 @@ def _run_simulation(
         layer_z_fep = _layer_contact_z(config, layer_id)
         layer_config = replace(config, z_fep=layer_z_fep)
         activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
+        previous_bottom = (
+            mesh.bottom_nodes(layer_id - 1)
+            if layer_id > 0
+            else np.zeros(0, dtype=int)
+        )
+        current_bottom = mesh.bottom_nodes(layer_id)
+        target_gap = LayerActivator._infer_layer_thickness(mesh, layer_id)
+        top_after_activation = _current_lifting_top(mesh)
+        active_nodes = np.flatnonzero(mesh.active_vertex_mask)
+        active_tets = int(np.count_nonzero(mesh.active_tet_mask))
+        tet_quality_stats = _format_tet_quality_stats("tet_quality", mesh)
+        _trace(
+            f"layer_{layer_id}_activation_state "
+            f"target_gap={target_gap:.6e} "
+            f"active_nodes={len(active_nodes)} active_tets={active_tets} "
+            f"{tet_quality_stats} "
+            f"{_format_z_stats('previous_bottom_z', mesh.vertices[previous_bottom, 2])} "
+            f"{_format_z_stats('current_bottom_z', mesh.vertices[current_bottom, 2])} "
+            f"{_format_z_stats('top_fixed_z', mesh.vertices[top_after_activation, 2])} "
+            f"{_format_z_stats('active_z', mesh.vertices[active_nodes, 2])}"
+        )
+        conn.send(_FrameMsg(
+            vertices=mesh.vertices.copy(),
+            tets=mesh.tets.copy(),
+            active_mask=mesh.active_vertex_mask.copy(),
+            active_tet_mask=mesh.active_tet_mask.copy(),
+            title=f"第 {layer_id + 1} 层 — 激活后/上提前",
+        ))
 
         pid_state = pid.update(0.0)
         e_z = pid_state.E_z
@@ -394,9 +519,19 @@ def _run_simulation(
             if lift_step > 0.0
             else 0
         )
+        solver_epsilon = _lift_convergence_epsilon(config, lift_step, target_gap)
+        layer_config = replace(layer_config, epsilon=solver_epsilon)
+        _trace(
+            f"layer_{layer_id}_solver_tolerance "
+            f"base_epsilon={float(config.epsilon):.6e} "
+            f"solver_epsilon={solver_epsilon:.6e} "
+            f"target_gap={target_gap:.6e} lift_step={lift_step:.6e}"
+        )
         top_ids = _current_lifting_top(mesh)
 
         layer_steps = 0
+        layer_return_steps = 0
+        platform_return_distance = 0.0
         _record_diag(
             layer_id,
             0,
@@ -473,7 +608,8 @@ def _run_simulation(
             _trace(
                 f"layer_{layer_id}_lift_start top_ids={len(top_ids)} "
                 f"v_lift={v_lift} dt={dt} lift_max={lift_max} "
-                f"lift_step={lift_step} expected_steps={expected_lift_steps}"
+                f"lift_step={lift_step} expected_steps={expected_lift_steps} "
+                f"solver_epsilon={solver_epsilon:.6e}"
             )
             trace_every_step = os.environ.get("HYDROGEL_VBD_TRACE_STEPS") == "1"
             trace_stride = int(os.environ.get("HYDROGEL_VBD_TRACE_STRIDE", "250"))
@@ -560,7 +696,7 @@ def _run_simulation(
                 # 全部脱膜则退出提升循环
                 if result.all_free and bool(getattr(layer_config, "enable_czm", True)):
                     _raise_if_detached_before_convergence(
-                        layer_id, layer_steps, result, config
+                        layer_id, layer_steps, result, layer_config
                     )
                     break
 
@@ -599,31 +735,116 @@ def _run_simulation(
                     layer=layer_id + 1, percentage=lift_pct, step=step_counter,
                 ))
 
+        if (
+            _has_lift
+            and not diag_stopped
+            and layer_id + 1 < n_layers
+            and len(top_ids) > 0
+            and abs(lift_step) > 0.0
+        ):
+            next_gap = LayerActivator._infer_layer_thickness(mesh, layer_id + 1)
+            actual_lift = layer_steps * abs(lift_step)
+            platform_return_distance = _platform_return_distance(
+                actual_lift, next_gap
+            )
+            return_step_distances = _positive_step_distances(
+                platform_return_distance, abs(lift_step)
+            )
+            if return_step_distances:
+                _trace(
+                    f"layer_{layer_id}_platform_return_start "
+                    f"distance={platform_return_distance:.6e} "
+                    f"next_gap={next_gap:.6e} "
+                    f"steps={len(return_step_distances)}"
+                )
+            for return_step_index, return_step_distance in enumerate(
+                return_step_distances, start=1
+            ):
+                bottom = mesh.bottom_nodes(layer_id)
+                bottom_state = mesh.czm_state[bottom].copy()
+                bottom_damage = mesh.damage[bottom].copy()
+                bottom_time_free = mesh.time_free[bottom].copy()
+                down_config = replace(
+                    layer_config,
+                    v_lift=-return_step_distance / max(abs(dt), 1e-12),
+                )
+                x_before_solve = mesh.vertices.copy()
+                call_start = time.perf_counter()
+                result = cpp_solve_lift_and_relax(
+                    mesh, down_config, e_z, layer_id, top_ids,
+                )
+                call_elapsed = time.perf_counter() - call_start
+                if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
+                    mesh.czm_state[bottom] = bottom_state
+                    mesh.damage[bottom] = bottom_damage
+                    mesh.time_free[bottom] = bottom_time_free
+                layer_return_steps += 1
+                layer_call_elapsed_s += call_elapsed
+                layer_total_iterations += int(result.iterations)
+                if result.iterations >= config.max_iters:
+                    layer_max_iter_hits += 1
+                if result.max_dx >= DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9):
+                    layer_clipped_steps += 1
+                if (
+                    return_step_index == 1
+                    or return_step_index == len(return_step_distances)
+                ):
+                    _trace(
+                        f"layer_{layer_id}_platform_return_step_"
+                        f"{return_step_index}_post_call "
+                        f"max_dx={result.max_dx:.4e} "
+                        f"iters={result.iterations} "
+                        f"call_ms={call_elapsed * 1000.0:.3f}"
+                    )
+
         elapsed_s = time.perf_counter() - layer_start
+        layer_call_count = layer_steps + layer_return_steps
         avg_call_ms = (
-            layer_call_elapsed_s / max(layer_steps, 1) * 1000.0
+            layer_call_elapsed_s / max(layer_call_count, 1) * 1000.0
             if layer_steps > 0
             else layer_call_elapsed_s * 1000.0
         )
+        max_iter_hit_rate = (
+            layer_max_iter_hits / layer_call_count * 100.0
+            if layer_call_count > 0
+            else 0.0
+        )
         _trace(
             f"layer_{layer_id}_done steps={layer_steps} "
+            f"return_steps={layer_return_steps} "
             f"elapsed_s={elapsed_s:.3f} total_iters={layer_total_iterations} "
             f"max_iter_hits={layer_max_iter_hits} "
+            f"max_iter_hit_rate={max_iter_hit_rate:.2f}% "
             f"clipped_steps={layer_clipped_steps} "
-            f"avg_call_ms={avg_call_ms:.3f}"
+            f"avg_call_ms={avg_call_ms:.3f} "
+            f"active_nodes={len(active_nodes)} active_tets={active_tets} "
+            f"solver_epsilon={solver_epsilon:.6e}"
         )
+        if max_iter_hit_rate >= 20.0:
+            conn.send(_LogMsg(text=(
+                f"  [perf] layer {layer_id + 1}: "
+                f"max_iter_hit_rate={max_iter_hit_rate:.1f}%, "
+                f"avg_call={avg_call_ms:.1f} ms, "
+                f"active_nodes={len(active_nodes)}, active_tets={active_tets}"
+            )))
         results.append({
             "layer_id": layer_id,
             "total_steps": layer_steps,
             "final_max_dx": float(result.max_dx),
             "total_iterations": layer_total_iterations,
             "max_iter_hits": layer_max_iter_hits,
+            "max_iter_hit_rate": max_iter_hit_rate,
             "clipped_steps": layer_clipped_steps,
             "elapsed_s": elapsed_s,
             "avg_call_ms": avg_call_ms,
             "lift_max": lift_max,
             "lift_step": lift_step,
+            "platform_return_distance": platform_return_distance,
+            "platform_return_steps": layer_return_steps,
+            "solver_epsilon": solver_epsilon,
             "expected_steps": expected_lift_steps,
+            "active_nodes": len(active_nodes),
+            "active_tets": active_tets,
             "top_nodes": len(top_ids),
             "E_z": float(e_z),
             "success": not diag_stopped,

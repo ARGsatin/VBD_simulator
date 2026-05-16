@@ -66,6 +66,53 @@ class ConformalArchitectureTests(unittest.TestCase):
         self.assertTrue(np.all(mesh.vertices[new_nodes, 2] >= 0.0))
         self.assertTrue(np.all(mesh.vertices[new_nodes, 2] <= layer_thickness))
 
+    def test_new_layer_tets_are_stress_free_at_activation(self):
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+        from hydrogel_vbd.physics.elastic_energy import compute_tet_deformation_gradient
+
+        layer_thickness = 0.05
+        config = SimulationConfig(c_shrink=1.0, layer_thickness=layer_thickness)
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=layer_thickness, config=config
+        )
+        activator = LayerActivator()
+
+        activator.activate_with_inheritance(mesh, current_layer=0, z_fep=0.0)
+        old_tets = np.flatnonzero(mesh.layer_id_per_tet == 0)
+        old_dm_inv = mesh.dm_inv[old_tets].copy()
+        old_volumes = mesh.tet_volumes[old_tets].copy()
+
+        shared_interface = mesh.bottom_nodes(0)
+        offsets = np.linspace(
+            -0.2 * layer_thickness,
+            0.2 * layer_thickness,
+            len(shared_interface),
+        )
+        mesh.vertices[shared_interface, 2] += offsets
+        expected_inherited_z = layer_thickness + offsets
+
+        activator.activate_with_inheritance(mesh, current_layer=1, z_fep=0.0)
+
+        np.testing.assert_allclose(
+            mesh.vertices[shared_interface, 2],
+            expected_inherited_z,
+        )
+
+        new_tets = np.flatnonzero(mesh.layer_id_per_tet == 1)
+        self.assertGreater(len(new_tets), 0)
+        for tet_id in new_tets:
+            tet = mesh.tets[tet_id]
+            F = compute_tet_deformation_gradient(
+                mesh.vertices[tet],
+                mesh.dm_inv[tet_id],
+            )
+            np.testing.assert_allclose(F, np.eye(3), atol=1e-10)
+
+        np.testing.assert_allclose(mesh.dm_inv[old_tets], old_dm_inv)
+        np.testing.assert_allclose(mesh.tet_volumes[old_tets], old_volumes)
+
     def test_top_down_activation_keeps_fixed_fep_and_platform_surface(self):
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
@@ -127,6 +174,62 @@ class ConformalArchitectureTests(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(layer_id, np.array([2, 1, 0], dtype=int))
+
+    def test_top_down_slice_grid_keeps_remainder_off_first_printed_layer(self):
+        from hydrogel_vbd.geometry.stl_mesher import (
+            _classify_occ_tets_to_layers,
+            _classify_occ_vertices,
+            _effective_top_down_layer_count,
+            _top_aligned_slice_origin,
+        )
+
+        z_min = 0.0
+        z_max = 9.5e-3
+        layer_thickness = 0.4996e-3
+        n_layers = _effective_top_down_layer_count(
+            z_max - z_min,
+            layer_thickness,
+        )
+        origin = _top_aligned_slice_origin(
+            z_min,
+            z_max,
+            n_layers,
+            layer_thickness,
+        )
+
+        self.assertEqual(n_layers, 19)
+        self.assertGreater(origin, z_min)
+
+        top_centroid = z_max - 0.5 * layer_thickness
+        bottom_centroid = 0.5 * origin
+        layer_id = _classify_occ_tets_to_layers(
+            np.array([top_centroid, bottom_centroid]),
+            origin,
+            n_layers,
+            layer_thickness,
+        )
+        np.testing.assert_array_equal(layer_id, np.array([0, n_layers - 1]))
+
+        point_z = np.array(
+            [z_min, origin + layer_thickness, z_max - layer_thickness, z_max]
+        )
+        first_active, surface_ids = _classify_occ_vertices(
+            point_z,
+            origin,
+            n_layers,
+            layer_thickness,
+            tol=1e-10,
+            model_z_min_m=z_min,
+            model_z_max_m=z_max,
+        )
+        np.testing.assert_array_equal(
+            surface_ids,
+            np.array([n_layers, n_layers - 1, 1, 0]),
+        )
+        np.testing.assert_array_equal(
+            first_active,
+            np.array([n_layers - 1, n_layers - 2, 0, 0]),
+        )
 
 
 if __name__ == "__main__":
