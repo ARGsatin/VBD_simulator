@@ -115,6 +115,29 @@ class MeshViewer(QtWidgets.QWidget):
             return tets
         return tets[mask]
 
+    @staticmethod
+    def _equal_axis_bounds(
+        points: np.ndarray,
+        pad_fraction: float = 0.1,
+    ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+        arr = np.asarray(points, dtype=float)
+        if arr.size == 0:
+            return (-0.5, 0.5), (-0.5, 0.5), (-0.5, 0.5)
+
+        mins = np.min(arr, axis=0)
+        maxs = np.max(arr, axis=0)
+        center = 0.5 * (mins + maxs)
+        span = float(np.max(maxs - mins))
+        if not np.isfinite(span) or span <= 0.0:
+            span = 0.01
+        half = 0.5 * span * (1.0 + 2.0 * float(pad_fraction))
+        bounds = [(float(c - half), float(c + half)) for c in center]
+        return bounds[0], bounds[1], bounds[2]
+
+    @staticmethod
+    def _display_points_mm(points_m: np.ndarray) -> np.ndarray:
+        return np.asarray(points_m, dtype=float) * 1000.0
+
     def show_initial_mesh(
         self,
         vertices: np.ndarray,
@@ -144,6 +167,8 @@ class MeshViewer(QtWidgets.QWidget):
             self._canvas.draw_idle()
             return
 
+        vertices_plot = self._display_points_mm(vertices)
+
         # 提取并缓存边界面（拓扑不变，后续帧复用）
         self._boundary_faces = self._extract_boundary_faces(tets)
         boundary_faces = self._boundary_faces
@@ -151,9 +176,9 @@ class MeshViewer(QtWidgets.QWidget):
         # 用 trisurf 绘制外表面
         try:
             self._surf = self._ax.plot_trisurf(
-                vertices[:, 0],
-                vertices[:, 1],
-                vertices[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 triangles=boundary_faces,
                 cmap="viridis",
                 alpha=0.75,
@@ -163,26 +188,22 @@ class MeshViewer(QtWidgets.QWidget):
         except Exception:
             # 如果 trisurf 失败（如退化面），回退到散点图
             self._scatter = self._ax.scatter(
-                vertices[:, 0],
-                vertices[:, 1],
-                vertices[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 c="steelblue",
                 s=8,
                 alpha=0.8,
             )
 
         # —— 自动缩放以包含所有点 + 基准底座平面 ——
-        x_min_v = float(np.min(vertices[:, 0]))
-        x_max_v = float(np.max(vertices[:, 0]))
-        y_min_v = float(np.min(vertices[:, 1]))
-        y_max_v = float(np.max(vertices[:, 1]))
-        z_min_v = float(np.min(vertices[:, 2]))
-        z_max_v = float(np.max(vertices[:, 2]))
+        x_min_v = float(np.min(vertices_plot[:, 0]))
+        x_max_v = float(np.max(vertices_plot[:, 0]))
+        y_min_v = float(np.min(vertices_plot[:, 1]))
+        y_max_v = float(np.max(vertices_plot[:, 1]))
 
         x_range = x_max_v - x_min_v or 0.01
         y_range = y_max_v - y_min_v or 0.01
-        z_range = z_max_v - z_min_v or 0.01
-        pad = max(x_range, y_range, z_range) * 0.1
 
         # 基准底座平面：Z=0 处半透明灰色矩形，带 20% 外扩边距
         expand = 0.2
@@ -202,11 +223,14 @@ class MeshViewer(QtWidgets.QWidget):
             linewidths=1.0,
         ))
 
-        self._ax.set_xlim(x_min_v - pad, x_max_v + pad)
-        self._ax.set_ylim(y_min_v - pad, y_max_v + pad)
-        # 锁定 Z 轴下限略低于 0，确保底座平面不被裁剪
-        z_lower = min(z_min_v - pad, -0.05 * z_range)
-        self._ax.set_zlim(z_lower, z_max_v + pad)
+        view_points = np.vstack([vertices_plot, base_corners])
+        xlim, ylim, zlim = self._equal_axis_bounds(view_points)
+        self._ax.set_xlim(*xlim)
+        self._ax.set_ylim(*ylim)
+        # Use equal axis spans so geometry is not visually stretched.
+        self._ax.set_zlim(*zlim)
+        if hasattr(self._ax, "set_box_aspect"):
+            self._ax.set_box_aspect((1.0, 1.0, 1.0))
 
         self._fig.tight_layout()
         self._canvas.draw_idle()
@@ -257,6 +281,8 @@ class MeshViewer(QtWidgets.QWidget):
             self._canvas.draw_idle()
             return
 
+        vertices_plot = self._display_points_mm(vertices_deformed)
+
         # 复用缓存的边界面（拓扑不变，避免每帧 O(N log N) 的 unique 操作）
         visible_tets = self._visible_tets(tets, active_tet_mask)
         if len(visible_tets) == 0:
@@ -278,9 +304,9 @@ class MeshViewer(QtWidgets.QWidget):
 
         try:
             self._surf = self._ax.plot_trisurf(
-                vertices_deformed[:, 0],
-                vertices_deformed[:, 1],
-                vertices_deformed[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 triangles=boundary_faces,
                 cmap=cmap_name,
                 alpha=0.75,
@@ -295,26 +321,22 @@ class MeshViewer(QtWidgets.QWidget):
             else:
                 colors = "steelblue"
             self._scatter = self._ax.scatter(
-                vertices_deformed[:, 0],
-                vertices_deformed[:, 1],
-                vertices_deformed[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 c=colors,
                 s=8,
                 alpha=0.8,
             )
 
         # —— 自动缩放以包含所有点 + 基准底座平面 ——
-        x_min_d = float(np.min(vertices_deformed[:, 0]))
-        x_max_d = float(np.max(vertices_deformed[:, 0]))
-        y_min_d = float(np.min(vertices_deformed[:, 1]))
-        y_max_d = float(np.max(vertices_deformed[:, 1]))
-        z_min_d = float(np.min(vertices_deformed[:, 2]))
-        z_max_d = float(np.max(vertices_deformed[:, 2]))
+        x_min_d = float(np.min(vertices_plot[:, 0]))
+        x_max_d = float(np.max(vertices_plot[:, 0]))
+        y_min_d = float(np.min(vertices_plot[:, 1]))
+        y_max_d = float(np.max(vertices_plot[:, 1]))
 
         x_range = x_max_d - x_min_d or 0.01
         y_range = y_max_d - y_min_d or 0.01
-        z_range = z_max_d - z_min_d or 0.01
-        pad = max(x_range, y_range, z_range) * 0.1
 
         # 基准底座平面：Z=0 处半透明灰色矩形，带 20% 外扩边距
         expand = 0.2
@@ -334,11 +356,14 @@ class MeshViewer(QtWidgets.QWidget):
             linewidths=1.0,
         ))
 
-        self._ax.set_xlim(x_min_d - pad, x_max_d + pad)
-        self._ax.set_ylim(y_min_d - pad, y_max_d + pad)
-        # 锁定 Z 轴下限略低于 0，确保底座平面不被裁剪
-        z_lower = min(z_min_d - pad, -0.05 * z_range)
-        self._ax.set_zlim(z_lower, z_max_d + pad)
+        view_points = np.vstack([vertices_plot, base_corners])
+        xlim, ylim, zlim = self._equal_axis_bounds(view_points)
+        self._ax.set_xlim(*xlim)
+        self._ax.set_ylim(*ylim)
+        # Use equal axis spans so geometry is not visually stretched.
+        self._ax.set_zlim(*zlim)
+        if hasattr(self._ax, "set_box_aspect"):
+            self._ax.set_box_aspect((1.0, 1.0, 1.0))
 
         self._fig.tight_layout()
         self._canvas.draw_idle()
@@ -496,11 +521,13 @@ class MeshViewer(QtWidgets.QWidget):
             self._canvas.draw_idle()
             return
 
+        vertices_plot = self._display_points_mm(vertices)
+
         try:
             self._surf = self._ax.plot_trisurf(
-                vertices[:, 0],
-                vertices[:, 1],
-                vertices[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 triangles=faces,
                 cmap="viridis",
                 alpha=0.8,
@@ -509,24 +536,20 @@ class MeshViewer(QtWidgets.QWidget):
             )
         except Exception:
             self._scatter = self._ax.scatter(
-                vertices[:, 0],
-                vertices[:, 1],
-                vertices[:, 2],
+                vertices_plot[:, 0],
+                vertices_plot[:, 1],
+                vertices_plot[:, 2],
                 c="steelblue",
                 s=4,
                 alpha=0.8,
             )
 
         # 自动缩放
-        pad = (
-            max(*[float(np.ptp(vertices[:, d])) or 0.01 for d in range(3)])
-            * 0.1
-        )
-        for d, label in enumerate("XYZ"):
-            axis = getattr(self._ax, f"set_{label.lower()}lim")
-            axis(
-                float(np.min(vertices[:, d])) - pad,
-                float(np.max(vertices[:, d])) + pad,
-            )
+        xlim, ylim, zlim = self._equal_axis_bounds(vertices_plot)
+        self._ax.set_xlim(*xlim)
+        self._ax.set_ylim(*ylim)
+        self._ax.set_zlim(*zlim)
+        if hasattr(self._ax, "set_box_aspect"):
+            self._ax.set_box_aspect((1.0, 1.0, 1.0))
         self._fig.tight_layout()
         self._canvas.draw_idle()

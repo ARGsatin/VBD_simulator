@@ -67,6 +67,29 @@ class StateAndActivationTests(unittest.TestCase):
         np.testing.assert_array_equal(result.active_vertex_mask, np.array([True, True, True, False]))
         np.testing.assert_array_equal(result.active_tet_mask, np.array([False]))
 
+    def test_tet_activation_requires_all_vertices_active(self):
+        from hydrogel_vbd.core.state import MeshState
+
+        mesh = MeshState(
+            vertices=np.zeros((4, 3)),
+            tets=np.array([[0, 1, 2, 3]]),
+            layer_id_per_vertex=np.array([0, 1, 0, 0]),
+            first_active_layer=np.array([0, 1, 0, 0]),
+            layer_id_per_tet=np.array([0]),
+        )
+
+        mesh.activate_layer(0)
+
+        np.testing.assert_array_equal(
+            mesh.active_vertex_mask,
+            np.array([True, False, True, True]),
+        )
+        np.testing.assert_array_equal(mesh.active_tet_mask, np.array([False]))
+
+        mesh.activate_layer(1)
+
+        np.testing.assert_array_equal(mesh.active_tet_mask, np.array([True]))
+
 
 if __name__ == "__main__":
     unittest.main()

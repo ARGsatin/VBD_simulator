@@ -580,7 +580,7 @@ class OCCFragmentMesher:
     ) -> None:
         self.stl_path = stl_path
         self.layer_thickness = float(layer_thickness)
-        self.resolution = max(float(resolution), 0.001)
+        self.resolution = max(float(resolution), 1.0e-5)
         self.quality_factor = float(quality_factor)
         self.max_points = int(max_points)
         self.print_z_axis = str(print_z_axis or "z").lower()
@@ -1521,7 +1521,7 @@ class DelaunayTetMesher:
     ) -> None:
         self.stl_path = stl_path
         self.layer_thickness = float(layer_thickness)
-        self.resolution = max(float(resolution), 0.001)
+        self.resolution = max(float(resolution), 1.0e-5)
         self.quality_factor = float(quality_factor)
         self.max_points = int(max_points)
         self.print_z_axis = str(print_z_axis or "z").lower()

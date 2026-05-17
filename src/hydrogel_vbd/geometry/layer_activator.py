@@ -201,6 +201,7 @@ class LayerActivator:
         if len(face_nodes):
             mesh.active_vertex_mask[face_nodes] = True
             new_nodes = np.union1d(new_nodes, face_nodes)
+            mesh.refresh_active_tet_mask(current_layer)
 
         if len(bottom):
             dz_new = float(z_fep) - float(np.median(mesh.ideal_vertices[bottom, 2]))

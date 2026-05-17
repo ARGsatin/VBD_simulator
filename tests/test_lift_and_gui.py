@@ -784,6 +784,21 @@ class StlMesherTests(unittest.TestCase):
         self.assertEqual(mesher.stl_path, "nonexistent.stl")
         self.assertAlmostEqual(mesher.resolution, 0.02)
 
+    def test_fine_print_layer_resolution_is_not_clamped_to_one_mm(self) -> None:
+        from hydrogel_vbd.geometry.stl_mesher import (
+            DelaunayTetMesher,
+            OCCFragmentMesher,
+        )
+
+        for mesher_type in (OCCFragmentMesher, DelaunayTetMesher):
+            mesher = mesher_type(
+                stl_path="nonexistent.step",
+                layer_thickness=5.0e-5,
+                resolution=5.0e-5,
+            )
+
+            self.assertAlmostEqual(mesher.resolution, 5.0e-5)
+
 
 try:
     from PySide6.QtWidgets import QApplication  # noqa: F401
@@ -837,6 +852,22 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertTrue(win.isVisible() is False)
         app.quit()
 
+    def test_main_window_resolution_control_accepts_fifty_microns(self) -> None:
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        win = MainWindow()
+        win._spin_resolution.setValue(0.05)
+
+        self.assertLessEqual(win._spin_resolution.minimum(), 0.05)
+        self.assertGreaterEqual(win._spin_resolution.decimals(), 2)
+        self.assertAlmostEqual(win._spin_resolution.value(), 0.05)
+        app.quit()
+
     def test_mesh_viewer_filters_deformed_mesh_to_active_tets(self) -> None:
         from hydrogel_vbd.gui.mesh_viewer import MeshViewer
 
@@ -859,6 +890,98 @@ class GuiParamConfigTests(unittest.TestCase):
             0,
         )
         np.testing.assert_array_equal(MeshViewer._visible_tets(tets, None), tets)
+
+    def test_mesh_viewer_equal_axis_bounds_preserve_physical_aspect(self) -> None:
+        from hydrogel_vbd.gui.mesh_viewer import MeshViewer
+
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.020, 0.001, 0.005],
+            ],
+            dtype=float,
+        )
+
+        xlim, ylim, zlim = MeshViewer._equal_axis_bounds(vertices)
+
+        spans = np.array([xlim[1] - xlim[0], ylim[1] - ylim[0], zlim[1] - zlim[0]])
+        np.testing.assert_allclose(spans, np.repeat(spans[0], 3))
+        self.assertLess(xlim[0], 0.0)
+        self.assertGreater(xlim[1], 0.020)
+        self.assertLess(ylim[0], 0.0)
+        self.assertGreater(ylim[1], 0.001)
+        self.assertLess(zlim[0], 0.0)
+        self.assertGreater(zlim[1], 0.005)
+
+    def test_mesh_viewer_converts_internal_meters_to_display_mm(self) -> None:
+        from hydrogel_vbd.gui.mesh_viewer import MeshViewer
+
+        vertices_m = np.array(
+            [
+                [0.001, -0.002, 0.003],
+                [0.010, 0.0005, 0.012],
+            ],
+            dtype=float,
+        )
+
+        np.testing.assert_allclose(
+            MeshViewer._display_points_mm(vertices_m),
+            np.array(
+                [
+                    [1.0, -2.0, 3.0],
+                    [10.0, 0.5, 12.0],
+                ],
+                dtype=float,
+            ),
+        )
+
+    def test_mesh_bbox_summary_reports_mm_extents(self) -> None:
+        from hydrogel_vbd.gui.main_window import _format_bbox_mm
+
+        vertices = np.array(
+            [
+                [0.0, -0.002, 0.001],
+                [0.020, 0.003, 0.011],
+            ],
+            dtype=float,
+        )
+
+        summary = _format_bbox_mm(vertices)
+
+        self.assertIn("X[0.000, 20.000]", summary)
+        self.assertIn("Y[-2.000, 3.000]", summary)
+        self.assertIn("Z[1.000, 11.000]", summary)
+        self.assertIn("size[20.000, 5.000, 10.000]", summary)
+
+    def test_step_meshing_boundary_recovery_failure_does_not_retry_standard_for_many_layers(self) -> None:
+        from hydrogel_vbd.gui.main_window import _should_retry_standard_meshing
+
+        exc = RuntimeError("Gmsh 3D mesh failed: Could not recover boundary mesh: error 2")
+
+        self.assertFalse(
+            _should_retry_standard_meshing(
+                algo_type="layered",
+                is_step=True,
+                actual_layers=190,
+                exc=exc,
+            )
+        )
+        self.assertFalse(
+            _should_retry_standard_meshing(
+                algo_type="standard",
+                is_step=True,
+                actual_layers=190,
+                exc=exc,
+            )
+        )
+        self.assertFalse(
+            _should_retry_standard_meshing(
+                algo_type="layered",
+                is_step=True,
+                actual_layers=20,
+                exc=exc,
+            )
+        )
 
     def test_solver_diagnostics_checkbox_controls_run_environment(self) -> None:
         from hydrogel_vbd.gui.main_window import MainWindow
@@ -1639,6 +1762,87 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
         self.assertEqual(len(return_calls), 2)
         for v_lift in return_calls:
             self.assertAlmostEqual(v_lift, -config.v_lift)
+
+    def test_cpp_platform_return_disables_czm_for_downstroke(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=True,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            lift_multiplier=1.5,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "enable_czm": config.enable_czm,
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+        observed_calls: list[tuple[int, float, bool]] = []
+
+        class FakeConn:
+            def send(self, msg) -> None:  # noqa: ANN001
+                pass
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            observed_calls.append(
+                (int(layer_id), float(cfg_arg.v_lift), bool(cfg_arg.enable_czm))
+            )
+            step = float(cfg_arg.v_lift) * float(cfg_arg.dt)
+            mesh_arg.vertices[np.asarray(lifting_top, dtype=int), 2] += step
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_solve,
+        ):
+            _run_simulation(
+                FakeConn(), mesh_dict, config_dict,
+                n_layers=2, output_dir="outputs/test_cpp_platform_return_czm",
+            )
+
+        lift_calls = [enable for layer, v_lift, enable in observed_calls if layer == 0 and v_lift > 0.0]
+        return_calls = [enable for layer, v_lift, enable in observed_calls if layer == 0 and v_lift < 0.0]
+        self.assertTrue(lift_calls)
+        self.assertTrue(all(lift_calls))
+        self.assertTrue(return_calls)
+        self.assertTrue(all(enable is False for enable in return_calls))
 
     def test_cpp_subprocess_traces_hit_rate_quality_and_scaled_lift_epsilon(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig

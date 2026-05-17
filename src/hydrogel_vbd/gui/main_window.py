@@ -82,6 +82,33 @@ class _ElectricFieldPlotData:
     primary_ylabel: str
 
 
+def _format_bbox_mm(vertices: np.ndarray) -> str:
+    arr = np.asarray(vertices, dtype=float)
+    if arr.size == 0:
+        return "bbox empty"
+    mins = np.min(arr, axis=0) * 1000.0
+    maxs = np.max(arr, axis=0) * 1000.0
+    size = maxs - mins
+    return (
+        f"bbox mm: X[{mins[0]:.3f}, {maxs[0]:.3f}] "
+        f"Y[{mins[1]:.3f}, {maxs[1]:.3f}] "
+        f"Z[{mins[2]:.3f}, {maxs[2]:.3f}] "
+        f"size[{size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f}]"
+    )
+
+
+def _should_retry_standard_meshing(
+    *,
+    algo_type: str,
+    is_step: bool,
+    actual_layers: int,
+    exc: Exception,
+) -> bool:
+    """Avoid silently replacing a layer-conformal STEP mesh with a free tet mesh."""
+    del algo_type, is_step, actual_layers, exc
+    return False
+
+
 # 参数元数据列表：定义每个参数在 GUI 中的显示标签、默认值、取值范围
 _PARAM_META: list[dict[str, Any]] = [
     {"key": "mu", "label": "剪切模量 μ (Pa)", "default": 5000.0, "min": 500.0, "max": 1e6},
@@ -479,12 +506,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_resolution.setStyleSheet("font-weight: bold;")
         info_1.addWidget(self._lbl_resolution)
         self._spin_resolution = QtWidgets.QDoubleSpinBox()
-        self._spin_resolution.setRange(0.5, 500.0)
-        self._spin_resolution.setDecimals(1)
+        self._spin_resolution.setRange(0.01, 500.0)
+        self._spin_resolution.setDecimals(3)
         self._spin_resolution.setValue(20.0)
-        self._spin_resolution.setSingleStep(1.0)
+        self._spin_resolution.setSingleStep(0.05)
         self._spin_resolution.setSuffix(" mm")
-        self._spin_resolution.setMaximumWidth(90)
+        self._spin_resolution.setMaximumWidth(110)
         self._spin_resolution.setToolTip("Demo 模式 XY 网格间距 (mm)")
         self._spin_resolution.valueChanged.connect(self._on_demo_params_changed)
         info_1.addWidget(self._spin_resolution)
@@ -745,7 +772,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lbl_auto_res.setText("(手动模式)")
         else:
             self._lbl_auto_res.setText(
-                f"(自动推荐: {self._spin_resolution.value():.1f} mm)"
+                f"(自动推荐: {self._spin_resolution.value():.3f} mm)"
             )
             self._generated_mesh = None
             self.mesh = None
@@ -938,14 +965,14 @@ class MainWindow(QtWidgets.QMainWindow):
         resolution_mm = resolution_m * 1000.0
         self._demo_default_resolution_mm = resolution_mm
         self._spin_resolution.blockSignals(True)
-        self._spin_resolution.setValue(round(resolution_mm, 1))
+        self._spin_resolution.setValue(round(resolution_mm, 3))
         self._spin_resolution.blockSignals(False)
         # 更新自动推荐提示
         if self._lbl_auto_res is not None:
             is_custom = self._chk_custom_res.isChecked() if self._chk_custom_res else False
             if not is_custom:
                 self._lbl_auto_res.setText(
-                    f"(自动推荐: {resolution_mm:.1f} mm)"
+                    f"(自动推荐: {resolution_mm:.3f} mm)"
                 )
 
     # ========================================================================
@@ -1007,13 +1034,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._log.append_log(
             f"  · 自动计算: {self._actual_layers} 层, "
-            f"分辨率 {self._auto_resolution*1000:.2f} mm"
+            f"分辨率 {self._auto_resolution*1000:.3f} mm"
         )
         self._log.append_log("  · 请点击「划分网格」生成四面体网格")
         self._status.showMessage(
             f"已加载 {self._stl_path.name} | "
             f"{self._actual_layers} 层 | "
-            f"{self._auto_resolution*1000:.2f} mm 分辨率"
+            f"{self._auto_resolution*1000:.3f} mm 分辨率"
         )
 
         # ── 立即在 3D 视图中显示 STL 模型原始表面 ──
@@ -1092,11 +1119,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not is_custom:
             resolution_mm = auto_res * 1000.0
             self._spin_resolution.blockSignals(True)
-            self._spin_resolution.setValue(round(resolution_mm, 1))
+            self._spin_resolution.setValue(round(resolution_mm, 3))
             self._spin_resolution.blockSignals(False)
             if self._lbl_auto_res is not None:
                 self._lbl_auto_res.setText(
-                    f"(自动推荐: {resolution_mm:.1f} mm)"
+                    f"(自动推荐: {resolution_mm:.3f} mm)"
                 )
 
     def _get_bounds_via_gmsh(self) -> tuple[float, float, float, float, float, float]:
@@ -1290,6 +1317,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 # ── Gmsh 返回 1-based 索引 → 0-based ──
                 faces_preview = faces_preview - 1
+                self._log.append_log(f"  · STEP preview {_format_bbox_mm(vertices_preview)}")
 
                 # ── 渲染表面代理 ──
                 self._viewer.show_stl_surface(
@@ -1376,7 +1404,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log.append_log(
                     f"层厚: {lt_mm:.2f} mm | "
                     f"层数: {self._actual_layers} | "
-                    f"分辨率: {user_res_mm:.1f} mm"
+                    f"分辨率: {user_res_mm:.3f} mm"
                 )
                 self._status.showMessage("正在划分网格（OCC Boolean Fragment）…")
 
@@ -1392,7 +1420,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     resolution=user_res_mm * 1e-3,
                     print_z_axis=self._print_z_axis(),
                 )
-                mesh, actual_layers = mesher.build_layered_mesh(config, algo_type=algo_type)
+                try:
+                    mesh, actual_layers = mesher.build_layered_mesh(
+                        config, algo_type=algo_type
+                    )
+                except Exception as mesh_exc:
+                    if not _should_retry_standard_meshing(
+                        algo_type=algo_type,
+                        is_step=is_step,
+                        actual_layers=self._actual_layers,
+                        exc=mesh_exc,
+                    ):
+                        raise
+                    self._log.append_log(
+                        "  ! layered STEP meshing failed for fine slices; "
+                        "retrying standard unstructured mesh"
+                    )
+                    mesh, actual_layers = mesher.build_layered_mesh(
+                        config, algo_type="standard"
+                    )
                 self._actual_layers = actual_layers
                 self._lbl_layers.setText(str(actual_layers))
                 self._log.append_log(
@@ -1437,6 +1483,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mesh.elements = mesh.tets.copy()
 
             # 在 3D 视图中展示初始网格
+            self._log.append_log(f"  · initial mesh {_format_bbox_mm(mesh.vertices)}")
             self._viewer.show_initial_mesh(mesh.vertices, mesh.tets)
             self._log.append_log("  · 3D 视图已更新为初始网格")
             self._log.append_log("  · 请点击「运行仿真」开始逐层计算")

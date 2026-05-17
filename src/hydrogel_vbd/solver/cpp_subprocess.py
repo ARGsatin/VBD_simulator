@@ -767,6 +767,7 @@ def _run_simulation(
                 down_config = replace(
                     layer_config,
                     v_lift=-return_step_distance / max(abs(dt), 1e-12),
+                    enable_czm=False,
                 )
                 x_before_solve = mesh.vertices.copy()
                 call_start = time.perf_counter()

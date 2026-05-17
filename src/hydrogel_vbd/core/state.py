@@ -459,7 +459,16 @@ class MeshState:
             当前打印层号（从 0 开始）。
         """
         self.active_vertex_mask = self.first_active_layer <= current_layer
-        self.active_tet_mask = self.layer_id_per_tet <= current_layer
+        self.refresh_active_tet_mask(current_layer)
+
+    def refresh_active_tet_mask(self, current_layer: int) -> None:
+        """Refresh active tetrahedra after vertex activation changes."""
+        layer_active = self.layer_id_per_tet <= current_layer
+        if self.tets.size == 0:
+            self.active_tet_mask = layer_active
+            return
+        vertices_active = np.all(self.active_vertex_mask[self.tets], axis=1)
+        self.active_tet_mask = layer_active & vertices_active
 
     def bottom_nodes(self, layer_id: int) -> np.ndarray:
         """获取指定层底面节点的索引。
