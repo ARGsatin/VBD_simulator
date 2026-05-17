@@ -862,6 +862,32 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertAlmostEqual(config.node_area, 1.0e-6)
         app.quit()
 
+    def test_fluid_czm_parameters_are_exposed_in_gui_param_panel(self) -> None:
+        from hydrogel_vbd.gui.main_window import ParameterPanel
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        panel = ParameterPanel()
+        values = {
+            "eta": 0.6,
+            "C_0": 25.0,
+            "fluid_radius": 0.0015,
+            "d_fluid_max": 0.0004,
+            "t_fluid_max": 0.15,
+            "d_min": 2.0e-6,
+        }
+        for key, value in values.items():
+            self.assertIn(key, panel._spin_map)
+            panel._spin_map[key].setValue(value)
+
+        config = panel.get_config()
+        for key, value in values.items():
+            self.assertAlmostEqual(getattr(config, key), value)
+        app.quit()
+
     def test_main_window_init(self) -> None:
         from hydrogel_vbd.gui.main_window import MainWindow
         from PySide6.QtWidgets import QApplication
@@ -874,6 +900,9 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertEqual(win.windowTitle(), "Hydrogel VBD Simulator")
         self.assertIsNotNone(win._chk_solver_diag)
         self.assertFalse(win._chk_solver_diag.isChecked())
+        self.assertGreaterEqual(win._left_layout.stretch(
+            win._left_layout.indexOf(win._param_scroll_area)
+        ), 1)
         self.assertTrue(win.isVisible() is False)
         app.quit()
 
@@ -977,6 +1006,16 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertIn("Y[-2.000, 3.000]", summary)
         self.assertIn("Z[1.000, 11.000]", summary)
         self.assertIn("size[20.000, 5.000, 10.000]", summary)
+
+    def test_worker_frame_layer_id_parses_cpp_and_python_titles(self) -> None:
+        from hydrogel_vbd.gui.main_window import _frame_layer_id_from_title
+
+        cpp_title = "\u7b2c 3 \u5c42 \u2014 \u4e0b\u653e\u5b8c\u6210/\u5c42\u7ed3\u675f"
+        python_title = "\u7b2c 3/10 \u5c42 \u2014 \u63d0\u5347 1.000e-3 m"
+
+        self.assertEqual(_frame_layer_id_from_title(cpp_title), 2)
+        self.assertEqual(_frame_layer_id_from_title(python_title), 2)
+        self.assertEqual(_frame_layer_id_from_title("仿真完成"), -1)
 
     def test_step_meshing_boundary_recovery_failure_does_not_retry_standard_for_many_layers(self) -> None:
         from hydrogel_vbd.gui.main_window import _should_retry_standard_meshing
@@ -1747,6 +1786,88 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
         self.assertIn("previous_bottom_z=", trace_text)
         self.assertIn("current_bottom_z=", trace_text)
         self.assertIn("target_gap=", trace_text)
+
+    def test_cpp_subprocess_emits_layer_end_frame_before_next_activation(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
+        from hydrogel_vbd.solver.cpp_subprocess import _FrameMsg, _run_simulation
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=False,
+            dt=1.0e-3,
+            v_lift=1.0e-3,
+            layer_thickness=1.0e-6,
+            lift_multiplier=1.5,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh, _ = ConformalMeshPipeline.create_demo(
+            layers=2, layer_thickness=config.layer_thickness, config=config
+        )
+        mesh_dict = {
+            attr: getattr(mesh, attr)
+            for attr in (
+                "vertices", "velocities", "prev_vertices", "ideal_vertices",
+                "node_mass", "active_vertex_mask", "is_top_fixed",
+                "is_bottom_surface", "czm_state", "damage", "time_free",
+                "tets", "active_tet_mask", "dm_inv", "tet_volumes", "colors",
+                "layer_id_per_vertex", "layer_id_per_tet", "first_active_layer",
+                "is_top_surface_of_layer",
+            )
+            if getattr(mesh, attr, None) is not None
+        }
+        config_dict = {
+            "enable_czm": config.enable_czm,
+            "dt": config.dt,
+            "v_lift": config.v_lift,
+            "layer_thickness": config.layer_thickness,
+            "lift_multiplier": config.lift_multiplier,
+            "max_iters": config.max_iters,
+            "N_stable": config.N_stable,
+        }
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def send(self, msg) -> None:  # noqa: ANN001
+                self.messages.append(msg)
+
+            def poll(self) -> bool:
+                return False
+
+        def fake_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            step = float(cfg_arg.v_lift) * float(cfg_arg.dt)
+            mesh_arg.vertices[np.asarray(lifting_top, dtype=int), 2] += step
+            return VBDSolveResult(
+                x=mesh_arg.vertices,
+                v=mesh_arg.velocities,
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        conn = FakeConn()
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_solve,
+        ):
+            _run_simulation(
+                conn, mesh_dict, config_dict,
+                n_layers=2, output_dir="outputs/test_cpp_layer_end_frame",
+            )
+
+        titles = [msg.title for msg in conn.messages if isinstance(msg, _FrameMsg)]
+        layer1_end = "\u7b2c 1 \u5c42 \u2014 \u4e0b\u653e\u5b8c\u6210/\u5c42\u7ed3\u675f"
+        layer2_activation = "\u7b2c 2 \u5c42 \u2014 \u6fc0\u6d3b\u540e/\u4e0a\u63d0\u524d"
+        layer2_final = "\u7b2c 2 \u5c42 \u2014 \u4e0a\u63d0\u5b8c\u6210/\u6700\u7ec8\u72b6\u6001"
+        self.assertIn(layer1_end, titles)
+        self.assertIn(layer2_final, titles)
+        self.assertLess(titles.index(layer1_end), titles.index(layer2_activation))
 
     def test_cpp_subprocess_returns_platform_before_next_layer_activation(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig

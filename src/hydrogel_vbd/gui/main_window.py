@@ -97,6 +97,20 @@ def _format_bbox_mm(vertices: np.ndarray) -> str:
     )
 
 
+def _frame_layer_id_from_title(title: str) -> int:
+    import re
+
+    text = str(title)
+    for pattern in (
+        "\u7b2c\\s*(\\d+)\\s*/",
+        "\u7b2c\\s*(\\d+)\\s*\u5c42",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1)) - 1
+    return -1
+
+
 def _should_retry_standard_meshing(
     *,
     algo_type: str,
@@ -119,6 +133,12 @@ _PARAM_META: list[dict[str, Any]] = [
     {"key": "K_czm", "label": "CZM 刚度 (Pa/m)", "default": 1.0e7, "min": 1e6, "max": 1e10},
     {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 5.0e-4, "min": 1e-6, "max": 1e-2},
     {"key": "node_area", "label": "CZM node area (m^2)", "default": 1.0e-6, "min": 1e-10, "max": 1e-3},
+    {"key": "eta", "label": "流体/损伤系数 η", "default": 0.8, "min": 0.0, "max": 10.0, "step": 0.1},
+    {"key": "C_0", "label": "流体负压倍率 C_0", "default": 1.0, "min": 0.0, "max": 1000.0, "step": 1.0},
+    {"key": "fluid_radius", "label": "流体作用半径 r (m)", "default": 0.001, "min": 1e-5, "max": 1e-2, "step": 1e-4},
+    {"key": "d_fluid_max", "label": "流体作用距离 d_fluid_max (m)", "default": 2.0e-3, "min": 0.0, "max": 1e-2, "step": 1e-4},
+    {"key": "t_fluid_max", "label": "流体持续时间 t_fluid_max (s)", "default": 0.5, "min": 0.0, "max": 10.0, "step": 0.05},
+    {"key": "d_min", "label": "最小液膜间隙 d_min (m)", "default": 1.0e-6, "min": 1e-9, "max": 1e-4, "decimals": 9, "step": 1e-6},
     {"key": "dt", "label": "时间步长 dt (s)", "default": 0.001, "min": 0.0001, "max": 0.05},
     {"key": "max_iters", "label": "最大迭代次数", "default": 50, "min": 5, "max": 200},
     {"key": "N_stable", "label": "稳定步数判决", "default": 3, "min": 2, "max": 50},
@@ -164,9 +184,11 @@ class ParameterPanel(QtWidgets.QGroupBox):
             if isinstance(default, float):
                 sb = QtWidgets.QDoubleSpinBox()
                 sb.setRange(meta["min"], meta["max"])
-                sb.setDecimals(6)
+                sb.setDecimals(int(meta.get("decimals", 6)))
                 sb.setValue(default)
-                sb.setSingleStep((meta["max"] - meta["min"]) / 100.0)
+                sb.setSingleStep(float(
+                    meta.get("step", (meta["max"] - meta["min"]) / 100.0)
+                ))
             else:
                 sb = QtWidgets.QSpinBox()
                 sb.setRange(meta["min"], meta["max"])
@@ -475,6 +497,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.setMinimumWidth(480)
         left.setMaximumWidth(620)
         left_layout = QtWidgets.QVBoxLayout(left)
+        self._left_layout = left_layout
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.setSpacing(6)
         self._param_panel = ParameterPanel()
@@ -594,8 +617,8 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll_area.setWidget(self._param_panel)
-        left_layout.addWidget(scroll_area)
-        left_layout.addStretch()
+        self._param_scroll_area = scroll_area
+        left_layout.addWidget(scroll_area, 1)
 
         # 右侧面板
         right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -1808,6 +1831,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        lid = _frame_layer_id_from_title(title)
         self.animation_frames.append({
             "vertices": vertices.copy(),
             "active_mask": active_mask.copy(),

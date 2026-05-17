@@ -836,6 +836,29 @@ def _run_simulation(
                 f"avg_call={avg_call_ms:.1f} ms, "
                 f"active_nodes={len(active_nodes)}, active_tets={active_tets}"
             )))
+        if not diag_stopped:
+            if layer_id + 1 >= n_layers:
+                final_title = (
+                    f"\u7b2c {layer_id + 1} \u5c42 \u2014 "
+                    "\u4e0a\u63d0\u5b8c\u6210/\u6700\u7ec8\u72b6\u6001"
+                )
+            elif layer_return_steps > 0:
+                final_title = (
+                    f"\u7b2c {layer_id + 1} \u5c42 \u2014 "
+                    "\u4e0b\u653e\u5b8c\u6210/\u5c42\u7ed3\u675f"
+                )
+            else:
+                final_title = (
+                    f"\u7b2c {layer_id + 1} \u5c42 \u2014 "
+                    "\u5c42\u7ed3\u675f"
+                )
+            conn.send(_FrameMsg(
+                vertices=mesh.vertices.copy(),
+                tets=mesh.tets.copy(),
+                active_mask=mesh.active_vertex_mask.copy(),
+                active_tet_mask=mesh.active_tet_mask.copy(),
+                title=final_title,
+            ))
         results.append({
             "layer_id": layer_id,
             "total_steps": layer_steps,
