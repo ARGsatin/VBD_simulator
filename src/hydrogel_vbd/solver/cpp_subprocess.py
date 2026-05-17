@@ -403,8 +403,11 @@ def _run_simulation(
     if diag_enabled:
         prepare_solver_diagnostics_csv(diag_path)
         _trace(f"diagnostic_csv_prepared path={diag_path}")
+    from hydrogel_vbd.solver.cpp_adapter import solver_dx_clip
+
+    current_dx_clip = DX_CLIP_DIAGNOSTIC
     diag_guard = SolverRunawayGuard(
-        limit=50, max_iters=int(config.max_iters), dx_clip=DX_CLIP_DIAGNOSTIC
+        limit=50, max_iters=int(config.max_iters), dx_clip=current_dx_clip
     )
     diag_stopped = False
 
@@ -416,7 +419,7 @@ def _run_simulation(
             or step % diag_stride == 0
             or int(getattr(result, "iterations", 0)) >= int(config.max_iters)
             or float(getattr(result, "max_dx", 0.0))
-            >= DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
+            >= current_dx_clip * (1.0 - 1e-9)
         )
 
     def _record_diag(
@@ -442,7 +445,7 @@ def _run_simulation(
             expected_steps=expected_steps,
             result=result,
             call_ms=call_ms,
-            dx_clip=DX_CLIP_DIAGNOSTIC,
+            dx_clip=current_dx_clip,
             z_fep=_layer_contact_z(config, layer_id),
             x_before=x_before,
             czm_pull=czm_pull,
@@ -476,6 +479,8 @@ def _run_simulation(
 
         layer_z_fep = _layer_contact_z(config, layer_id)
         layer_config = replace(config, z_fep=layer_z_fep)
+        current_dx_clip = solver_dx_clip(layer_config)
+        diag_guard.dx_clip = current_dx_clip
         activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
         previous_bottom = (
             mesh.bottom_nodes(layer_id - 1)
@@ -525,7 +530,8 @@ def _run_simulation(
             f"layer_{layer_id}_solver_tolerance "
             f"base_epsilon={float(config.epsilon):.6e} "
             f"solver_epsilon={solver_epsilon:.6e} "
-            f"target_gap={target_gap:.6e} lift_step={lift_step:.6e}"
+            f"target_gap={target_gap:.6e} lift_step={lift_step:.6e} "
+            f"dx_clip={current_dx_clip:.6e}"
         )
         top_ids = _current_lifting_top(mesh)
 
@@ -569,7 +575,7 @@ def _run_simulation(
             layer_total_iterations += int(result.iterations)
             if result.iterations >= config.max_iters:
                 layer_max_iter_hits += 1
-            if result.max_dx >= DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9):
+            if result.max_dx >= current_dx_clip * (1.0 - 1e-9):
                 layer_clipped_steps += 1
             step_counter += result.iterations
             _record_diag(
@@ -609,7 +615,8 @@ def _run_simulation(
                 f"layer_{layer_id}_lift_start top_ids={len(top_ids)} "
                 f"v_lift={v_lift} dt={dt} lift_max={lift_max} "
                 f"lift_step={lift_step} expected_steps={expected_lift_steps} "
-                f"solver_epsilon={solver_epsilon:.6e}"
+                f"solver_epsilon={solver_epsilon:.6e} "
+                f"dx_clip={current_dx_clip:.6e}"
             )
             trace_every_step = os.environ.get("HYDROGEL_VBD_TRACE_STEPS") == "1"
             trace_stride = int(os.environ.get("HYDROGEL_VBD_TRACE_STRIDE", "250"))
@@ -665,7 +672,7 @@ def _run_simulation(
                 layer_total_iterations += int(result.iterations)
                 if result.iterations >= config.max_iters:
                     layer_max_iter_hits += 1
-                if result.max_dx >= DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9):
+                if result.max_dx >= current_dx_clip * (1.0 - 1e-9):
                     layer_clipped_steps += 1
                 if should_trace_step:
                     _trace(
@@ -784,7 +791,7 @@ def _run_simulation(
                 layer_total_iterations += int(result.iterations)
                 if result.iterations >= config.max_iters:
                     layer_max_iter_hits += 1
-                if result.max_dx >= DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9):
+                if result.max_dx >= current_dx_clip * (1.0 - 1e-9):
                     layer_clipped_steps += 1
                 if (
                     return_step_index == 1
@@ -819,7 +826,8 @@ def _run_simulation(
             f"clipped_steps={layer_clipped_steps} "
             f"avg_call_ms={avg_call_ms:.3f} "
             f"active_nodes={len(active_nodes)} active_tets={active_tets} "
-            f"solver_epsilon={solver_epsilon:.6e}"
+            f"solver_epsilon={solver_epsilon:.6e} "
+            f"dx_clip={current_dx_clip:.6e}"
         )
         if max_iter_hit_rate >= 20.0:
             conn.send(_LogMsg(text=(
@@ -843,6 +851,7 @@ def _run_simulation(
             "platform_return_distance": platform_return_distance,
             "platform_return_steps": layer_return_steps,
             "solver_epsilon": solver_epsilon,
+            "dx_clip": current_dx_clip,
             "expected_steps": expected_lift_steps,
             "active_nodes": len(active_nodes),
             "active_tets": active_tets,

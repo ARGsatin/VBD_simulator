@@ -328,7 +328,7 @@ VBDSolveResult solve_until_stable(
     const double dt2 = cfg.dt * cfg.dt;
     const double inv_dt = 1.0 / std::max(cfg.dt, 1e-12);
     const double inv_dt2 = 1.0 / std::max(dt2, 1e-12);
-    const double dx_clip = 0.002;  // 步长截断阈值：2 mm
+    const double dx_clip = std::max(cfg.dx_clip, 1e-12);
 
     for (int iteration = 1; iteration <= cfg.max_iters; ++iteration) {
         iterations_done = iteration;
@@ -531,7 +531,7 @@ VBDSolveResult solve_lift_and_relax(
     const double dt2 = cfg.dt * cfg.dt;
     const double inv_dt = 1.0 / std::max(cfg.dt, 1e-12);
     const double inv_dt2 = 1.0 / std::max(dt2, 1e-12);
-    const double dx_clip = 0.002;  // 步长截断阈值收紧至 2 mm
+    const double dx_clip = std::max(cfg.dx_clip, 1e-12);
     const double lift_step = cfg.v_lift * cfg.dt;
 
     // ── 收集底面节点（用于 CZM 状态更新与剥离判定）──

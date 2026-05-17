@@ -23,6 +23,11 @@ from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
 _CPP_AVAILABLE = False
 _CPP_IMPORT_ERROR: str | None = None
 
+DX_CLIP_MAX = 2.0e-3
+DX_CLIP_MIN = 5.0e-6
+DX_CLIP_LAYER_FRACTION = 0.5
+DX_CLIP_LIFT_STEP_FACTOR = 2.0
+
 
 def _prefer_newer_cpp_build_dir() -> None:
     """Prefer freshly built development binaries over stale deployed pyd files."""
@@ -103,6 +108,20 @@ def cpp_module_info() -> str:
     return f"{_CPP_MODULE_NAME} {module_path}"
 
 
+def solver_dx_clip(cfg: SimulationConfig) -> float:
+    """Return a per-call displacement clip scaled to the print layer size."""
+    layer_thickness = abs(float(getattr(cfg, "layer_thickness", 0.0)))
+    lift_step = abs(
+        float(getattr(cfg, "v_lift", 0.0)) * float(getattr(cfg, "dt", 0.0))
+    )
+    scaled = max(
+        DX_CLIP_MIN,
+        DX_CLIP_LAYER_FRACTION * layer_thickness,
+        DX_CLIP_LIFT_STEP_FACTOR * lift_step,
+    )
+    return min(DX_CLIP_MAX, scaled)
+
+
 def refresh_availability() -> bool:
     """编译后重新检测 C++ 模块（支持热加载，无需重启进程）。
 
@@ -181,6 +200,7 @@ def _build_cpp_config(cfg: SimulationConfig) -> Any:
     cpp_cfg.t_fluid_max = cfg.t_fluid_max
     cpp_cfg.v_lift = cfg.v_lift
     cpp_cfg.layer_thickness = cfg.layer_thickness
+    cpp_cfg.dx_clip = solver_dx_clip(cfg)
     cpp_cfg.c_init = cfg.c_init
     return cpp_cfg
 
@@ -302,9 +322,10 @@ def _current_bottom_mask(mesh: MeshState, layer_id: int) -> np.ndarray:
 
 
 def _hit_clipped_max_iters(result_dict: dict[str, Any], config: SimulationConfig) -> bool:
+    dx_clip = solver_dx_clip(config)
     return (
         int(result_dict["iterations"]) >= int(config.max_iters)
-        and float(result_dict["max_dx"]) >= 0.002 * (1.0 - 1e-9)
+        and float(result_dict["max_dx"]) >= dx_clip * (1.0 - 1e-9)
     )
 
 

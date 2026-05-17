@@ -799,6 +799,31 @@ class StlMesherTests(unittest.TestCase):
 
             self.assertAlmostEqual(mesher.resolution, 5.0e-5)
 
+    def test_occ_mesh_min_size_tracks_fine_layer_thickness(self) -> None:
+        from hydrogel_vbd.geometry.stl_mesher import (
+            _occ_gmsh_mesh_retry_attempts_mm,
+            _occ_gmsh_mesh_size_bounds_mm,
+        )
+
+        max_size_mm, min_size_mm = _occ_gmsh_mesh_size_bounds_mm(
+            resolution_m=1.0e-3,
+            quality_factor=1.0,
+            layer_thickness_m=5.0e-5,
+        )
+
+        self.assertAlmostEqual(max_size_mm, 1.0)
+        self.assertAlmostEqual(min_size_mm, 0.0125)
+
+        attempts = _occ_gmsh_mesh_retry_attempts_mm(
+            max_size_mm, min_size_mm, layer_thickness_m=5.0e-5
+        )
+
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertEqual(attempts[0][2:], (4, 5))
+        self.assertEqual(attempts[1][2:], (1, 5))
+        self.assertAlmostEqual(attempts[0][0], 1.0)
+        self.assertAlmostEqual(attempts[0][1], 0.0125)
+
 
 try:
     from PySide6.QtWidgets import QApplication  # noqa: F401
@@ -1265,6 +1290,45 @@ class GuiParamConfigTests(unittest.TestCase):
 
 class CppAdapterStateWritebackTests(unittest.TestCase):
     """C++ 适配层可写状态数组回写回归测试。"""
+
+    def test_cpp_config_scales_dx_clip_to_layer_thickness(self) -> None:
+        from types import SimpleNamespace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        import hydrogel_vbd.solver.cpp_adapter as cpp_adapter
+
+        class FakeSolverConfig:
+            pass
+
+        fake_cpp = SimpleNamespace(SolverConfig=FakeSolverConfig)
+        config = SimulationConfig(
+            layer_thickness=5.0e-5,
+            dt=1.0e-3,
+            v_lift=1.0e-2,
+        )
+
+        with patch.object(cpp_adapter, "hydrogel_vbd_cpp", fake_cpp):
+            cpp_cfg = cpp_adapter._build_cpp_config(config)
+
+        self.assertAlmostEqual(cpp_cfg.dx_clip, 2.5e-5)
+
+    def test_clipped_max_iter_uses_scaled_dx_clip(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        import hydrogel_vbd.solver.cpp_adapter as cpp_adapter
+
+        config = SimulationConfig(
+            layer_thickness=5.0e-5,
+            dt=1.0e-3,
+            v_lift=1.0e-2,
+            max_iters=50,
+        )
+
+        self.assertTrue(cpp_adapter._hit_clipped_max_iters(
+            {"iterations": 50, "max_dx": 2.5e-5}, config
+        ))
+        self.assertFalse(cpp_adapter._hit_clipped_max_iters(
+            {"iterations": 50, "max_dx": 1.0e-5}, config
+        ))
 
     def test_cpp_adapter_passes_current_layer_bottom_mask(self) -> None:
         from types import SimpleNamespace

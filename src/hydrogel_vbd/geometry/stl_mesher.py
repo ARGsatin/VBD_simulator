@@ -125,6 +125,59 @@ def _top_aligned_slice_origin(
     return float(z_max_m) - int(n_layers) * float(layer_thickness_m)
 
 
+def _occ_gmsh_mesh_size_bounds_mm(
+    resolution_m: float,
+    quality_factor: float,
+    layer_thickness_m: float,
+) -> tuple[float, float]:
+    """Return Gmsh max/min mesh sizes in mm for OCC layer fragments."""
+    layer_mm = max(abs(float(layer_thickness_m)) * 1000.0, 1.0e-9)
+    quality = max(abs(float(quality_factor)), 1.0e-12)
+    max_size_mm = max(abs(float(resolution_m)) * 1000.0 / quality, layer_mm * 0.5)
+    max_size_mm = min(max_size_mm, 500.0)
+    min_size_mm = min(max_size_mm * 0.1, layer_mm * 0.25)
+    min_size_mm = max(min_size_mm, 1.0e-6)
+    return max_size_mm, min_size_mm
+
+
+def _occ_gmsh_mesh_retry_attempts_mm(
+    max_size_mm: float,
+    min_size_mm: float,
+    layer_thickness_m: float,
+) -> list[tuple[float, float, int, int]]:
+    """Return conservative Gmsh retry settings for very thin layer stacks."""
+    layer_mm = max(abs(float(layer_thickness_m)) * 1000.0, 1.0e-9)
+    max_size = float(max_size_mm)
+    min_size = float(min_size_mm)
+    thin_stack = max_size / layer_mm > 8.0
+    if thin_stack:
+        attempts = [
+            (max_size, min_size, 4, 5),
+            (max_size, min_size, 1, 5),
+            (max_size, min_size, 4, 6),
+        ]
+    else:
+        attempts = [
+            (max_size, min_size, 1, 5),
+            (max_size, min_size, 4, 5),
+            (max_size, min_size, 4, 6),
+        ]
+    unique: list[tuple[float, float, int, int]] = []
+    seen: set[tuple[float, float, int, int]] = set()
+    for attempt in attempts:
+        key = (
+            round(attempt[0], 12),
+            round(attempt[1], 12),
+            int(attempt[2]),
+            int(attempt[3]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(attempt)
+    return unique
+
+
 def transform_points_to_print_z(
     points: np.ndarray,
     print_z_axis: str = "z",
@@ -1092,31 +1145,57 @@ class OCCFragmentMesher:
         tuple[MeshState, int]
         """
         # ── 设置网格尺寸 ──
-        mesh_size_mm = self.resolution * 1000.0 / self.quality_factor  # m → mm
-        mesh_size_mm = max(mesh_size_mm, layer_thickness_m * 1000.0 * 0.5)  # 确保不小于层厚的一半
-        mesh_size_mm = min(mesh_size_mm, 500.0)  # 上限 500 mm
-
-        gmsh.option.setNumber("Mesh.Algorithm3D", 1)        # 3D Delaunay
-        gmsh.option.setNumber("Mesh.Algorithm", 5)           # 2D Delaunay
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size_mm * 0.1)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size_mm)
-        gmsh.option.setNumber("Mesh.Optimize", 1)
-        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
-        gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
-
-        # 为所有点设置网格尺寸
-        gmsh.model.mesh.setSize(
-            gmsh.model.getEntities(0), mesh_size_mm
+        mesh_size_mm, mesh_min_size_mm = _occ_gmsh_mesh_size_bounds_mm(
+            self.resolution,
+            self.quality_factor,
+            layer_thickness_m,
+        )
+        mesh_attempts = _occ_gmsh_mesh_retry_attempts_mm(
+            mesh_size_mm,
+            mesh_min_size_mm,
+            layer_thickness_m,
         )
 
-        # ── 生成 3D 网格 ──
-        try:
-            gmsh.model.mesh.generate(3)
-        except Exception as exc:
+        last_exc: Exception | None = None
+        for attempt_id, (max_size_mm, min_size_mm, algo3d, algo2d) in enumerate(
+            mesh_attempts, start=1
+        ):
+            if attempt_id > 1:
+                try:
+                    gmsh.model.mesh.clear()
+                except Exception:
+                    pass
+
+            gmsh.option.setNumber("Mesh.Algorithm3D", algo3d)
+            gmsh.option.setNumber("Mesh.Algorithm", algo2d)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", min_size_mm)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMax", max_size_mm)
+            gmsh.option.setNumber("Mesh.Optimize", 1)
+            gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+            gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+
+            # 为所有点设置网格尺寸
+            gmsh.model.mesh.setSize(
+                gmsh.model.getEntities(0), max_size_mm
+            )
+
+            # ── 生成 3D 网格 ──
+            try:
+                gmsh.model.mesh.generate(3)
+                node_tags, _, _ = gmsh.model.mesh.getNodes()
+                if len(node_tags) > 0:
+                    break
+                last_exc = RuntimeError("Gmsh 3D 网格生成后没有节点")
+            except Exception as exc:
+                last_exc = exc
+        else:
+            suggested_mm = max(layer_thickness_m * 1000.0 * 2.0, 0.01)
             raise RuntimeError(
-                f"Gmsh 3D 网格生成失败: {exc}。"
-                " 请尝试增大 resolution 或简化模型几何。"
-            ) from exc
+                f"Gmsh 3D 网格生成失败: {last_exc}。"
+                " 薄层 STEP 分层时请尝试减小 resolution，"
+                f"建议先试 {suggested_mm:.3f}–{suggested_mm * 4.0:.3f} mm，"
+                "或简化模型几何。"
+            ) from last_exc
 
         # ── 提取节点 ──
         node_tags, node_coords_flat, _ = gmsh.model.mesh.getNodes()

@@ -365,6 +365,7 @@ PYBIND11_MODULE(VBD_PYBIND_MODULE_NAME, m) {
         .def_readwrite("t_fluid_max", &SolverConfig::t_fluid_max)
         .def_readwrite("v_lift", &SolverConfig::v_lift)
         .def_readwrite("layer_thickness", &SolverConfig::layer_thickness)
+        .def_readwrite("dx_clip", &SolverConfig::dx_clip)
         .def_readwrite("c_init", &SolverConfig::c_init);
 
     // 求解函数

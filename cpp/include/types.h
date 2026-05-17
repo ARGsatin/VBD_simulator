@@ -54,11 +54,12 @@ struct SolverConfig {
     double d_fluid_max = 1e-3;
     double t_fluid_max = 0.1;
 
-    // 平台提升
+    // Platform lift
     double v_lift = 0.0;
-    double layer_thickness = 5e-5;   // 层厚 (m)，用于提升距离计算
+    double layer_thickness = 5e-5;
+    double dx_clip = 2e-3;
 
-    // 自适应加速度
+    // Adaptive acceleration
     double c_init = 0.5;
 };
 
