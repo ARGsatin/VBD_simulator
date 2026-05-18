@@ -18,7 +18,7 @@
 3. **局部力与 Hessian 装配** — 惯性、超弹刚度、阻尼、CZM 软化、流体吸力、电场提升
 4. **VBD 求解** — 基于图着色的顶点批次 3×3 Newton 局部迭代
 5. **CZM 损伤状态机** — `FIXED → DAMAGING → FREE` 三态转换
-6. **PID 控制电场** — 评估底部节点平均垂度并自动调节 `E_z`
+6. **电场调控** — 支持标量 PID、底部 Z 向误差反演、RMS 守门与短窗口施加
 7. **多格式输出** — NPZ 状态快照、VTU 可视化、CSV 报告、JSON 回放、`M150 E...` G-code
 
 ---
@@ -142,8 +142,100 @@ VBD_simulator/
 | **流体拖曳** | `d_fluid_max`, `t_fluid_max`, `fluid_radius` | 最大阻尼距离、时间、作用半径 |
 | **求解器** | `dt`, `epsilon`, `max_iters`, `N_stable` | 时间步长、收敛容差、最大迭代 |
 | **PID 控制** | `c_init`, `err_target`, `K_p`, `K_i`, `K_d` | 初始固化度、目标误差、PID 增益 |
-| **电场** | `q_ion`, `E_max` | 离子电荷密度、最大电场强度 |
+| **电场** | `q_ion`, `E_max`, `field_control_mode`, `field_regularization` | 离子电荷密度、最大电场强度、控制模式、反演正则 |
+| **电场短窗口** | `field_detach_pre_steps`, `field_detach_post_steps`, `field_peak_window_steps` | 脱膜窗口与最高点窗口的施加步数 |
 | **打印工艺** | `layer_thickness`, `z_fep`, `v_lift`, `build_axis` | 层厚、离型膜位置、提升速度、构建方向（0=X/1=Y/2=Z） |
+
+---
+
+## ⚡ 电场调控策略
+
+当前实现以 **Z 向均匀电场 `E_z`** 作为第一阶段控制对象，不做 x/y 补偿，也不做多电极 FEM 电场分布求解。底层求解器仍接收单个标量 `e_z`，电场力采用现有等效体力模型：
+
+```text
+f_z = q_ion * E_z
+```
+
+### 控制模式
+
+`SimulationConfig.field_control_mode` 支持以下模式：
+
+| 模式 | 行为 |
+|------|------|
+| `scalar_pid` | 原有标量 PID 路径，根据形状误差调节单个 `E_z` |
+| `bottom_z` | 使用底部节点 Z 向下垂误差反推出单个 `E_z` |
+| `bottom_z_guarded` | 同时评估 baseline 与 candidate，仅在全局 RMS 不恶化时采用 candidate |
+
+### Bottom-Z 反演
+
+`BottomZFieldController` 的输入为当前层底部节点、目标顶点、仿真顶点和 `SimulationConfig`。控制器计算底部节点 Z 向下垂：
+
+```text
+sag_i = max(target_z_i - sim_z_i - err_target, 0)
+```
+
+然后根据 PID 项得到期望 Z 向补偿力，其中 D 项按 `dt` 计算：
+
+```text
+force_desired = K_p * sag + K_i * integral + K_d * (sag - sag_prev) / dt
+```
+
+v1 映射矩阵使用均匀电场假设：
+
+```text
+B_z = q_ion * ones((N_bottom, 1))
+```
+
+再通过带 Tikhonov 正则的最小二乘求单个 `E_z`，并裁剪到：
+
+```text
+0 <= E_z <= E_max
+```
+
+因此该控制器不会产生负向电场；当底部无节点、误差为负、或结构已被抬升到目标以上时，输出为 0。
+
+### RMS 守门
+
+`bottom_z_guarded` 和 GUI 的“电场调试对比”遵循保守守门原则：
+
+```text
+candidate_rms <= baseline_rms * (1 + rms_guard_tolerance) + 1e-12
+```
+
+默认容忍度为 1%。同时会比较 `max_error` 和改善状态，避免为了局部底部抬升而造成整体形状显著拉长或失真。若 candidate 未通过守门，则自动回退 no-field / scalar PID 结果。
+
+每层结果会记录关键调试指标，例如：
+
+- `field_no_field_rms`
+- `field_with_field_rms`
+- `field_no_field_max_error`
+- `field_with_field_max_error`
+- `field_guard_passed`
+- `field_guard_reason`
+- `field_effective_mode`
+- `field_detach_E_z`
+- `field_peak_E_z`
+- `field_window_applied_steps`
+
+### V2 短窗口施加
+
+为避免电场在整个上提过程中持续拉伸结构，GUI field-debug 路径采用短窗口策略：
+
+1. **脱膜窗口**：以 no-field 分支推断出的脱膜步为中心，在 `field_detach_pre_steps` 到 `field_detach_post_steps` 范围内施加 `E_detach`。
+2. **最高点窗口**：在提升末端 `field_peak_window_steps` 步施加 `E_peak`，主要用于 guard 对比和形态检查。
+
+`E_detach` 和 `E_peak` 分别由对应时刻的底部 Z 向误差自适应计算；两个窗口重叠时取较大的正向电场。窗口外 `E_z = 0`。
+
+### GUI 调试对比
+
+勾选 **“电场调试对比”** 后，每层会从同一初始状态分别运行：
+
+- no-field baseline
+- with-field candidate
+
+然后逐层显示/记录 no-field 与 with-field 的 RMS、max error、底部 Z 误差、电场强度、守门状态和最终采用分支。若同时勾选 C++ 加速，GUI 会优先使用直接 C++ adapter 执行分支；失败时回退 Python 求解器。
+
+该模式用于验证电场是否真正改善形状，计算量大于普通单路径仿真。
 
 ---
 
