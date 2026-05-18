@@ -129,6 +129,7 @@ class SimulationWorker(QtCore.QObject):
             and is_cpp_available()
         )
         self._field_debug_cpp_fallback_count = 0
+        self._render_elapsed_s = 0.0
 
     # ───────────────────────────────────────────────────────────
     # 网格深拷贝（避免数据竞争 → 杜绝 Segfault）
@@ -606,7 +607,13 @@ class SimulationWorker(QtCore.QObject):
             from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
             solver = PythonReferenceVBDSolver
 
-        mesh = copy.deepcopy(source_mesh)
+        snapshot_start = time.perf_counter()
+        mesh = self._deep_copy_mesh(source_mesh)
+        snapshot_elapsed_s = time.perf_counter() - snapshot_start
+        cpp_solve_elapsed_s = 0.0
+        python_solve_elapsed_s = 0.0
+        czm_sync_elapsed_s = 0.0
+        return_elapsed_s = 0.0
         layer_z_fep = self._layer_contact_z(config, layer_id)
         layer_config = replace(config, z_fep=layer_z_fep)
         activator = LayerActivator()
@@ -677,9 +684,12 @@ class SimulationWorker(QtCore.QObject):
                     bottom_damage = mesh.damage[bottom].copy()
                     bottom_time_free = mesh.time_free[bottom].copy()
                     x_before_solve = mesh.vertices.copy()
+                    solve_start = time.perf_counter()
                     result = cpp_solve_lift_and_relax(
                         mesh, layer_config, step_e_z, layer_id, top_ids
                     )
+                    cpp_solve_elapsed_s += time.perf_counter() - solve_start
+                    sync_start = time.perf_counter()
                     self._sync_cpp_lift_czm_state(
                         mesh,
                         layer_config,
@@ -692,10 +702,13 @@ class SimulationWorker(QtCore.QObject):
                         bottom_time_free,
                         result,
                     )
+                    czm_sync_elapsed_s += time.perf_counter() - sync_start
                 else:
+                    solve_start = time.perf_counter()
                     result = python_solver.solve_with_lift(
                         mesh, layer_id=layer_id, e_z=step_e_z, lifting_top=top_ids
                     )
+                    python_solve_elapsed_s += time.perf_counter() - solve_start
                 layer_steps += 1
                 total_iterations += int(getattr(result, "iterations", 0))
                 if getattr(result, "iterations", 0) >= config.max_iters:
@@ -709,7 +722,9 @@ class SimulationWorker(QtCore.QObject):
                     if detach_step <= 0:
                         detach_step = layer_steps
                     if commit_mesh is None:
-                        commit_mesh = copy.deepcopy(mesh)
+                        snapshot_start = time.perf_counter()
+                        commit_mesh = self._deep_copy_mesh(mesh)
+                        snapshot_elapsed_s += time.perf_counter() - snapshot_start
                         commit_result = result
                         commit_steps = layer_steps
                     if bool(getattr(config, "enable_czm", True)):
@@ -720,23 +735,31 @@ class SimulationWorker(QtCore.QObject):
                         break
             if result is None:
                 if use_cpp:
+                    solve_start = time.perf_counter()
                     result = cpp_solve_until_stable(
                         mesh, layer_config, e_z, layer_id
                     )
+                    cpp_solve_elapsed_s += time.perf_counter() - solve_start
                 else:
+                    solve_start = time.perf_counter()
                     result = python_solver.solve_until_stable(
                         mesh, layer_id=layer_id, e_z=e_z
                     )
+                    python_solve_elapsed_s += time.perf_counter() - solve_start
         else:
             x_before_solve = mesh.vertices.copy()
             if e_z > 0.0:
                 field_applied_steps = 1
             if use_cpp:
+                solve_start = time.perf_counter()
                 result = cpp_solve_until_stable(mesh, layer_config, e_z, layer_id)
+                cpp_solve_elapsed_s += time.perf_counter() - solve_start
             else:
+                solve_start = time.perf_counter()
                 result = python_solver.solve_until_stable(
                     mesh, layer_id=layer_id, e_z=e_z
                 )
+                python_solve_elapsed_s += time.perf_counter() - solve_start
             total_iterations += int(getattr(result, "iterations", 0))
             if getattr(result, "iterations", 0) >= config.max_iters:
                 max_iter_hits += 1
@@ -745,14 +768,20 @@ class SimulationWorker(QtCore.QObject):
                 >= self.DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
             ):
                 clipped_steps += 1
+            sync_start = time.perf_counter()
             self._update_czm_from_current_terms(
                 mesh, layer_config, layer_id, e_z, x_before_solve
             )
+            czm_sync_elapsed_s += time.perf_counter() - sync_start
 
-        guard_mesh = copy.deepcopy(mesh)
+        snapshot_start = time.perf_counter()
+        guard_mesh = self._deep_copy_mesh(mesh)
+        snapshot_elapsed_s += time.perf_counter() - snapshot_start
         guard_result = result
         if commit_mesh is None:
-            commit_mesh = copy.deepcopy(guard_mesh)
+            snapshot_start = time.perf_counter()
+            commit_mesh = self._deep_copy_mesh(guard_mesh)
+            snapshot_elapsed_s += time.perf_counter() - snapshot_start
             commit_result = guard_result
             commit_steps = layer_steps
         if (
@@ -778,7 +807,9 @@ class SimulationWorker(QtCore.QObject):
                 bottom_state = commit_mesh.czm_state[bottom].copy()
                 bottom_damage = commit_mesh.damage[bottom].copy()
                 bottom_time_free = commit_mesh.time_free[bottom].copy()
+                return_start = time.perf_counter()
                 if use_cpp:
+                    solve_start = time.perf_counter()
                     commit_result = cpp_solve_lift_and_relax(
                         commit_mesh,
                         down_config,
@@ -786,14 +817,18 @@ class SimulationWorker(QtCore.QObject):
                         layer_id,
                         return_top_ids,
                     )
+                    cpp_solve_elapsed_s += time.perf_counter() - solve_start
                 else:
                     return_solver = solver(down_config)
+                    solve_start = time.perf_counter()
                     commit_result = return_solver.solve_with_lift(
                         commit_mesh,
                         layer_id=layer_id,
                         e_z=0.0,
                         lifting_top=return_top_ids,
                     )
+                    python_solve_elapsed_s += time.perf_counter() - solve_start
+                return_elapsed_s += time.perf_counter() - return_start
                 if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
                     commit_mesh.czm_state[bottom] = bottom_state
                     commit_mesh.damage[bottom] = bottom_damage
@@ -819,6 +854,11 @@ class SimulationWorker(QtCore.QObject):
             "applied_steps": float(field_applied_steps),
             "detach_E_z": float(e_z),
             "peak_E_z": float(e_z if peak_e_z is None else peak_e_z),
+            "cpp_solve_ms": float(cpp_solve_elapsed_s * 1000.0),
+            "python_solve_ms": float(python_solve_elapsed_s * 1000.0),
+            "czm_sync_ms": float(czm_sync_elapsed_s * 1000.0),
+            "return_ms": float(return_elapsed_s * 1000.0),
+            "snapshot_ms": float(snapshot_elapsed_s * 1000.0),
         }
         return _FieldDebugBranchRun(
             commit_mesh=commit_mesh,
@@ -900,9 +940,24 @@ class SimulationWorker(QtCore.QObject):
             "solver_avg_call_ms": float(payload.get("avg_call_ms", 0.0)),
             "solver_lift_max": float(payload.get("lift_max", 0.0)),
             "solver_lift_step": float(payload.get("lift_step", 0.0)),
+            "solver_return_steps": float(payload.get("platform_return_steps", 0)),
+            "solver_platform_return_distance": float(
+                payload.get("platform_return_distance", 0.0)
+            ),
             "solver_expected_steps": float(payload.get("expected_steps", 0)),
             "solver_top_nodes": float(payload.get("top_nodes", 0)),
             "shape_error_available": 0.0,
+            "perf_lift_steps": float(payload.get("total_steps", 0)),
+            "perf_return_steps": float(payload.get("platform_return_steps", 0)),
+            "perf_no_field_ms": 0.0,
+            "perf_with_field_ms": 0.0,
+            "perf_cpp_solve_ms": float(payload.get("cpp_solve_ms", 0.0)),
+            "perf_python_solve_ms": 0.0,
+            "perf_czm_sync_ms": float(payload.get("czm_sync_ms", 0.0)),
+            "perf_render_ms": float(payload.get("render_ms", 0.0)),
+            "perf_snapshot_ms": float(payload.get("snapshot_ms", 0.0)),
+            "rms_error": 0.0,
+            "max_error": final_max_dx,
         }
         if total_steps > 0:
             metrics["solver_max_iter_hit_pct"] = (
@@ -1139,10 +1194,13 @@ class SimulationWorker(QtCore.QObject):
             solve_lift_and_relax as cpp_solve_lift_and_relax,
         )
         from hydrogel_vbd.solver.diagnostics import (
+            LayerPerformanceDiagnostics,
             SolverRunawayGuard,
             SolverStepDiagnostics,
             diagnostics_enabled,
+            prepare_layer_performance_diagnostics_csv,
             prepare_solver_diagnostics_csv,
+            write_layer_performance_diagnostics_csv,
             write_solver_diagnostics_csv,
         )
 
@@ -1195,16 +1253,19 @@ class SimulationWorker(QtCore.QObject):
             else bool(self._solver_diagnostics_enabled)
         )
         diag_path = self._output_dir / "reports" / "solver_diagnostics.csv"
+        perf_diag_path = self._output_dir / "reports" / "performance_diagnostics.csv"
         diag_stride = (
             max(1, int(os.environ.get("HYDROGEL_VBD_SOLVER_DIAG_STRIDE", "250")))
             if self._solver_diagnostics_stride is None
             else max(1, int(self._solver_diagnostics_stride))
         )
         self.log_message.emit(
-            f"  [diag] solver CSV enabled={diag_enabled} path={diag_path}"
+            f"  [diag] solver CSV enabled={diag_enabled} "
+            f"path={diag_path}, perf_path={perf_diag_path}"
         )
         if diag_enabled:
             prepare_solver_diagnostics_csv(diag_path)
+            prepare_layer_performance_diagnostics_csv(perf_diag_path)
             self._trace(f"diagnostic_csv_prepared path={diag_path}")
         diag_guard = SolverRunawayGuard(
             limit=50,
@@ -1272,11 +1333,47 @@ class SimulationWorker(QtCore.QObject):
                 return True
             return False
 
+        def _write_perf_diag(
+            layer_id: int,
+            mode: str,
+            metrics: dict[str, float | str],
+            guard_reason: str = "",
+        ) -> None:
+            if not diag_enabled:
+                return
+            write_layer_performance_diagnostics_csv(
+                perf_diag_path,
+                [
+                    LayerPerformanceDiagnostics(
+                        layer_id=int(layer_id),
+                        mode=mode,
+                        elapsed_s=float(metrics.get("solver_elapsed_s", 0.0)),
+                        lift_steps=int(float(metrics.get("perf_lift_steps", 0.0))),
+                        return_steps=int(float(metrics.get("perf_return_steps", 0.0))),
+                        no_field_ms=float(metrics.get("perf_no_field_ms", 0.0)),
+                        with_field_ms=float(metrics.get("perf_with_field_ms", 0.0)),
+                        cpp_solve_ms=float(metrics.get("perf_cpp_solve_ms", 0.0)),
+                        czm_sync_ms=float(metrics.get("perf_czm_sync_ms", 0.0)),
+                        render_ms=float(metrics.get("perf_render_ms", 0.0)),
+                        solver_steps=int(
+                            float(metrics.get("solver_total_steps", 0.0))
+                        ),
+                        solver_iterations=int(
+                            float(metrics.get("solver_total_iterations", 0.0))
+                        ),
+                        rms_error=float(metrics.get("rms_error", 0.0)),
+                        max_error=float(metrics.get("max_error", 0.0)),
+                        guard_reason=str(guard_reason),
+                    )
+                ],
+            )
+
         for layer_id in range(self._n_layers):
             if self._stop_flag:
                 self._trace(f"layer_{layer_id}_skipped_after_stop")
                 break
             layer_start = time.perf_counter()
+            layer_render_start_s = self._render_elapsed_s
             layer_steps = 0
             layer_call_elapsed_s = 0.0
             layer_total_iterations = 0
@@ -1287,10 +1384,11 @@ class SimulationWorker(QtCore.QObject):
             )
 
             if self._field_debug_enabled:
-                layer_start_mesh = copy.deepcopy(self._mesh)
-                call_start = time.perf_counter()
+                layer_start_mesh = self._mesh
+                layer_snapshot_ms = 0.0
                 field_cpp_fallbacks_before = self._field_debug_cpp_fallback_count
                 field_branch_requested_cpp = bool(self._field_debug_use_cpp)
+                no_field_start = time.perf_counter()
                 no_field_run = self._run_field_debug_branch(
                     layer_start_mesh,
                     self._config,
@@ -1299,21 +1397,12 @@ class SimulationWorker(QtCore.QObject):
                     use_cpp=field_branch_requested_cpp,
                     continue_to_peak=True,
                 )
+                no_field_elapsed_ms = (time.perf_counter() - no_field_start) * 1000.0
                 no_field_metrics = self._shape_debug_metrics(
                     no_field_run.guard_mesh, layer_id
                 )
                 no_field_commit_metrics = self._shape_debug_metrics(
                     no_field_run.commit_mesh, layer_id
-                )
-                self._push_frame(
-                    vertices=no_field_run.commit_mesh.vertices.copy(),
-                    tets=no_field_run.commit_mesh.tets,
-                    active_mask=no_field_run.commit_mesh.active_vertex_mask.copy(),
-                    active_tet_mask=no_field_run.commit_mesh.active_tet_mask.copy(),
-                    title=(
-                        f"field-debug layer {layer_id + 1}/{self._n_layers} "
-                        "no-field baseline (commit)"
-                    ),
                 )
                 detach_state = bottom_z_detach_debug.update(
                     bottom_nodes=no_field_run.commit_mesh.bottom_nodes(layer_id),
@@ -1331,10 +1420,11 @@ class SimulationWorker(QtCore.QObject):
                     float(peak_state.unclipped_E_z),
                 )
                 candidate_skipped = derived_e_z <= 1.0e-12
+                with_field_elapsed_ms = 0.0
                 if candidate_skipped:
                     with_field_run = _FieldDebugBranchRun(
-                        commit_mesh=copy.deepcopy(no_field_run.commit_mesh),
-                        guard_mesh=copy.deepcopy(no_field_run.guard_mesh),
+                        commit_mesh=no_field_run.commit_mesh,
+                        guard_mesh=no_field_run.guard_mesh,
                         commit_result=no_field_run.commit_result,
                         guard_result=no_field_run.guard_result,
                         commit_steps=0,
@@ -1357,6 +1447,11 @@ class SimulationWorker(QtCore.QObject):
                             "applied_steps": 0.0,
                             "detach_E_z": float(detach_state.E_z),
                             "peak_E_z": float(peak_state.E_z),
+                            "cpp_solve_ms": 0.0,
+                            "python_solve_ms": 0.0,
+                            "czm_sync_ms": 0.0,
+                            "return_ms": 0.0,
+                            "snapshot_ms": 0.0,
                         },
                     )
                     with_field_info = {
@@ -1373,8 +1468,14 @@ class SimulationWorker(QtCore.QObject):
                         "applied_steps": 0.0,
                         "detach_E_z": float(detach_state.E_z),
                         "peak_E_z": float(peak_state.E_z),
+                        "cpp_solve_ms": 0.0,
+                        "python_solve_ms": 0.0,
+                        "czm_sync_ms": 0.0,
+                        "return_ms": 0.0,
+                        "snapshot_ms": 0.0,
                     }
                 else:
+                    with_field_start = time.perf_counter()
                     with_field_run = self._run_field_debug_branch(
                         layer_start_mesh,
                         self._config,
@@ -1387,6 +1488,9 @@ class SimulationWorker(QtCore.QObject):
                         peak_e_z=peak_state.E_z,
                         continue_to_peak=True,
                     )
+                    with_field_elapsed_ms = (
+                        time.perf_counter() - with_field_start
+                    ) * 1000.0
                     with_field_info = with_field_run.info
                 with_field_metrics = self._shape_debug_metrics(
                     with_field_run.guard_mesh, layer_id
@@ -1451,10 +1555,42 @@ class SimulationWorker(QtCore.QObject):
                     else np.zeros_like(x_final)
                 )
                 layer_elapsed_s = time.perf_counter() - layer_start
-                branch_elapsed_s = time.perf_counter() - call_start
-                avg_call_ms = (
-                    branch_elapsed_s / 2.0 * 1000.0
+                branch_elapsed_ms = no_field_elapsed_ms + with_field_elapsed_ms
+                with_field_return_steps = (
+                    0
+                    if candidate_skipped
+                    else int(float(with_field_info.get("return_steps", 0.0)))
                 )
+                avg_call_ms = branch_elapsed_ms / max(
+                    no_field_run.executed_steps
+                    + with_field_run.executed_steps
+                    + int(float(no_field_run.info.get("return_steps", 0.0)))
+                    + with_field_return_steps,
+                    1,
+                )
+                perf_cpp_solve_ms = float(
+                    no_field_run.info.get("cpp_solve_ms", 0.0)
+                ) + float(with_field_info.get("cpp_solve_ms", 0.0))
+                perf_python_solve_ms = float(
+                    no_field_run.info.get("python_solve_ms", 0.0)
+                ) + float(with_field_info.get("python_solve_ms", 0.0))
+                perf_czm_sync_ms = float(
+                    no_field_run.info.get("czm_sync_ms", 0.0)
+                ) + float(with_field_info.get("czm_sync_ms", 0.0))
+                perf_snapshot_ms = (
+                    layer_snapshot_ms
+                    + float(no_field_run.info.get("snapshot_ms", 0.0))
+                    + float(with_field_info.get("snapshot_ms", 0.0))
+                )
+                perf_render_ms = (
+                    self._render_elapsed_s - layer_render_start_s
+                ) * 1000.0
+                perf_lift_steps = (
+                    no_field_run.executed_steps + with_field_run.executed_steps
+                )
+                perf_return_steps = int(
+                    float(no_field_run.info.get("return_steps", 0.0))
+                ) + with_field_return_steps
                 layer_metrics: dict[str, float | str] = {
                     "E_z": selected_e_z,
                     "solver_total_steps": float(layer_steps),
@@ -1469,6 +1605,11 @@ class SimulationWorker(QtCore.QObject):
                     "solver_lift_max": float(no_field_run.lift_max),
                     "solver_lift_step": float(
                         self._config.v_lift * self._config.dt
+                    ),
+                    "solver_return_steps": float(
+                        with_field_info["return_steps"]
+                        if guard_passed
+                        else no_field_run.info["return_steps"]
                     ),
                     "solver_expected_steps": float(
                         self._expected_lift_steps(
@@ -1555,6 +1696,24 @@ class SimulationWorker(QtCore.QObject):
                     "field_rms_guard_limit": guard["rms_limit"],
                     "field_max_error_guard_limit": guard["max_error_limit"],
                     "field_effective_mode": effective_mode,
+                    "perf_lift_steps": float(perf_lift_steps),
+                    "perf_return_steps": float(perf_return_steps),
+                    "perf_no_field_ms": float(no_field_elapsed_ms),
+                    "perf_with_field_ms": float(with_field_elapsed_ms),
+                    "perf_branch_total_ms": float(branch_elapsed_ms),
+                    "perf_cpp_solve_ms": float(perf_cpp_solve_ms),
+                    "perf_python_solve_ms": float(perf_python_solve_ms),
+                    "perf_czm_sync_ms": float(perf_czm_sync_ms),
+                    "perf_render_ms": float(perf_render_ms),
+                    "perf_snapshot_ms": float(perf_snapshot_ms),
+                    "perf_no_field_lift_steps": float(no_field_run.executed_steps),
+                    "perf_no_field_return_steps": float(
+                        no_field_run.info.get("return_steps", 0.0)
+                    ),
+                    "perf_with_field_lift_steps": float(with_field_run.executed_steps),
+                    "perf_with_field_return_steps": float(
+                        with_field_info.get("return_steps", 0.0)
+                    ),
                     "rms_error": selected_metrics["rms"],
                     "max_error": selected_metrics["max_error"],
                 }
@@ -1580,6 +1739,11 @@ class SimulationWorker(QtCore.QObject):
                     f"{int(float(with_field_info['commit_step']))}/"
                     f"{int(float(with_field_info['guard_step']))}, "
                     f"return_steps={int(float(with_field_info['return_steps']))}, "
+                    f"time(no/with/czm/render)="
+                    f"{no_field_elapsed_ms:.1f}/"
+                    f"{with_field_elapsed_ms:.1f}/"
+                    f"{perf_czm_sync_ms:.1f}/"
+                    f"{perf_render_ms:.1f} ms, "
                     f"guard={guard['reason']}"
                 )
                 layer_result = LayerResult(
@@ -1599,6 +1763,12 @@ class SimulationWorker(QtCore.QObject):
                     ),
                 )
                 results.append(layer_result)
+                _write_perf_diag(
+                    layer_id,
+                    "field_debug",
+                    layer_metrics,
+                    guard_reason=str(guard["reason"]),
+                )
                 self.layer_finished.emit(layer_result)
                 self.progress_update.emit(
                     layer_id + 1,
@@ -1828,9 +1998,28 @@ class SimulationWorker(QtCore.QObject):
                 "solver_avg_call_ms": float(avg_call_ms),
                 "solver_lift_max": float(lift_max),
                 "solver_lift_step": float(lift_step),
+                "solver_return_steps": 0.0,
                 "solver_expected_steps": float(expected_lift_steps),
                 "solver_top_nodes": float(len(top_ids)),
                 "shape_error_available": 0.0,
+                "perf_lift_steps": float(layer_steps),
+                "perf_return_steps": 0.0,
+                "perf_no_field_ms": 0.0,
+                "perf_with_field_ms": 0.0,
+                "perf_branch_total_ms": 0.0,
+                "perf_cpp_solve_ms": (
+                    float(layer_call_elapsed_s * 1000.0) if self._use_cpp else 0.0
+                ),
+                "perf_python_solve_ms": (
+                    0.0 if self._use_cpp else float(layer_call_elapsed_s * 1000.0)
+                ),
+                "perf_czm_sync_ms": 0.0,
+                "perf_render_ms": float(
+                    (self._render_elapsed_s - layer_render_start_s) * 1000.0
+                ),
+                "perf_snapshot_ms": 0.0,
+                "rms_error": 0.0,
+                "max_error": float(getattr(result, "max_dx", 0.0)),
             }
             if layer_steps > 0:
                 layer_metrics["solver_max_iter_hit_pct"] = (
@@ -1858,6 +2047,7 @@ class SimulationWorker(QtCore.QObject):
                 success=(diag_stop_reason is None and getattr(result, "all_free", True)),
             )
             results.append(layer_result)
+            _write_perf_diag(layer_id, "single_path", layer_metrics)
 
             # ── 每层结束时推送 layer_finished（主线程用于实时误差分析、DVR 等）──
             self.layer_finished.emit(layer_result)
@@ -1946,11 +2136,15 @@ class SimulationWorker(QtCore.QObject):
         title : str
             帧标题（显示在 GUI 标题栏或图例中）。
         """
-        payload = {
-            "vertices": vertices,
-            "tets": tets,
-            "active_mask": active_mask,
-            "active_tet_mask": active_tet_mask,
-            "title": title,
-        }
-        self.frame_ready.emit(payload)
+        start = time.perf_counter()
+        try:
+            payload = {
+                "vertices": vertices,
+                "tets": tets,
+                "active_mask": active_mask,
+                "active_tet_mask": active_tet_mask,
+                "title": title,
+            }
+            self.frame_ready.emit(payload)
+        finally:
+            self._render_elapsed_s += time.perf_counter() - start

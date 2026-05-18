@@ -31,6 +31,43 @@ class LiftPlanDiagnostics:
     estimated_wall_s: float
 
 
+@dataclass(frozen=True)
+class PerformanceBenchmarkScenario:
+    name: str
+    model_path: Path
+    layers: int
+    enable_czm: bool
+    lift_multiplier: float
+    field_debug_enabled: bool
+
+
+def default_performance_benchmark_matrix(
+    *,
+    model_path: str | Path = Path("assets/test_models/demo7.STEP"),
+    layers: int = 32,
+) -> list[PerformanceBenchmarkScenario]:
+    """Return the standard slow-mode benchmark matrix without running it."""
+    path = Path(model_path)
+    scenarios: list[PerformanceBenchmarkScenario] = []
+    for enable_czm in (False, True):
+        for lift_multiplier in (1.5, 5.0):
+            for field_debug_enabled in (False, True):
+                scenarios.append(
+                    PerformanceBenchmarkScenario(
+                        name=(
+                            f"demo7_32l_czm-{int(enable_czm)}_"
+                            f"lift-{lift_multiplier:g}_field-{int(field_debug_enabled)}"
+                        ),
+                        model_path=path,
+                        layers=int(layers),
+                        enable_czm=bool(enable_czm),
+                        lift_multiplier=float(lift_multiplier),
+                        field_debug_enabled=bool(field_debug_enabled),
+                    )
+                )
+    return scenarios
+
+
 def diagnostics_enabled(env: Mapping[str, str] | None = None) -> bool:
     """Return whether solver diagnostics are enabled by environment."""
     source = os.environ if env is None else env
@@ -443,6 +480,79 @@ def prepare_solver_diagnostics_csv(path: str | Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=SolverStepDiagnostics.csv_fields())
+        writer.writeheader()
+
+
+@dataclass(frozen=True)
+class LayerPerformanceDiagnostics:
+    layer_id: int
+    mode: str
+    elapsed_s: float
+    lift_steps: int
+    return_steps: int
+    no_field_ms: float
+    with_field_ms: float
+    cpp_solve_ms: float
+    czm_sync_ms: float
+    render_ms: float
+    solver_steps: int
+    solver_iterations: int
+    rms_error: float
+    max_error: float
+    guard_reason: str
+
+    @classmethod
+    def csv_fields(cls) -> list[str]:
+        return [
+            "layer_id",
+            "mode",
+            "elapsed_s",
+            "lift_steps",
+            "return_steps",
+            "no_field_ms",
+            "with_field_ms",
+            "cpp_solve_ms",
+            "czm_sync_ms",
+            "render_ms",
+            "solver_steps",
+            "solver_iterations",
+            "rms_error",
+            "max_error",
+            "guard_reason",
+        ]
+
+    def as_csv_row(self) -> dict[str, Any]:
+        return {field: getattr(self, field) for field in self.csv_fields()}
+
+
+def write_layer_performance_diagnostics_csv(
+    path: str | Path,
+    rows: list[LayerPerformanceDiagnostics],
+) -> None:
+    """Append per-layer wall-time diagnostics to a stable CSV."""
+    if not rows:
+        return
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not out.exists() or out.stat().st_size == 0
+    with out.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=LayerPerformanceDiagnostics.csv_fields()
+        )
+        if needs_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row.as_csv_row())
+
+
+def prepare_layer_performance_diagnostics_csv(path: str | Path) -> None:
+    """Start a performance diagnostic run with the current stable CSV header."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=LayerPerformanceDiagnostics.csv_fields()
+        )
         writer.writeheader()
 
 

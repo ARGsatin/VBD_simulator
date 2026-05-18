@@ -325,10 +325,13 @@ def _run_simulation(
         solve_lift_and_relax as cpp_solve_lift_and_relax,
     )
     from hydrogel_vbd.solver.diagnostics import (
+        LayerPerformanceDiagnostics,
         SolverRunawayGuard,
         SolverStepDiagnostics,
         diagnostics_enabled,
+        prepare_layer_performance_diagnostics_csv,
         prepare_solver_diagnostics_csv,
+        write_layer_performance_diagnostics_csv,
         write_solver_diagnostics_csv,
     )
     from hydrogel_vbd.solver.vbd_solver import VBDSolveResult, _normal_pull_from_terms
@@ -394,14 +397,19 @@ def _run_simulation(
         else bool(diag_enabled_override)
     )
     diag_path = output_path / "reports" / "solver_diagnostics.csv"
+    perf_diag_path = output_path / "reports" / "performance_diagnostics.csv"
     diag_stride = (
         max(1, int(os.environ.get("HYDROGEL_VBD_SOLVER_DIAG_STRIDE", "250")))
         if diag_stride_override is None
         else max(1, int(diag_stride_override))
     )
-    conn.send(_LogMsg(text=f"  [diag] solver CSV enabled={diag_enabled} path={diag_path}"))
+    conn.send(_LogMsg(text=(
+        f"  [diag] solver CSV enabled={diag_enabled} "
+        f"path={diag_path}, perf_path={perf_diag_path}"
+    )))
     if diag_enabled:
         prepare_solver_diagnostics_csv(diag_path)
+        prepare_layer_performance_diagnostics_csv(perf_diag_path)
         _trace(f"diagnostic_csv_prepared path={diag_path}")
     from hydrogel_vbd.solver.cpp_adapter import solver_dx_clip
 
@@ -474,6 +482,17 @@ def _run_simulation(
         layer_max_iter_hits = 0
         layer_clipped_steps = 0
         layer_call_elapsed_s = 0.0
+        layer_cpp_solve_elapsed_s = 0.0
+        layer_czm_sync_elapsed_s = 0.0
+        layer_render_elapsed_s = 0.0
+        layer_snapshot_elapsed_s = 0.0
+
+        def _send_layer_frame(frame: _FrameMsg) -> None:
+            nonlocal layer_render_elapsed_s
+            render_start = time.perf_counter()
+            conn.send(frame)
+            layer_render_elapsed_s += time.perf_counter() - render_start
+
         _trace(f"layer_{layer_id}_start")
         conn.send(_LogMsg(text=f"  [C++] 第 {layer_id + 1}/{n_layers} 层 ← VBD 求解"))
 
@@ -503,7 +522,7 @@ def _run_simulation(
             f"{_format_z_stats('top_fixed_z', mesh.vertices[top_after_activation, 2])} "
             f"{_format_z_stats('active_z', mesh.vertices[active_nodes, 2])}"
         )
-        conn.send(_FrameMsg(
+        _send_layer_frame(_FrameMsg(
             vertices=mesh.vertices.copy(),
             tets=mesh.tets.copy(),
             active_mask=mesh.active_vertex_mask.copy(),
@@ -572,6 +591,7 @@ def _run_simulation(
             result = cpp_solve_until_stable(mesh, layer_config, e_z, layer_id)
             call_elapsed = time.perf_counter() - call_start
             layer_call_elapsed_s += call_elapsed
+            layer_cpp_solve_elapsed_s += call_elapsed
             layer_total_iterations += int(result.iterations)
             if result.iterations >= config.max_iters:
                 layer_max_iter_hits += 1
@@ -591,6 +611,7 @@ def _run_simulation(
             # CZM 更新（提升后）
             bottom = mesh.bottom_nodes(layer_id)
             if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
+                sync_start = time.perf_counter()
                 terms_after = build_local_physics_terms(
                     mesh, layer_config, e_z=e_z, x_prev=x_before_solve,
                     layer_id=layer_id,
@@ -602,6 +623,7 @@ def _run_simulation(
                     k_czm=layer_config.K_czm, delta_f=layer_config.delta_f,
                     z_fep=layer_config.z_fep, dt=dt,
                 )
+                layer_czm_sync_elapsed_s += time.perf_counter() - sync_start
         else:
             # 校验 top_ids 合法性
             nV = mesh.vertices.shape[0]
@@ -643,8 +665,11 @@ def _run_simulation(
                 result = cpp_solve_lift_and_relax(
                     mesh, layer_config, e_z, layer_id, top_ids,
                 )
+                solve_elapsed = time.perf_counter() - call_start
+                layer_cpp_solve_elapsed_s += solve_elapsed
                 pull_after = None
                 if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
+                    sync_start = time.perf_counter()
                     mesh.czm_state[bottom] = bottom_state
                     mesh.damage[bottom] = bottom_damage
                     mesh.time_free[bottom] = bottom_time_free
@@ -667,6 +692,7 @@ def _run_simulation(
                     result.all_free = bool(
                         np.all(mesh.czm_state[bottom] == int(CZMState.FREE))
                     )
+                    layer_czm_sync_elapsed_s += time.perf_counter() - sync_start
                 call_elapsed = time.perf_counter() - call_start
                 layer_call_elapsed_s += call_elapsed
                 layer_total_iterations += int(result.iterations)
@@ -721,7 +747,7 @@ def _run_simulation(
                 if step_counter % render_interval == 0:
                     v = mesh.vertices
                     t = mesh.tets
-                    conn.send(_FrameMsg(
+                    _send_layer_frame(_FrameMsg(
                         vertices=v.copy() if v is not None else np.zeros((0, 3)),
                         tets=t.copy() if t is not None else np.zeros((0, 4), dtype=np.int32),
                         active_mask=(
@@ -782,6 +808,7 @@ def _run_simulation(
                     mesh, down_config, e_z, layer_id, top_ids,
                 )
                 call_elapsed = time.perf_counter() - call_start
+                layer_cpp_solve_elapsed_s += call_elapsed
                 if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
                     mesh.czm_state[bottom] = bottom_state
                     mesh.damage[bottom] = bottom_damage
@@ -852,13 +879,39 @@ def _run_simulation(
                     f"\u7b2c {layer_id + 1} \u5c42 \u2014 "
                     "\u5c42\u7ed3\u675f"
                 )
-            conn.send(_FrameMsg(
+            _send_layer_frame(_FrameMsg(
                 vertices=mesh.vertices.copy(),
                 tets=mesh.tets.copy(),
                 active_mask=mesh.active_vertex_mask.copy(),
                 active_tet_mask=mesh.active_tet_mask.copy(),
                 title=final_title,
             ))
+        cpp_solve_ms = float(layer_cpp_solve_elapsed_s * 1000.0)
+        czm_sync_ms = float(layer_czm_sync_elapsed_s * 1000.0)
+        render_ms = float(layer_render_elapsed_s * 1000.0)
+        if diag_enabled:
+            write_layer_performance_diagnostics_csv(
+                perf_diag_path,
+                [
+                    LayerPerformanceDiagnostics(
+                        layer_id=layer_id,
+                        mode="cpp_subprocess",
+                        elapsed_s=float(elapsed_s),
+                        lift_steps=int(layer_steps),
+                        return_steps=int(layer_return_steps),
+                        no_field_ms=0.0,
+                        with_field_ms=0.0,
+                        cpp_solve_ms=cpp_solve_ms,
+                        czm_sync_ms=czm_sync_ms,
+                        render_ms=render_ms,
+                        solver_steps=int(layer_call_count),
+                        solver_iterations=int(layer_total_iterations),
+                        rms_error=0.0,
+                        max_error=float(result.max_dx),
+                        guard_reason="",
+                    )
+                ],
+            )
         results.append({
             "layer_id": layer_id,
             "total_steps": layer_steps,
@@ -873,6 +926,10 @@ def _run_simulation(
             "lift_step": lift_step,
             "platform_return_distance": platform_return_distance,
             "platform_return_steps": layer_return_steps,
+            "cpp_solve_ms": cpp_solve_ms,
+            "czm_sync_ms": czm_sync_ms,
+            "render_ms": render_ms,
+            "snapshot_ms": float(layer_snapshot_elapsed_s * 1000.0),
             "solver_epsilon": solver_epsilon,
             "dx_clip": current_dx_clip,
             "expected_steps": expected_lift_steps,

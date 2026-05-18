@@ -1062,7 +1062,7 @@ class WorkerLiftControlTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["field_derived_E_z"], 0.5)
         self.assertAlmostEqual(metrics["E_z"], 0.0)
 
-    def test_field_debug_emits_no_field_and_selected_frames(self) -> None:
+    def test_field_debug_emits_only_selected_frame_and_records_perf_metrics(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
         from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
@@ -1100,12 +1100,16 @@ class WorkerLiftControlTests(unittest.TestCase):
                     chebyshev_skipped_damaging=0,
                 )
 
+        out_dir = Path("outputs/test_worker_field_debug_frames")
+        perf_csv = out_dir / "reports" / "performance_diagnostics.csv"
+        perf_csv.unlink(missing_ok=True)
         worker = SimulationWorker(
             mesh=mesh,
             config=config,
             n_layers=1,
-            output_dir="outputs/test_worker_field_debug_frames",
+            output_dir=out_dir,
             use_cpp=False,
+            solver_diagnostics_enabled=True,
             field_debug_enabled=True,
         )
         worker._trace = lambda msg: None
@@ -1116,11 +1120,22 @@ class WorkerLiftControlTests(unittest.TestCase):
             "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
             FakeSolver,
         ):
-            worker._run_layers()
+            results = worker._run_layers()
 
         titles = [frame["title"] for frame in frames]
-        self.assertTrue(any("no-field" in title for title in titles))
+        self.assertFalse(any("no-field" in title for title in titles))
         self.assertTrue(any("selected" in title for title in titles))
+
+        metrics = results[0].error_metrics
+        self.assertIn("perf_no_field_ms", metrics)
+        self.assertIn("perf_with_field_ms", metrics)
+        self.assertIn("perf_render_ms", metrics)
+        self.assertGreaterEqual(metrics["perf_no_field_ms"], 0.0)
+        self.assertGreaterEqual(metrics["perf_with_field_ms"], 0.0)
+        header = perf_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
+        self.assertIn("no_field_ms", header)
+        self.assertIn("with_field_ms", header)
+        self.assertIn("czm_sync_ms", header)
 
     def test_field_debug_v2_applies_field_only_at_detach_and_peak_windows(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
@@ -1365,11 +1380,11 @@ class WorkerLiftControlTests(unittest.TestCase):
         self.assertEqual(metrics["field_window_detach_step"], 2.0)
         self.assertEqual(metrics["field_commit_step"], 2.0)
         self.assertEqual(metrics["field_guard_step"], 5.0)
-        no_field_frames = [
-            frame for frame in frames if "no-field baseline" in frame["title"]
+        selected_frames = [
+            frame for frame in frames if "selected no_field" in frame["title"]
         ]
-        self.assertEqual(len(no_field_frames), 1)
-        self.assertAlmostEqual(no_field_frames[0]["vertices"][0, 2], 2.0)
+        self.assertEqual(len(selected_frames), 1)
+        self.assertAlmostEqual(selected_frames[0]["vertices"][0, 2], 2.0)
 
     def test_field_debug_czm_disabled_commits_all_free_state_not_peak(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
@@ -3471,7 +3486,9 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
         }
         out_dir = Path("outputs/test_cpp_diagnostic_guard")
         csv_path = out_dir / "reports" / "solver_diagnostics.csv"
+        perf_csv_path = out_dir / "reports" / "performance_diagnostics.csv"
         csv_path.unlink(missing_ok=True)
+        perf_csv_path.unlink(missing_ok=True)
 
         class FakeConn:
             def __init__(self) -> None:
@@ -3538,6 +3555,9 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
         self.assertFalse(done_messages[0].results[0]["success"])
         header = csv_path.read_text(encoding="utf-8").splitlines()[0].split(",")
         self.assertEqual(header, SolverStepDiagnostics.csv_fields())
+        perf_header = perf_csv_path.read_text(encoding="utf-8").splitlines()[0].split(",")
+        self.assertIn("cpp_solve_ms", perf_header)
+        self.assertIn("czm_sync_ms", perf_header)
 
     def test_cpp_diagnostics_off_does_not_write_csv(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig

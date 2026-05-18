@@ -40,6 +40,28 @@ class SolverDiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(plan.lift_step, 1.0e-6)
         self.assertEqual(plan.expected_steps, 150)
 
+    def test_default_performance_benchmark_matrix_covers_main_slow_modes(self) -> None:
+        from hydrogel_vbd.solver.diagnostics import (
+            default_performance_benchmark_matrix,
+        )
+
+        scenarios = default_performance_benchmark_matrix()
+
+        self.assertEqual(len(scenarios), 8)
+        self.assertTrue(all(s.model_path.name == "demo7.STEP" for s in scenarios))
+        self.assertTrue(all(s.layers == 32 for s in scenarios))
+        self.assertIn(
+            (True, 5.0, True),
+            {
+                (
+                    s.enable_czm,
+                    s.lift_multiplier,
+                    s.field_debug_enabled,
+                )
+                for s in scenarios
+            },
+        )
+
     def test_solver_step_diagnostics_records_counts_and_timing(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
@@ -129,6 +151,41 @@ class SolverDiagnosticsTests(unittest.TestCase):
 
         lines = out.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines, [",".join(SolverStepDiagnostics.csv_fields())])
+
+    def test_layer_performance_diagnostics_csv_has_stable_header(self) -> None:
+        from hydrogel_vbd.solver.diagnostics import (
+            LayerPerformanceDiagnostics,
+            prepare_layer_performance_diagnostics_csv,
+            write_layer_performance_diagnostics_csv,
+        )
+
+        out = ROOT / "outputs" / "test_layer_performance_diagnostics.csv"
+        out.unlink(missing_ok=True)
+        row = LayerPerformanceDiagnostics(
+            layer_id=2,
+            mode="field_debug",
+            elapsed_s=1.25,
+            lift_steps=45,
+            return_steps=45,
+            no_field_ms=300.0,
+            with_field_ms=310.0,
+            cpp_solve_ms=500.0,
+            czm_sync_ms=80.0,
+            render_ms=12.0,
+            solver_steps=90,
+            solver_iterations=180,
+            rms_error=1.0e-3,
+            max_error=2.0e-3,
+            guard_reason="pass",
+        )
+
+        prepare_layer_performance_diagnostics_csv(out)
+        write_layer_performance_diagnostics_csv(out, [row])
+
+        lines = out.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0].split(","), LayerPerformanceDiagnostics.csv_fields())
+        self.assertIn("field_debug", lines[1])
+        self.assertIn("310.0", lines[1])
 
     def test_diagnostic_runaway_guard_triggers_after_repeated_clipped_steps(self) -> None:
         from hydrogel_vbd.solver.diagnostics import (
