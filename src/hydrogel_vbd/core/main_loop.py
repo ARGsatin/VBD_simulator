@@ -33,15 +33,18 @@ from pathlib import Path
 
 import numpy as np
 
+from typing import Any
+
 from hydrogel_vbd.core.config import SimulationConfig
 from hydrogel_vbd.control.field_controller import PIDFieldController, PIDFieldState
-from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
 from hydrogel_vbd.geometry.layer_activator import LayerActivator
+from hydrogel_vbd.geometry.stl_slicer import load_stl, slice_stl
 from hydrogel_vbd.io.gcode_exporter import insert_pid_field_commands
 from hydrogel_vbd.io.npz_state import save_layer_state
 from hydrogel_vbd.io.report_writer import write_metrics_csv
 from hydrogel_vbd.io.vtk_writer import write_vtu
+from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
 from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
 
@@ -287,6 +290,173 @@ def run_demo(
 
 
 # ---------------------------------------------------------------------------
+# STL 流水线入口
+# ---------------------------------------------------------------------------
+
+def run_from_stl(
+    stl_path: str | Path,
+    layer_height: float = 5e-5,
+    quality: float = 1.0,
+    output: str | Path = "outputs/stl_sim",
+    config: SimulationConfig | None = None,
+) -> list[LayerResult]:
+    """从 STL 文件运行完整打印仿真流水线。
+
+    步骤：
+    1. 切片 STL（用于预览 / 报告）
+    2. 通过 TetGen 构建共形分层四面体网格
+    3. 逐层执行：激活 → 求解 → 评估 → 补偿
+
+    Parameters
+    ----------
+    stl_path : str | Path
+        输入 STL 文件路径。
+    layer_height : float
+        打印层厚（与 STL 同单位），默认 5e-5 (0.05 mm)。
+    quality : float
+        TetGen 网格细化因子 (0.1 … 5.0，默认 1.0)。
+    output : str | Path
+        输出根目录路径。
+    config : SimulationConfig or None
+        仿真配置，None 则使用默认值。
+
+    Returns
+    -------
+    list[LayerResult]
+        每层的求解结果列表。
+    """
+    output_dir = Path(output)
+    for sub in ("states", "vtk", "reports", "gcode", "slices"):
+        (output_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    config = config or SimulationConfig(layer_thickness=layer_height)
+
+    # ── 1. STL 切片 ──
+    mesh_orig = load_stl(stl_path)
+    z_min = float(mesh_orig.bounds[0][2])
+    z_max = float(mesh_orig.bounds[1][2])
+    num_layers = max(1, int((z_max - z_min) / layer_height))
+    print(f"Model Z range: [{z_min:.6f}, {z_max:.6f}]  →  {num_layers} layers")
+
+    slices = slice_stl(stl_path, layer_height, z_min, z_max)
+    print(f"  Generated {len(slices)} slice contours")
+
+    # ── 2. 共形分层四面体网格 ──
+    print("Building conformal tet mesh …")
+    mesh, _ = ConformalMeshPipeline.from_stl(
+        stl_path, layer_height=layer_height, config=config, quality=quality,
+    )
+    target_vertices = mesh.ideal_vertices.copy()
+    print(f"  Vertices: {len(mesh.vertices)}, Tets: {len(mesh.tets)}")
+
+    # ── 3. 逐层仿真循环 ──
+    solver = PythonReferenceVBDSolver(config)
+    activator = LayerActivator()
+    controller = PIDFieldController(config)
+
+    results: list[LayerResult] = []
+    commands_by_layer: dict[int, Any] = {}
+
+    for layer_id in range(num_layers):
+        activator.activate_with_inheritance(mesh, layer_id, z_fep=config.z_fep)
+
+        bottom = mesh.bottom_nodes(layer_id)
+        update_czm_states(
+            mesh,
+            bottom,
+            internal_pull_z=np.full(len(bottom), config.T_max * 1.05),
+            area=config.node_area,
+            t_max=config.T_max,
+            k_czm=config.K_czm,
+            delta_f=config.delta_f,
+            z_fep=config.z_fep,
+            dt=config.dt,
+        )
+
+        solve_result = solver.solve_until_stable(mesh, layer_id=layer_id, e_z=controller.E_z)
+        x_sim, v_sim = solve_result.x, solve_result.v
+
+        err_avg = (
+            float(np.mean(target_vertices[bottom, 2] - x_sim[bottom, 2]))
+            if len(bottom)
+            else 0.0
+        )
+        pid_state = controller.update(err_avg=err_avg)
+        max_error = float(np.max(np.linalg.norm(target_vertices - x_sim, axis=1)))
+        rms_error = float(
+            np.sqrt(np.mean(np.sum((target_vertices - x_sim) ** 2, axis=1)))
+        )
+        metrics = {
+            "err_avg": err_avg,
+            "E_z": pid_state.E_z,
+            "PID_integral": pid_state.PID_integral,
+            "kinetic_energy": solve_result.kinetic_energy,
+            "stable_steps": float(solve_result.stable_steps),
+            "max_dx": solve_result.max_dx,
+            "all_free": float(solve_result.all_free),
+            "max_error": max_error,
+        }
+
+        result = LayerResult(
+            layer_id=layer_id,
+            x_sim=x_sim.copy(),
+            v_sim=v_sim.copy(),
+            error_metrics=metrics,
+            field_command_next=FieldCommand(
+                voltage=np.array([pid_state.E_z]), electrode_ids=["E_z"]
+            ),
+            max_deformation=max_error,
+            rms_error=rms_error,
+            success=bool(max_error < 2.0),
+        )
+        results.append(result)
+        commands_by_layer[layer_id] = pid_state
+
+        save_layer_state(output_dir / "states" / f"layer_{layer_id:04d}.npz", result)
+        write_vtu(
+            output_dir / "vtk" / f"layer_{layer_id:04d}.vtu",
+            mesh,
+            point_data={"active": mesh.active_vertex_mask.astype(float)},
+        )
+
+        print(
+            f"  Layer {layer_id:3d}: err_avg={err_avg:.6e}  "
+            f"E_z={pid_state.E_z:.6f}  "
+            f"steps={solve_result.stable_steps}"
+        )
+
+    # ── 4. 输出报告 ──
+    write_metrics_csv(output_dir / "reports" / "error_metrics.csv", results)
+    command_payload = {
+        "layers": [
+            {
+                "layer_id": lid,
+                "E_z": float(c.E_z),
+                "err_avg": float(c.err_avg),
+                "PID_integral": float(c.PID_integral),
+                "prev_error": float(c.prev_error),
+                "delta_E": float(c.delta_E),
+            }
+            for lid, c in commands_by_layer.items()
+        ]
+    }
+    (output_dir / "simulation_field_commands.json").write_text(
+        json.dumps(command_payload, indent=2), encoding="utf-8"
+    )
+
+    source_gcode = "".join(
+        f";LAYER: {lid}\nG1 Z{lid * layer_height:.6f}\n" for lid in range(num_layers)
+    )
+    compensated = insert_pid_field_commands(source_gcode, commands_by_layer)
+    (output_dir / "gcode" / "compensated_print.gcode").write_text(
+        compensated, encoding="utf-8"
+    )
+
+    print(f"\nDone — results in {output_dir.resolve()}")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 命令行入口
 # ---------------------------------------------------------------------------
 
@@ -295,15 +465,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="运行水凝胶 VBD 仿真演示循环。"
     )
-    parser.add_argument("--layers", type=int, default=3, help="仿真层数")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("outputs/demo"),
-        help="输出目录路径",
-    )
+    parser.add_argument("--layers", type=int, default=3, help="合成柱体仿真层数")
+    parser.add_argument("--output", type=Path, default=Path("outputs/demo"), help="输出目录路径")
+    parser.add_argument("--stl", type=str, default=None, help="STL 文件路径（使用 STL 流水线）")
+    parser.add_argument("--layer-height", type=float, default=5e-5, help="打印层厚（与 STL 同单位）")
+    parser.add_argument("--quality", type=float, default=1.0, help="TetGen 网格质量因子 (0.1-5.0)")
     args = parser.parse_args()
-    run_demo(layers=args.layers, output=args.output)
+
+    if args.stl:
+        run_from_stl(
+            stl_path=args.stl,
+            layer_height=args.layer_height,
+            quality=args.quality,
+            output=args.output,
+        )
+    else:
+        run_demo(layers=args.layers, output=args.output)
 
 
 if __name__ == "__main__":

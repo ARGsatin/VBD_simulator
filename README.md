@@ -13,13 +13,14 @@
 
 ### 核心流程
 
-1. **全局共形四面体网格构建** — 含共享层间界面节点的多层网格
-2. **逐层激活与保形** — 离型膜碰撞处理、继承变形几何、防穿透插值
-3. **局部力与 Hessian 装配** — 惯性、超弹刚度、阻尼、CZM 软化、流体吸力、电场提升
-4. **VBD 求解** — 基于图着色的顶点批次 3×3 Newton 局部迭代
-5. **CZM 损伤状态机** — `FIXED → DAMAGING → FREE` 三态转换
-6. **PID 控制电场** — 评估底部节点平均垂度并自动调节 `E_z`
-7. **多格式输出** — NPZ 状态快照、VTU 可视化、CSV 报告、JSON 回放、`M150 E...` G-code
+1. **STL 切片** — 将输入模型沿 Z 轴切片为 2D 截面轮廓（可选预览）
+2. **全局共形四面体网格构建** — 含共享层间界面节点的多层网格，支持合成柱体或从 STL/STEP 构建
+3. **逐层激活与保形** — 离型膜碰撞处理、继承变形几何、防穿透插值
+4. **局部力与 Hessian 装配** — 惯性、超弹刚度、阻尼、CZM 软化、流体吸力、电场提升
+5. **VBD 求解** — 基于图着色的顶点批次 3×3 Newton 局部迭代
+6. **CZM 损伤状态机** — `FIXED → DAMAGING → FREE` 三态转换
+7. **PID 控制电场** — 评估底部节点平均垂度并自动调节 `E_z`
+8. **多格式输出** — NPZ 状态快照、VTU 可视化、CSV 报告、JSON 回放、`M150 E...` G-code
 
 ---
 
@@ -44,7 +45,7 @@ VBD_simulator/
 │   ├── core/                          # 核心层：配置、状态、主循环
 │   │   ├── config.py                  # 仿真配置数据类（YAML 加载）
 │   │   ├── state.py                   # 仿真状态管理（网格/顶点数据）
-│   │   └── main_loop.py               # 主仿真循环（逐层求解）
+│   │   └── main_loop.py               # 主仿真循环（逐层求解 + STL 流水线）
 │   │
 │   ├── control/                       # 控制模块
 │   │   ├── field_controller.py        # PID 电场控制器
@@ -67,9 +68,11 @@ VBD_simulator/
 │   │   └── elastic_energy.py          # 四面体超弹性能量计算
 │   │
 │   ├── geometry/                      # 几何处理模块
-│   │   ├── conformal_pipeline.py      # 保形网格管道
+│   │   ├── conformal_pipeline.py      # 保形网格管道（合成柱体 + STL 导入）
 │   │   ├── layer_activator.py         # 逐层激活器
-│   │   └── stl_mesher.py              # STL → 四面体网格
+│   │   ├── stl_mesher.py              # STL/STEP → 四面体网格（Gmsh OCC / Delaunay）
+│   │   ├── stl_slicer.py              # STL 切片器（2D 截面轮廓）
+│   │   └── tet_mesher.py              # STL → 四面体网格（TetGen，轻量替代方案）
 │   │
 │   ├── gui/                           # 图形界面（PySide6）
 │   │   ├── main_window.py             # 主窗口（4 步工作流 + 自动编译集成）
@@ -103,7 +106,10 @@ VBD_simulator/
 │   └── bindings/                      # pybind11 绑定
 │       └── pybind_vbd.cpp
 │
-├── tests/                             # 测试文件（31 个测试）
+├── tests/                             # 测试文件
+│   ├── data/                          # 测试用 STL 模型
+│   │   ├── demo7.STL
+│   │   └── 长方体.STL
 │   ├── test_conformal_architecture.py
 │   ├── test_io_and_main_loop.py
 │   ├── test_lift_and_gui.py
@@ -113,6 +119,11 @@ VBD_simulator/
 │   ├── test_package_and_configs.py
 │   └── test_state_and_activation.py
 │
+├── assets/                            # 静态资源
+│   └── test_models/                   # 更多测试模型（STL + STEP）
+│       ├── 长方体(1).STL
+│       └── demo7(1).STL
+│
 ├── docs/                              # 文档
 │   ├── architecture/                  # 架构文档
 │   │   ├── 技术栈.md
@@ -120,11 +131,6 @@ VBD_simulator/
 │   ├── guide/                         # 使用指南
 │   └── superpowers/                   # 开发计划
 │       └── plans/
-│
-├── assets/                            # 静态资源
-│   └── test_models/                   # 测试用 STL 模型
-│       ├── 长方体(1).STL
-│       └── demo7(1).STL
 │
 └── outputs/                           # 仿真输出目录
 ```
@@ -175,20 +181,29 @@ pip install -e .
 ### 运行仿真
 
 ```powershell
-# 方式一：命令行动态引入
+# 方式一：合成柱体演示（无 STL 依赖）
 python -c "import sys; sys.path.insert(0,'src'); from hydrogel_vbd.core.main_loop import run_demo; run_demo(layers=3, output='outputs/demo')"
 
-# 方式二：直接运行主循环
-python src/hydrogel_vbd/core/main_loop.py --layers 3
+# 方式二：从 STL 文件运行（完整流水线）
+python -m hydrogel_vbd.core.main_loop --stl "assets/test_models/demo7(1).STL" --layer-height 5e-5 --output outputs/stl_sim
 
 # 方式三：启动图形界面
 python run_gui.py
 ```
 
+### STL 流水线命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--stl` | — | STL 文件路径（提供则走 STL 流水线，否则走合成柱体演示） |
+| `--layer-height` | `5e-5` | 打印层厚（与 STL 同单位） |
+| `--quality` | `1.0` | TetGen 网格细化因子（0.1 … 5.0，越大越细） |
+| `--output` | `outputs/demo` | 输出根目录 |
+
 ### 运行测试
 
 ```powershell
-# 运行全部测试（31 个）
+# 运行全部测试
 python -m pytest tests/ -v
 
 # 运行单个测试文件
@@ -205,12 +220,14 @@ python -m pytest tests/test_state_and_activation.py -v
 |-------------|------|------|
 | `states/` | `.npz` | 每层求解后的完整状态快照 |
 | `vtk/` | `.vtu` | ParaView 可读的网格可视化文件 |
+| `slices/` | `.png` | （STL 路径）切片轮廓预览 |
 | `reports/` | `.csv`, `.json` | 误差指标、收敛历史、PID 日志 |
-| `gcode/` | `.gcode` | 含 `M150 E...` 电场指令的打印 G-code |
+| `gcode/` | `.gcode` | 含 `M150 E...` 电场指令的补偿打印 G-code |
+| `simulation_field_commands.json` | `.json` | PID 回放文件 |
 
 CSV 报告格式：
 ```csv
-layer_id, err_avg, E_z, kinetic_energy, stable_steps, max_dx, all_free
+layer_id, err_avg, E_z, PID_integral, kinetic_energy, stable_steps, max_dx, all_free, max_error
 ```
 
 ---
@@ -302,7 +319,11 @@ copy Release\hydrogel_vbd_cpp.*.pyd ..\src\
 - **模块化**：每个物理效应为独立的力模块，易于扩展和替换
 - **配置驱动**：所有参数集中于 `config.yaml`，便于调参和复现
 - **Python 优先**：参考实现用 Python 编写，接口为 C++ 移植预留
+<<<<<<< HEAD
+- **测试覆盖**：测试覆盖核心路径（状态管理、求解收敛、力向量、IO 往返）
+=======
 - **测试覆盖**：31 个测试覆盖核心路径（状态管理、求解收敛、力向量、IO 往返、数值稳定性）
+>>>>>>> origin/main
 
 ### 关键类
 
@@ -313,6 +334,7 @@ copy Release\hydrogel_vbd_cpp.*.pyd ..\src\
 | `PythonReferenceVBDSolver` | `solver.vbd_solver` | Chebyshev 半隐式 VBD 求解 |
 | `FieldController` | `control.field_controller` | PID 电场调节 |
 | `LayerActivator` | `geometry.layer_activator` | 新层激活与保形 |
+| `ConformalMeshPipeline` | `geometry.conformal_pipeline` | 网格构建（合成柱体 + STL 导入） |
 
 ---
 
@@ -320,9 +342,15 @@ copy Release\hydrogel_vbd_cpp.*.pyd ..\src\
 
 - **语言**：Python 3.10+（核心），C++17（加速）
 - **数值计算**：NumPy, SciPy
+<<<<<<< HEAD
+- **网格处理**：trimesh, PyVista, Gmsh, TetGen
+- **GUI**：PySide6（Qt for Python）
+- **C++ 绑定**：pybind11
+=======
 - **网格处理**：trimesh, PyVista
 - **GUI**：PySide6（Qt for Python），含自动编译集成
 - **C++ 绑定**：pybind11，支持编译后热加载
+>>>>>>> origin/main
 - **线性代数**：Eigen 3.4（C++ 端）
 - **构建系统**：CMake + MSBuild，GUI 内一键自动编译
 - **测试**：pytest

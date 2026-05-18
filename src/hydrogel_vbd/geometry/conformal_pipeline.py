@@ -11,15 +11,25 @@
 
    - ``create_demo()`` 静态工厂方法生成一个多层共形四面体网格，
      层间共享节点，保证应力继承和激活演化的拓扑一致性。
+   - ``from_stl()`` 从 STL 文件构建共形分层网格（TetGen 路径）。
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from hydrogel_vbd.core.config import SimulationConfig
+from hydrogel_vbd.geometry.tet_mesher import from_stl as tet_mesh_from_stl
 from hydrogel_vbd.solver.graph_coloring import greedy_vertex_coloring
 from hydrogel_vbd.core.state import MeshState
+
+
+def _compute_bottom_surface(vertices: np.ndarray, z_tol: float = 1e-9) -> np.ndarray:
+    """检测全局底面顶点（Z 坐标接近 Z_min 的顶点）。"""
+    z_min = float(np.min(vertices[:, 2]))
+    return np.abs(vertices[:, 2] - z_min) < z_tol
 
 
 class ConformalMeshPipeline:
@@ -146,3 +156,105 @@ class ConformalMeshPipeline:
         mesh.colors = greedy_vertex_coloring(mesh)            # 图着色分组
 
         return mesh, layers
+
+    # ------------------------------------------------------------------
+    # STL 流水线
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def from_stl(
+        stl_path: str | Path,
+        layer_height: float,
+        config: SimulationConfig | None = None,
+        quality: float = 1.0,
+    ) -> tuple[MeshState, int]:
+        """从 STL 文件构建共形分层四面体网格。
+
+        步骤：
+        1. 通过 TetGen 对 STL 进行四面体剖分
+        2. 按重心 Z 坐标将每个四面体分配到对应打印层
+        3. 计算顶点的首次激活层和顶层表面标记
+        4. 检测底面、预计算形函数矩阵、节点质量和图着色
+
+        Parameters
+        ----------
+        stl_path : str | Path
+            输入 STL 文件路径。
+        layer_height : float
+            打印层厚（与 STL 同单位）。
+        config : SimulationConfig or None
+            仿真配置。None 则使用默认值。
+        quality : float
+            TetGen 网格细化因子（0.1 … 5.0，默认 1.0）。
+
+        Returns
+        -------
+        tuple[MeshState, int]
+            - mesh : 含完整层元数据的网格状态对象
+            - num_layers : 总层数
+        """
+        config = config or SimulationConfig(layer_thickness=layer_height)
+
+        # 1. TetGen 四面体剖分
+        vertices, tets = tet_mesh_from_stl(stl_path, quality=quality)
+        n_vertices = len(vertices)
+        z_min = float(np.min(vertices[:, 2]))
+        z_max = float(np.max(vertices[:, 2]))
+
+        if z_max - z_min < 1e-12:
+            raise ValueError("STL 在 Z 轴方向无厚度")
+
+        num_layers = max(1, int(np.ceil((z_max - z_min) / layer_height)))
+
+        # 2. 按重心 Z 将四面体分配到层
+        centroids = vertices[tets].mean(axis=1)
+        tet_layers = np.floor((centroids[:, 2] - z_min) / layer_height).astype(np.int32)
+        tet_layers = np.clip(tet_layers, 0, num_layers - 1)
+
+        # 3. 每个顶点的首次激活层
+        first_active = np.full(n_vertices, num_layers, dtype=np.int32)
+        for tid, layer in enumerate(tet_layers):
+            first_active[tets[tid]] = np.minimum(first_active[tets[tid]], layer)
+
+        # 4. 每个顶点涉及的层集合（用于检测层间界面顶点）
+        vertex_layers: list[set[int]] = [set() for _ in range(n_vertices)]
+        for tid, layer in enumerate(tet_layers):
+            for v in tets[tid]:
+                vertex_layers[int(v)].add(int(layer))
+
+        # 5. is_top_surface_of_layer 标记
+        #    跨多层 → 界面顶点（取最大层号）
+        #    单一层 → Z 接近层边界时标记
+        is_top = np.full(n_vertices, -1, dtype=np.int32)
+        for vi, layers_set in enumerate(vertex_layers):
+            if len(layers_set) >= 2:
+                is_top[vi] = max(layers_set)
+            elif len(layers_set) == 1:
+                layer = list(layers_set)[0]
+                vz = float(vertices[vi, 2])
+                lo = z_min + layer * layer_height
+                hi = lo + layer_height
+                if abs(vz - z_max) < layer_height * 0.05:
+                    is_top[vi] = layer + 1
+                elif abs(vz - lo) < layer_height * 0.05:
+                    is_top[vi] = layer
+                elif abs(vz - hi) < layer_height * 0.05:
+                    is_top[vi] = layer + 1
+
+        # 6. 底面检测
+        is_bottom = _compute_bottom_surface(vertices)
+
+        # 7. 组装 MeshState
+        mesh = MeshState(
+            vertices=vertices,
+            tets=tets,
+            layer_id_per_vertex=first_active.copy(),
+            first_active_layer=first_active.copy(),
+            layer_id_per_tet=tet_layers,
+            is_bottom_surface=is_bottom,
+            is_top_surface_of_layer=is_top,
+        )
+        mesh.precompute_reference_matrices(config.c_shrink)
+        mesh.node_mass = mesh._build_node_masses(config.rho)
+        mesh.colors = greedy_vertex_coloring(mesh)
+        return mesh, num_layers
