@@ -80,6 +80,7 @@ class _ElectricFieldPlotData:
     aux_label: str
     primary_title: str
     primary_ylabel: str
+    guard_passed: np.ndarray | None = None
 
 
 def _format_bbox_mm(vertices: np.ndarray) -> str:
@@ -1632,8 +1633,12 @@ class MainWindow(QtWidgets.QMainWindow):
         _user_wants_cpp = (
             self._chk_use_cpp is not None and self._chk_use_cpp.isChecked()
         )
-        _cpp_ready = _user_wants_cpp and is_cpp_available() and not field_debug_enabled
-        if _user_wants_cpp and not is_cpp_available():
+        _cpp_available = is_cpp_available()
+        _cpp_ready = _user_wants_cpp and _cpp_available and not field_debug_enabled
+        _field_debug_cpp_ready = (
+            _user_wants_cpp and _cpp_available and field_debug_enabled
+        )
+        if _user_wants_cpp and not _cpp_available:
             builder = CppBuilder()
             if builder.pyd_exists():
                 self._log.append_log("  [build] 检测到旧版 .pyd，重新编译 ...")
@@ -1650,13 +1655,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log.append_log("  [build] 前置条件就绪，正在后台编译 ...")
                 self._start_cpp_build(builder, config)
                 return
-        if field_debug_enabled and _user_wants_cpp:
+        if field_debug_enabled and _field_debug_cpp_ready:
             self._log.append_log(
-                "  [field-debug] 电场调试对比需要 Python 克隆分支，已暂时关闭 C++"
+                "  [field-debug] 电场调试对比将使用直接 C++ adapter；本次不走 C++ 子进程隔离"
             )
         if _cpp_ready:
             self._log.append_log("  [info] 使用 C++ 加速求解器")
-        elif _user_wants_cpp and not is_cpp_available():
+        elif _field_debug_cpp_ready:
+            self._log.append_log("  [info] 使用 Python 控制循环 + C++ adapter 分支求解")
+        elif _user_wants_cpp and not _cpp_available:
             pass  # 已在上方打印回退消息
         else:
             self._log.append_log("  [info] 使用 Python 参考求解器（用户选择）")
@@ -1689,6 +1696,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 use_cpp=_cpp_ready,
                 solver_diagnostics_enabled=solver_diag_enabled,
                 field_debug_enabled=field_debug_enabled,
+                field_debug_use_cpp=_field_debug_cpp_ready,
             )
             self._thread = QtCore.QThread(self)
 
@@ -2579,22 +2587,63 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
                 ],
                 dtype=float,
             )
-            cum_source = np.nan_to_num(max_err, nan=0.0, posinf=0.0, neginf=0.0)
-            cum_sum = np.cumsum(cum_source)
-            total = cum_sum[-1] if cum_sum.size and cum_sum[-1] > 0 else 1.0
-            cum_pct = cum_sum / total * 100.0
+            has_field_debug = any(
+                "field_no_field_rms" in ElectricFieldPlotWindow._metrics(r)
+                and "field_with_field_rms" in ElectricFieldPlotWindow._metrics(r)
+                for r in results
+            )
+            if has_field_debug:
+                aux_values: list[float] = []
+                guard_passed: list[float] = []
+                for result in results:
+                    no_field_rms = ElectricFieldPlotWindow._metric_value(
+                        result, ("field_no_field_rms",), np.nan
+                    )
+                    with_field_rms = ElectricFieldPlotWindow._metric_value(
+                        result, ("field_with_field_rms",), np.nan
+                    )
+                    if (
+                        np.isfinite(no_field_rms)
+                        and np.isfinite(with_field_rms)
+                        and no_field_rms > 1.0e-15
+                    ):
+                        aux_values.append(
+                            (no_field_rms - with_field_rms)
+                            / no_field_rms
+                            * 100.0
+                        )
+                    else:
+                        aux_values.append(np.nan)
+                    guard_passed.append(
+                        ElectricFieldPlotWindow._metric_value(
+                            result, ("field_guard_passed",), np.nan
+                        )
+                    )
+                aux_pct = np.array(aux_values, dtype=float)
+                aux_label = "RMS 改善率 (%)"
+                guard_status = np.array(guard_passed, dtype=float)
+            else:
+                cum_source = np.nan_to_num(
+                    max_err, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                cum_sum = np.cumsum(cum_source)
+                total = cum_sum[-1] if cum_sum.size and cum_sum[-1] > 0 else 1.0
+                aux_pct = cum_sum / total * 100.0
+                aux_label = "累计误差 (%)"
+                guard_status = None
             return _ElectricFieldPlotData(
                 layers=layers,
                 e_z=e_z_vals,
                 primary=max_err,
                 secondary=rms_err,
-                aux_pct=cum_pct,
+                aux_pct=aux_pct,
                 mode="shape",
                 primary_label="max_error (m)",
                 secondary_label="rms_error (m)",
-                aux_label="累计误差 (%)",
+                aux_label=aux_label,
                 primary_title="形状误差对比",
                 primary_ylabel="误差 (m)",
+                guard_passed=guard_status,
             )
 
         solver_max_dx = np.array(
@@ -2662,7 +2711,7 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
 
         # ── 左上：E_z 电场 ──
         ax1 = fig.add_subplot(2, 2, 1)
-        ax1.plot(layers, plot_data.e_z, "b-o", markersize=4, linewidth=1.5, label="E_z (V/m)")
+        ax1.plot(layers, plot_data.e_z, "b-o", markersize=3, linewidth=1.3, label="E_z (V/m)")
         ax1.set_xlabel("层序号")
         ax1.set_ylabel("E_z (V/m)", color="b")
         ax1.tick_params(axis="y", labelcolor="b")
@@ -2675,7 +2724,7 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
             layers,
             plot_data.aux_pct,
             0,
-            alpha=0.15,
+            alpha=0.08,
             color="orange",
             label=plot_data.aux_label,
         )
@@ -2685,18 +2734,38 @@ class ElectricFieldPlotWindow(QtWidgets.QDialog):
             "orange",
             linestyle="--",
             linewidth=1.0,
-            markersize=3,
-            marker="s",
-            markerfacecolor="orange",
         )
+        if plot_data.guard_passed is not None:
+            finite_aux = np.isfinite(plot_data.aux_pct)
+            failed = finite_aux & ~(plot_data.guard_passed > 0.5)
+            if np.any(failed):
+                ax1b.scatter(
+                    layers[failed],
+                    plot_data.aux_pct[failed],
+                    color="red",
+                    marker="x",
+                    s=28,
+                    label="守门失败",
+                    zorder=4,
+                )
         ax1b.set_ylabel(plot_data.aux_label, color="orange")
         ax1b.tick_params(axis="y", labelcolor="orange")
-        ax1b.set_ylim(0, 105)
+        if plot_data.guard_passed is None:
+            ax1b.set_ylim(0, 105)
+        else:
+            finite_aux = plot_data.aux_pct[np.isfinite(plot_data.aux_pct)]
+            if finite_aux.size:
+                lo = min(0.0, float(np.min(finite_aux)))
+                hi = max(0.0, float(np.max(finite_aux)))
+                span = max(1.0, hi - lo)
+                ax1b.set_ylim(lo - span * 0.15, hi + span * 0.15)
+            else:
+                ax1b.set_ylim(-1.0, 1.0)
 
         # 合并图例
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1b.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
 
         # ── 右下：shape error 或 solver diagnostic ──
         ax2 = fig.add_subplot(2, 2, 4)

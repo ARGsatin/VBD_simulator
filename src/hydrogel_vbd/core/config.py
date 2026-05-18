@@ -147,6 +147,9 @@ class SimulationConfig:
     field_control_mode: str = "scalar_pid"  # 电场控制模式
     field_regularization: float = 1.0e-3    # 电压反演 Tikhonov 正则
     rms_guard_tolerance: float = 0.01       # guarded 模式 RMS 容忍比例
+    field_detach_pre_steps: int = 0         # v2 脱膜窗口：脱膜前步数
+    field_detach_post_steps: int = 1        # v2 脱膜窗口：脱膜后步数
+    field_peak_window_steps: int = 1        # v2 最高点窗口：末尾步数
 
     # ────────── 打印工艺 ──────────
     layer_thickness: float = 5e-5    # 层厚 / 平台提升距离 (m) = 0.05mm

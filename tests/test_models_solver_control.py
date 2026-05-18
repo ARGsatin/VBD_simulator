@@ -184,6 +184,39 @@ class ModelsSolverControlTests(unittest.TestCase):
         self.assertAlmostEqual(second.unclipped_E_z, 0.4)
         self.assertAlmostEqual(second.E_z, 0.25)
 
+    def test_bottom_z_controller_integral_accumulates_with_dt(self):
+        from hydrogel_vbd.control.field_controller import BottomZFieldController
+        from hydrogel_vbd.core.config import SimulationConfig
+
+        config = SimulationConfig(
+            err_target=0.0,
+            K_p=0.0,
+            K_i=2.0,
+            K_d=0.0,
+            dt=0.5,
+            q_ion=1.0,
+            E_max=10.0,
+        )
+        controller = BottomZFieldController(config, regularization=0.0)
+        target = np.array([[0.0, 0.0, 1.0]])
+        simulated = np.array([[0.0, 0.0, 0.8]])
+
+        first = controller.update(
+            bottom_nodes=np.array([0], dtype=int),
+            target_vertices=target,
+            simulated_vertices=simulated,
+        )
+        second = controller.update(
+            bottom_nodes=np.array([0], dtype=int),
+            target_vertices=target,
+            simulated_vertices=simulated,
+        )
+
+        self.assertAlmostEqual(first.PID_integral, 0.1)
+        self.assertAlmostEqual(first.E_z, 0.2)
+        self.assertAlmostEqual(second.PID_integral, 0.2)
+        self.assertAlmostEqual(second.E_z, 0.4)
+
 
 if __name__ == "__main__":
     unittest.main()

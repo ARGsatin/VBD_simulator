@@ -31,7 +31,7 @@ import math
 import os
 import time
 import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,23 @@ from hydrogel_vbd.solver.cpp_adapter import is_cpp_available
 
 class _SimulationCancelled(Exception):
     """Internal control-flow exception for user-requested simulation stops."""
+
+
+@dataclass
+class _FieldDebugBranchRun:
+    """Field-debug branch state split into commit and guard snapshots."""
+
+    commit_mesh: MeshState
+    guard_mesh: MeshState
+    commit_result: Any
+    guard_result: Any
+    commit_steps: int
+    executed_steps: int
+    total_iterations: int
+    max_iter_hits: int
+    clipped_steps: int
+    lift_max: float
+    info: dict[str, float | str]
 
 
 class SimulationWorker(QtCore.QObject):
@@ -90,6 +107,7 @@ class SimulationWorker(QtCore.QObject):
         solver_diagnostics_enabled: bool | None = None,
         solver_diagnostics_stride: int | None = None,
         field_debug_enabled: bool = False,
+        field_debug_use_cpp: bool | None = None,
     ) -> None:
         super().__init__()
         self._mesh_original = mesh
@@ -103,6 +121,14 @@ class SimulationWorker(QtCore.QObject):
         self._solver_diagnostics_enabled = solver_diagnostics_enabled
         self._solver_diagnostics_stride = solver_diagnostics_stride
         self._field_debug_enabled = bool(field_debug_enabled)
+        if field_debug_use_cpp is None:
+            field_debug_use_cpp = bool(field_debug_enabled and use_cpp)
+        self._field_debug_use_cpp = (
+            bool(field_debug_enabled)
+            and bool(field_debug_use_cpp)
+            and is_cpp_available()
+        )
+        self._field_debug_cpp_fallback_count = 0
 
     # ───────────────────────────────────────────────────────────
     # 网格深拷贝（避免数据竞争 → 杜绝 Segfault）
@@ -296,6 +322,20 @@ class SimulationWorker(QtCore.QObject):
         return int(math.ceil(ratio - max(1e-12, abs(ratio) * 1e-12)))
 
     @staticmethod
+    def _positive_step_distances(total: float, max_step: float) -> list[float]:
+        total = max(0.0, float(total))
+        max_step = max(0.0, float(max_step))
+        if total <= 0.0 or max_step <= 0.0:
+            return []
+        steps: list[float] = []
+        remaining = total
+        while remaining > max(1e-15, total * 1e-12):
+            step = min(max_step, remaining)
+            steps.append(step)
+            remaining -= step
+        return steps
+
+    @staticmethod
     def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
         return float(config.z_fep)
 
@@ -334,6 +374,48 @@ class SimulationWorker(QtCore.QObject):
         return pull
 
     @staticmethod
+    def _sync_cpp_lift_czm_state(
+        mesh: MeshState,
+        config: SimulationConfig,
+        layer_id: int,
+        e_z: float,
+        x_prev: np.ndarray,
+        bottom: np.ndarray,
+        bottom_state: np.ndarray,
+        bottom_damage: np.ndarray,
+        bottom_time_free: np.ndarray,
+        result: Any,
+    ) -> None:
+        """Mirror subprocess CZM handling for direct C++ field-debug steps."""
+        if not bool(getattr(config, "enable_czm", True)) or len(bottom) == 0:
+            return
+
+        from hydrogel_vbd.physics.czm import CZMState, update_czm_states
+        from hydrogel_vbd.physics.local_terms import build_local_physics_terms
+        from hydrogel_vbd.solver.vbd_solver import _normal_pull_from_terms
+
+        mesh.czm_state[bottom] = bottom_state
+        mesh.damage[bottom] = bottom_damage
+        mesh.time_free[bottom] = bottom_time_free
+        terms = build_local_physics_terms(
+            mesh, config, e_z=e_z, x_prev=x_prev, layer_id=layer_id
+        )
+        update_czm_states(
+            mesh,
+            bottom,
+            internal_pull_z=_normal_pull_from_terms(terms.force, bottom),
+            area=config.node_area,
+            t_max=config.T_max,
+            k_czm=config.K_czm,
+            delta_f=config.delta_f,
+            z_fep=config.z_fep,
+            dt=config.dt,
+        )
+        result.all_free = bool(
+            np.all(mesh.czm_state[bottom] == int(CZMState.FREE))
+        )
+
+    @staticmethod
     def _shape_debug_metrics(mesh: MeshState, layer_id: int) -> dict[str, float]:
         """Return global RMS and current-bottom Z metrics for a mesh snapshot."""
         target = np.asarray(mesh.ideal_vertices, dtype=float)
@@ -363,23 +445,173 @@ class SimulationWorker(QtCore.QObject):
             "bottom_count": float(len(bottom)),
         }
 
+    @staticmethod
+    def _field_debug_guard(
+        no_field_metrics: dict[str, float],
+        with_field_metrics: dict[str, float],
+        tolerance: float,
+    ) -> dict[str, float | str]:
+        """Return conservative field-debug acceptance diagnostics."""
+        eps = 1.0e-12
+        rms_limit = no_field_metrics["rms"] * (1.0 + float(tolerance)) + eps
+        max_limit = (
+            no_field_metrics["max_error"] * (1.0 + float(tolerance)) + eps
+        )
+        rms_ok = with_field_metrics["rms"] <= rms_limit
+        max_ok = with_field_metrics["max_error"] <= max_limit
+
+        rms_improvement_eps = max(eps, abs(no_field_metrics["rms"]) * 1.0e-6)
+        bottom_mean_eps = max(
+            eps, abs(no_field_metrics["bottom_z_mean"]) * 1.0e-6
+        )
+        bottom_max_eps = max(
+            eps, abs(no_field_metrics["bottom_z_max"]) * 1.0e-6
+        )
+        no_mean_sag = max(no_field_metrics["bottom_z_mean"], 0.0)
+        with_mean_sag = max(with_field_metrics["bottom_z_mean"], 0.0)
+        no_max_sag = max(no_field_metrics["bottom_z_max"], 0.0)
+        with_max_sag = max(with_field_metrics["bottom_z_max"], 0.0)
+        improved = (
+            with_field_metrics["rms"]
+            < no_field_metrics["rms"] - rms_improvement_eps
+            or with_mean_sag < no_mean_sag - bottom_mean_eps
+            or with_max_sag < no_max_sag - bottom_max_eps
+        )
+
+        if not rms_ok:
+            reason = "rms_error_worse"
+        elif not max_ok:
+            reason = "max_error_worse"
+        elif not improved:
+            reason = "no_improvement"
+        else:
+            reason = "pass"
+
+        return {
+            "passed": float(rms_ok and max_ok and improved),
+            "reason": reason,
+            "rms_limit": float(rms_limit),
+            "max_error_limit": float(max_limit),
+            "rms_passed": float(rms_ok),
+            "max_error_passed": float(max_ok),
+            "improvement_passed": float(improved),
+        }
+
+    @staticmethod
+    def _field_event_window_e_z(
+        step: int,
+        expected_steps: int,
+        detach_e_z: float,
+        detach_step: int,
+        config: SimulationConfig,
+        peak_e_z: float | None = None,
+    ) -> tuple[float, bool, int]:
+        """Return the event-window E_z for a 1-based lift step."""
+        detach_e_z = float(detach_e_z)
+        peak_e_z = detach_e_z if peak_e_z is None else float(peak_e_z)
+        if (detach_e_z <= 0.0 and peak_e_z <= 0.0) or expected_steps <= 0:
+            return 0.0, False, 0
+
+        detach_pre = max(
+            0, int(getattr(config, "field_detach_pre_steps", 0))
+        )
+        detach_post = max(
+            0, int(getattr(config, "field_detach_post_steps", 1))
+        )
+        peak_steps = max(
+            0, int(getattr(config, "field_peak_window_steps", 1))
+        )
+        peak_start = (
+            max(1, expected_steps - peak_steps + 1)
+            if peak_steps > 0
+            else 0
+        )
+
+        in_detach_window = (
+            detach_step > 0
+            and (detach_step - detach_pre) <= step <= (detach_step + detach_post)
+        )
+        in_peak_window = peak_start > 0 and step >= peak_start
+        candidates: list[float] = []
+        if in_detach_window:
+            candidates.append(max(detach_e_z, 0.0))
+        if in_peak_window:
+            candidates.append(max(peak_e_z, 0.0))
+        value = max(candidates) if candidates else 0.0
+        return value, value > 0.0, peak_start
+
     def _run_field_debug_branch(
         self,
         source_mesh: MeshState,
         config: SimulationConfig,
         layer_id: int,
         e_z: float,
-    ) -> tuple[MeshState, Any, int, int, int, int, float]:
+        use_cpp: bool = False,
+        event_window_detach_step: int | None = None,
+        peak_e_z: float | None = None,
+        continue_to_peak: bool = False,
+    ) -> _FieldDebugBranchRun:
         """Run a cloned layer branch for field-debug comparison."""
+        try:
+            return self._run_field_debug_branch_once(
+                source_mesh,
+                config,
+                layer_id,
+                e_z,
+                use_cpp=use_cpp,
+                event_window_detach_step=event_window_detach_step,
+                peak_e_z=peak_e_z,
+                continue_to_peak=continue_to_peak,
+            )
+        except Exception as exc:
+            if not use_cpp:
+                raise
+            self._field_debug_cpp_fallback_count += 1
+            self._field_debug_use_cpp = False
+            self.log_message.emit(
+                f"  [field-debug] C++ adapter 分支求解失败，回退 Python: {exc}"
+            )
+            return self._run_field_debug_branch_once(
+                source_mesh,
+                config,
+                layer_id,
+                e_z,
+                use_cpp=False,
+                event_window_detach_step=event_window_detach_step,
+                peak_e_z=peak_e_z,
+                continue_to_peak=continue_to_peak,
+            )
+
+    def _run_field_debug_branch_once(
+        self,
+        source_mesh: MeshState,
+        config: SimulationConfig,
+        layer_id: int,
+        e_z: float,
+        use_cpp: bool = False,
+        event_window_detach_step: int | None = None,
+        peak_e_z: float | None = None,
+        continue_to_peak: bool = False,
+    ) -> _FieldDebugBranchRun:
+        """Run one cloned field-debug branch with the selected solver backend."""
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
-        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        if use_cpp:
+            from hydrogel_vbd.solver.cpp_adapter import (
+                solve_until_stable as cpp_solve_until_stable,
+                solve_lift_and_relax as cpp_solve_lift_and_relax,
+            )
+            solver = None
+        else:
+            from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+            solver = PythonReferenceVBDSolver
 
         mesh = copy.deepcopy(source_mesh)
         layer_z_fep = self._layer_contact_z(config, layer_id)
         layer_config = replace(config, z_fep=layer_z_fep)
         activator = LayerActivator()
         activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
-        solver = PythonReferenceVBDSolver(layer_config)
+        python_solver = None if use_cpp else solver(layer_config)
 
         lift_max = config.lift_multiplier * config.layer_thickness
         lift_step = config.v_lift * config.dt
@@ -394,15 +626,76 @@ class SimulationWorker(QtCore.QObject):
         max_iter_hits = 0
         clipped_steps = 0
         layer_steps = 0
+        return_steps = 0
+        platform_return_distance = 0.0
+        detach_step = 0
+        commit_steps = 0
+        commit_mesh: MeshState | None = None
+        commit_result: Any | None = None
+        field_applied_steps = 0
+        peak_start_step = (
+            max(
+                1,
+                expected_lift_steps
+                - max(0, int(getattr(config, "field_peak_window_steps", 1)))
+                + 1,
+            )
+            if expected_lift_steps > 0
+            and int(getattr(config, "field_peak_window_steps", 1)) > 0
+            else 0
+        )
+        timing_mode = (
+            "event_windows_v2"
+            if event_window_detach_step is not None and expected_lift_steps > 0
+            else "constant"
+        )
         if expected_lift_steps > 0 and len(top_ids) > 0:
             self._validate_lift_plan(
                 layer_id, lift_max, lift_step, expected_lift_steps
             )
             result = None
             for _ in range(expected_lift_steps):
-                result = solver.solve_with_lift(
-                    mesh, layer_id=layer_id, e_z=e_z, lifting_top=top_ids
-                )
+                step_index = layer_steps + 1
+                if event_window_detach_step is None:
+                    step_e_z = float(e_z)
+                else:
+                    step_e_z, active_window, peak_start_step = (
+                        self._field_event_window_e_z(
+                            step_index,
+                            expected_lift_steps,
+                            float(e_z),
+                            int(event_window_detach_step or 0),
+                            config,
+                            peak_e_z=peak_e_z,
+                        )
+                    )
+                    if active_window:
+                        field_applied_steps += 1
+                if use_cpp:
+                    bottom = mesh.bottom_nodes(layer_id)
+                    bottom_state = mesh.czm_state[bottom].copy()
+                    bottom_damage = mesh.damage[bottom].copy()
+                    bottom_time_free = mesh.time_free[bottom].copy()
+                    x_before_solve = mesh.vertices.copy()
+                    result = cpp_solve_lift_and_relax(
+                        mesh, layer_config, step_e_z, layer_id, top_ids
+                    )
+                    self._sync_cpp_lift_czm_state(
+                        mesh,
+                        layer_config,
+                        layer_id,
+                        step_e_z,
+                        x_before_solve,
+                        bottom,
+                        bottom_state,
+                        bottom_damage,
+                        bottom_time_free,
+                        result,
+                    )
+                else:
+                    result = python_solver.solve_with_lift(
+                        mesh, layer_id=layer_id, e_z=step_e_z, lifting_top=top_ids
+                    )
                 layer_steps += 1
                 total_iterations += int(getattr(result, "iterations", 0))
                 if getattr(result, "iterations", 0) >= config.max_iters:
@@ -412,16 +705,38 @@ class SimulationWorker(QtCore.QObject):
                     >= self.DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
                 ):
                     clipped_steps += 1
-                if result.all_free and bool(getattr(config, "enable_czm", True)):
-                    self._raise_if_detached_before_convergence(
-                        layer_id, layer_steps, result, layer_config
-                    )
-                    break
+                if result.all_free:
+                    if detach_step <= 0:
+                        detach_step = layer_steps
+                    if commit_mesh is None:
+                        commit_mesh = copy.deepcopy(mesh)
+                        commit_result = result
+                        commit_steps = layer_steps
+                    if bool(getattr(config, "enable_czm", True)):
+                        self._raise_if_detached_before_convergence(
+                            layer_id, layer_steps, result, layer_config
+                        )
+                    if not continue_to_peak:
+                        break
             if result is None:
-                result = solver.solve_until_stable(mesh, layer_id=layer_id, e_z=e_z)
+                if use_cpp:
+                    result = cpp_solve_until_stable(
+                        mesh, layer_config, e_z, layer_id
+                    )
+                else:
+                    result = python_solver.solve_until_stable(
+                        mesh, layer_id=layer_id, e_z=e_z
+                    )
         else:
             x_before_solve = mesh.vertices.copy()
-            result = solver.solve_until_stable(mesh, layer_id=layer_id, e_z=e_z)
+            if e_z > 0.0:
+                field_applied_steps = 1
+            if use_cpp:
+                result = cpp_solve_until_stable(mesh, layer_config, e_z, layer_id)
+            else:
+                result = python_solver.solve_until_stable(
+                    mesh, layer_id=layer_id, e_z=e_z
+                )
             total_iterations += int(getattr(result, "iterations", 0))
             if getattr(result, "iterations", 0) >= config.max_iters:
                 max_iter_hits += 1
@@ -434,14 +749,89 @@ class SimulationWorker(QtCore.QObject):
                 mesh, layer_config, layer_id, e_z, x_before_solve
             )
 
-        return (
-            mesh,
-            result,
-            layer_steps,
-            total_iterations,
-            max_iter_hits,
-            clipped_steps,
-            lift_max,
+        guard_mesh = copy.deepcopy(mesh)
+        guard_result = result
+        if commit_mesh is None:
+            commit_mesh = copy.deepcopy(guard_mesh)
+            commit_result = guard_result
+            commit_steps = layer_steps
+        if (
+            expected_lift_steps > 0
+            and len(top_ids) > 0
+            and layer_id + 1 < self._n_layers
+            and abs(lift_step) > 0.0
+            and commit_steps > 0
+        ):
+            platform_return_distance = float(commit_steps) * abs(float(lift_step))
+            return_top_ids = self._current_lifting_top(commit_mesh)
+            for return_step_distance in self._positive_step_distances(
+                platform_return_distance, abs(lift_step)
+            ):
+                if len(return_top_ids) == 0:
+                    break
+                down_config = replace(
+                    layer_config,
+                    v_lift=-return_step_distance / max(abs(config.dt), 1e-12),
+                    enable_czm=False,
+                )
+                bottom = commit_mesh.bottom_nodes(layer_id)
+                bottom_state = commit_mesh.czm_state[bottom].copy()
+                bottom_damage = commit_mesh.damage[bottom].copy()
+                bottom_time_free = commit_mesh.time_free[bottom].copy()
+                if use_cpp:
+                    commit_result = cpp_solve_lift_and_relax(
+                        commit_mesh,
+                        down_config,
+                        0.0,
+                        layer_id,
+                        return_top_ids,
+                    )
+                else:
+                    return_solver = solver(down_config)
+                    commit_result = return_solver.solve_with_lift(
+                        commit_mesh,
+                        layer_id=layer_id,
+                        e_z=0.0,
+                        lifting_top=return_top_ids,
+                    )
+                if bool(getattr(layer_config, "enable_czm", True)) and len(bottom) > 0:
+                    commit_mesh.czm_state[bottom] = bottom_state
+                    commit_mesh.damage[bottom] = bottom_damage
+                    commit_mesh.time_free[bottom] = bottom_time_free
+                return_steps += 1
+                total_iterations += int(getattr(commit_result, "iterations", 0))
+                if getattr(commit_result, "iterations", 0) >= config.max_iters:
+                    max_iter_hits += 1
+                if (
+                    getattr(commit_result, "max_dx", 0.0)
+                    >= self.DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
+                ):
+                    clipped_steps += 1
+        info: dict[str, float | str] = {
+            "timing_mode": timing_mode,
+            "expected_steps": float(expected_lift_steps),
+            "detach_step": float(detach_step),
+            "commit_step": float(commit_steps),
+            "guard_step": float(layer_steps),
+            "return_steps": float(return_steps),
+            "platform_return_distance": float(platform_return_distance),
+            "peak_start_step": float(peak_start_step),
+            "applied_steps": float(field_applied_steps),
+            "detach_E_z": float(e_z),
+            "peak_E_z": float(e_z if peak_e_z is None else peak_e_z),
+        }
+        return _FieldDebugBranchRun(
+            commit_mesh=commit_mesh,
+            guard_mesh=guard_mesh,
+            commit_result=commit_result,
+            guard_result=guard_result,
+            commit_steps=commit_steps,
+            executed_steps=layer_steps,
+            total_iterations=total_iterations,
+            max_iter_hits=max_iter_hits,
+            clipped_steps=clipped_steps,
+            lift_max=lift_max,
+            info=info,
         )
 
     def _validate_lift_plan(
@@ -756,13 +1146,18 @@ class SimulationWorker(QtCore.QObject):
             write_solver_diagnostics_csv,
         )
 
-        if self._use_cpp and self._field_debug_enabled:
+        if self._field_debug_enabled and self._field_debug_use_cpp:
+            self.log_message.emit(
+                "  [field-debug] 使用直接 C++ adapter 求解 no-field / with-field 分支"
+            )
+
+        if self._use_cpp and self._field_debug_enabled and not self._field_debug_use_cpp:
             self.log_message.emit(
                 "  [field-debug] 电场对比需要克隆同层状态，已切换到 Python 求解器"
             )
             self._use_cpp = False
 
-        if self._use_cpp:
+        if self._use_cpp and not self._field_debug_enabled:
             self.log_message.emit("  [info] 使用 C++ 加速求解器 (子进程)")
             self._trace("cpp_subprocess_start")
             try:
@@ -777,10 +1172,14 @@ class SimulationWorker(QtCore.QObject):
                 self._use_cpp = False
                 self._restore_mesh_copy()
 
-        self.log_message.emit("  [info] 使用 Python 参考求解器")
+        if self._field_debug_enabled and self._field_debug_use_cpp:
+            self.log_message.emit("  [info] 使用 Python 控制循环 + C++ adapter 分支求解")
+        else:
+            self.log_message.emit("  [info] 使用 Python 参考求解器")
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
-        bottom_z_debug = BottomZFieldController(self._config)
+        bottom_z_detach_debug = BottomZFieldController(self._config)
+        bottom_z_peak_debug = BottomZFieldController(self._config)
         self._trace(
             f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers} "
             f"enable_czm={getattr(self._config, 'enable_czm', True)} "
@@ -890,66 +1289,160 @@ class SimulationWorker(QtCore.QObject):
             if self._field_debug_enabled:
                 layer_start_mesh = copy.deepcopy(self._mesh)
                 call_start = time.perf_counter()
-                (
-                    no_field_mesh,
-                    no_field_result,
-                    no_field_steps,
-                    no_field_iterations,
-                    no_field_max_iter_hits,
-                    no_field_clipped_steps,
-                    lift_max,
-                ) = self._run_field_debug_branch(
-                    layer_start_mesh, self._config, layer_id, e_z=0.0
-                )
-                no_field_metrics = self._shape_debug_metrics(no_field_mesh, layer_id)
-                derived_state = bottom_z_debug.update(
-                    bottom_nodes=no_field_mesh.bottom_nodes(layer_id),
-                    target_vertices=no_field_mesh.ideal_vertices,
-                    simulated_vertices=no_field_mesh.vertices,
-                )
-                (
-                    with_field_mesh,
-                    with_field_result,
-                    with_field_steps,
-                    with_field_iterations,
-                    with_field_max_iter_hits,
-                    with_field_clipped_steps,
-                    _,
-                ) = self._run_field_debug_branch(
+                field_cpp_fallbacks_before = self._field_debug_cpp_fallback_count
+                field_branch_requested_cpp = bool(self._field_debug_use_cpp)
+                no_field_run = self._run_field_debug_branch(
                     layer_start_mesh,
                     self._config,
                     layer_id,
-                    e_z=derived_state.E_z,
+                    e_z=0.0,
+                    use_cpp=field_branch_requested_cpp,
+                    continue_to_peak=True,
                 )
-                with_field_metrics = self._shape_debug_metrics(
-                    with_field_mesh, layer_id
+                no_field_metrics = self._shape_debug_metrics(
+                    no_field_run.guard_mesh, layer_id
                 )
-                guard_limit = (
-                    no_field_metrics["rms"]
-                    * (1.0 + float(getattr(self._config, "rms_guard_tolerance", 0.01)))
-                    + 1e-12
+                no_field_commit_metrics = self._shape_debug_metrics(
+                    no_field_run.commit_mesh, layer_id
                 )
-                guard_passed = with_field_metrics["rms"] <= guard_limit
-                if guard_passed:
-                    self._mesh = with_field_mesh
-                    selected_result = with_field_result
-                    selected_metrics = with_field_metrics
-                    effective_mode = "with_field"
-                    selected_e_z = float(derived_state.E_z)
-                    layer_steps = with_field_steps
-                    layer_total_iterations = with_field_iterations
-                    layer_max_iter_hits = with_field_max_iter_hits
-                    layer_clipped_steps = with_field_clipped_steps
+                self._push_frame(
+                    vertices=no_field_run.commit_mesh.vertices.copy(),
+                    tets=no_field_run.commit_mesh.tets,
+                    active_mask=no_field_run.commit_mesh.active_vertex_mask.copy(),
+                    active_tet_mask=no_field_run.commit_mesh.active_tet_mask.copy(),
+                    title=(
+                        f"field-debug layer {layer_id + 1}/{self._n_layers} "
+                        "no-field baseline (commit)"
+                    ),
+                )
+                detach_state = bottom_z_detach_debug.update(
+                    bottom_nodes=no_field_run.commit_mesh.bottom_nodes(layer_id),
+                    target_vertices=no_field_run.commit_mesh.ideal_vertices,
+                    simulated_vertices=no_field_run.commit_mesh.vertices,
+                )
+                peak_state = bottom_z_peak_debug.update(
+                    bottom_nodes=no_field_run.guard_mesh.bottom_nodes(layer_id),
+                    target_vertices=no_field_run.guard_mesh.ideal_vertices,
+                    simulated_vertices=no_field_run.guard_mesh.vertices,
+                )
+                derived_e_z = max(float(detach_state.E_z), float(peak_state.E_z))
+                derived_unclipped_e_z = max(
+                    float(detach_state.unclipped_E_z),
+                    float(peak_state.unclipped_E_z),
+                )
+                candidate_skipped = derived_e_z <= 1.0e-12
+                if candidate_skipped:
+                    with_field_run = _FieldDebugBranchRun(
+                        commit_mesh=copy.deepcopy(no_field_run.commit_mesh),
+                        guard_mesh=copy.deepcopy(no_field_run.guard_mesh),
+                        commit_result=no_field_run.commit_result,
+                        guard_result=no_field_run.guard_result,
+                        commit_steps=0,
+                        executed_steps=0,
+                        total_iterations=0,
+                        max_iter_hits=0,
+                        clipped_steps=0,
+                        lift_max=no_field_run.lift_max,
+                        info={
+                            "timing_mode": "event_windows_v2",
+                            "expected_steps": no_field_run.info["expected_steps"],
+                            "detach_step": no_field_run.info["detach_step"],
+                            "commit_step": no_field_run.info["commit_step"],
+                            "guard_step": no_field_run.info["guard_step"],
+                            "return_steps": no_field_run.info["return_steps"],
+                            "platform_return_distance": no_field_run.info[
+                                "platform_return_distance"
+                            ],
+                            "peak_start_step": no_field_run.info["peak_start_step"],
+                            "applied_steps": 0.0,
+                            "detach_E_z": float(detach_state.E_z),
+                            "peak_E_z": float(peak_state.E_z),
+                        },
+                    )
+                    with_field_info = {
+                        "timing_mode": "event_windows_v2",
+                        "expected_steps": no_field_run.info["expected_steps"],
+                        "detach_step": no_field_run.info["detach_step"],
+                        "commit_step": no_field_run.info["commit_step"],
+                        "guard_step": no_field_run.info["guard_step"],
+                        "return_steps": no_field_run.info["return_steps"],
+                        "platform_return_distance": no_field_run.info[
+                            "platform_return_distance"
+                        ],
+                        "peak_start_step": no_field_run.info["peak_start_step"],
+                        "applied_steps": 0.0,
+                        "detach_E_z": float(detach_state.E_z),
+                        "peak_E_z": float(peak_state.E_z),
+                    }
                 else:
-                    self._mesh = no_field_mesh
-                    selected_result = no_field_result
-                    selected_metrics = no_field_metrics
+                    with_field_run = self._run_field_debug_branch(
+                        layer_start_mesh,
+                        self._config,
+                        layer_id,
+                        e_z=detach_state.E_z,
+                        use_cpp=bool(self._field_debug_use_cpp),
+                        event_window_detach_step=int(
+                            float(no_field_run.info["detach_step"])
+                        ),
+                        peak_e_z=peak_state.E_z,
+                        continue_to_peak=True,
+                    )
+                    with_field_info = with_field_run.info
+                with_field_metrics = self._shape_debug_metrics(
+                    with_field_run.guard_mesh, layer_id
+                )
+                with_field_commit_metrics = self._shape_debug_metrics(
+                    with_field_run.commit_mesh, layer_id
+                )
+                field_cpp_fallbacks = (
+                    self._field_debug_cpp_fallback_count
+                    - field_cpp_fallbacks_before
+                )
+                field_solver_backend = (
+                    "cpp_adapter"
+                    if field_branch_requested_cpp and field_cpp_fallbacks == 0
+                    else "python"
+                )
+                guard = self._field_debug_guard(
+                    no_field_metrics,
+                    with_field_metrics,
+                    float(getattr(self._config, "rms_guard_tolerance", 0.01)),
+                )
+                guard_passed = bool(guard["passed"])
+                if guard_passed:
+                    self._mesh = with_field_run.commit_mesh
+                    selected_result = with_field_run.commit_result
+                    selected_metrics = with_field_commit_metrics
+                    effective_mode = "with_field"
+                    selected_e_z = derived_e_z
+                    layer_steps = with_field_run.executed_steps
+                    layer_total_iterations = with_field_run.total_iterations
+                    layer_max_iter_hits = with_field_run.max_iter_hits
+                    layer_clipped_steps = with_field_run.clipped_steps
+                else:
+                    self._mesh = no_field_run.commit_mesh
+                    selected_result = no_field_run.commit_result
+                    selected_metrics = no_field_commit_metrics
                     effective_mode = "no_field"
                     selected_e_z = 0.0
-                    layer_steps = no_field_steps
-                    layer_total_iterations = no_field_iterations
-                    layer_max_iter_hits = no_field_max_iter_hits
-                    layer_clipped_steps = no_field_clipped_steps
+                    layer_steps = no_field_run.executed_steps
+                    layer_total_iterations = no_field_run.total_iterations
+                    layer_max_iter_hits = no_field_run.max_iter_hits
+                    layer_clipped_steps = no_field_run.clipped_steps
+
+                self._push_frame(
+                    vertices=self._mesh.vertices.copy(),
+                    tets=self._mesh.tets,
+                    active_mask=self._mesh.active_vertex_mask.copy(),
+                    active_tet_mask=self._mesh.active_tet_mask.copy(),
+                    title=(
+                        f"field-debug layer {layer_id + 1}/{self._n_layers} "
+                        f"selected {effective_mode} "
+                        f"(commit {int(float(with_field_info['commit_step']))}/"
+                        f"guard {int(float(with_field_info['guard_step']))}, "
+                        f"return {int(float(with_field_info['return_steps']))})"
+                    ),
+                )
 
                 x_final = self._mesh.vertices.copy()
                 v_final = (
@@ -973,13 +1466,14 @@ class SimulationWorker(QtCore.QObject):
                     "solver_clipped_steps": float(layer_clipped_steps),
                     "solver_elapsed_s": float(layer_elapsed_s),
                     "solver_avg_call_ms": float(avg_call_ms),
-                    "solver_lift_max": float(lift_max),
+                    "solver_lift_max": float(no_field_run.lift_max),
                     "solver_lift_step": float(
                         self._config.v_lift * self._config.dt
                     ),
                     "solver_expected_steps": float(
                         self._expected_lift_steps(
-                            lift_max, self._config.v_lift * self._config.dt
+                            no_field_run.lift_max,
+                            self._config.v_lift * self._config.dt,
                         )
                         if self._config.v_lift * self._config.dt > 0.0
                         else 0
@@ -989,9 +1483,45 @@ class SimulationWorker(QtCore.QObject):
                     ),
                     "shape_error_available": 1.0,
                     "field_debug_enabled": 1.0,
+                    "field_debug_solver_backend": field_solver_backend,
+                    "field_debug_cpp_fallbacks": float(field_cpp_fallbacks),
+                    "field_candidate_skipped": float(candidate_skipped),
+                    "field_timing_mode": with_field_info["timing_mode"],
+                    "field_window_expected_steps": with_field_info[
+                        "expected_steps"
+                    ],
+                    "field_window_detach_step": with_field_info[
+                        "detach_step"
+                    ],
+                    "field_window_peak_start_step": with_field_info[
+                        "peak_start_step"
+                    ],
+                    "field_window_applied_steps": with_field_info[
+                        "applied_steps"
+                    ],
+                    "field_detach_E_z": with_field_info["detach_E_z"],
+                    "field_peak_E_z": with_field_info["peak_E_z"],
+                    "field_commit_step": with_field_info["commit_step"],
+                    "field_guard_step": with_field_info["guard_step"],
+                    "field_platform_return_steps": with_field_info[
+                        "return_steps"
+                    ],
+                    "field_platform_return_distance": with_field_info[
+                        "platform_return_distance"
+                    ],
                     "field_bottom_node_count": no_field_metrics["bottom_count"],
                     "field_no_field_rms": no_field_metrics["rms"],
                     "field_with_field_rms": with_field_metrics["rms"],
+                    "field_no_field_commit_rms": no_field_commit_metrics["rms"],
+                    "field_with_field_commit_rms": with_field_commit_metrics["rms"],
+                    "field_no_field_max_error": no_field_metrics["max_error"],
+                    "field_with_field_max_error": with_field_metrics["max_error"],
+                    "field_no_field_commit_max_error": no_field_commit_metrics[
+                        "max_error"
+                    ],
+                    "field_with_field_commit_max_error": with_field_commit_metrics[
+                        "max_error"
+                    ],
                     "field_rms_improvement": (
                         no_field_metrics["rms"] - with_field_metrics["rms"]
                     ),
@@ -1007,9 +1537,23 @@ class SimulationWorker(QtCore.QObject):
                     "field_with_field_bottom_z_max": with_field_metrics[
                         "bottom_z_max"
                     ],
-                    "field_derived_E_z": float(derived_state.E_z),
-                    "field_unclipped_E_z": float(derived_state.unclipped_E_z),
+                    "field_derived_E_z": derived_e_z,
+                    "field_unclipped_E_z": derived_unclipped_e_z,
+                    "field_detach_unclipped_E_z": float(
+                        detach_state.unclipped_E_z
+                    ),
+                    "field_peak_unclipped_E_z": float(
+                        peak_state.unclipped_E_z
+                    ),
                     "field_guard_passed": float(guard_passed),
+                    "field_guard_reason": guard["reason"],
+                    "field_rms_guard_passed": guard["rms_passed"],
+                    "field_max_error_guard_passed": guard["max_error_passed"],
+                    "field_improvement_guard_passed": guard[
+                        "improvement_passed"
+                    ],
+                    "field_rms_guard_limit": guard["rms_limit"],
+                    "field_max_error_guard_limit": guard["max_error_limit"],
                     "field_effective_mode": effective_mode,
                     "rms_error": selected_metrics["rms"],
                     "max_error": selected_metrics["max_error"],
@@ -1023,9 +1567,20 @@ class SimulationWorker(QtCore.QObject):
                     f"rms(no/with)="
                     f"{no_field_metrics['rms']:.6e}/"
                     f"{with_field_metrics['rms']:.6e}, "
-                    f"E_z={derived_state.E_z:.6e} "
-                    f"(raw={derived_state.unclipped_E_z:.6e}), "
-                    f"guard={'pass' if guard_passed else 'fallback'}"
+                    f"max(no/with)="
+                    f"{no_field_metrics['max_error']:.6e}/"
+                    f"{with_field_metrics['max_error']:.6e}, "
+                    f"E(detach/peak)="
+                    f"{float(with_field_info['detach_E_z']):.6e}/"
+                    f"{float(with_field_info['peak_E_z']):.6e}, "
+                    f"E_z={derived_e_z:.6e} "
+                    f"(raw={derived_unclipped_e_z:.6e}), "
+                    f"backend={field_solver_backend}, "
+                    f"steps(commit/guard)="
+                    f"{int(float(with_field_info['commit_step']))}/"
+                    f"{int(float(with_field_info['guard_step']))}, "
+                    f"return_steps={int(float(with_field_info['return_steps']))}, "
+                    f"guard={guard['reason']}"
                 )
                 layer_result = LayerResult(
                     layer_id=layer_id,

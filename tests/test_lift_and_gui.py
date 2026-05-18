@@ -765,6 +765,875 @@ class WorkerLiftControlTests(unittest.TestCase):
         self.assertEqual(metrics["field_effective_mode"], "with_field")
         self.assertTrue(any("[field-debug]" in msg for msg in logs))
 
+    def test_field_debug_uses_direct_cpp_adapter_when_requested(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        mesh.vertices[0, 2] = 1.0
+        mesh.ideal_vertices[0, 2] = 1.0
+        cpp_calls: list[float] = []
+
+        def fake_cpp_solve(mesh_arg, cfg_arg, e_z, layer_id):  # noqa: ANN001, ARG001
+            cpp_calls.append(float(e_z))
+            mesh_arg.vertices[0, 2] = 0.5 if float(e_z) <= 0.0 else 0.9
+            return VBDSolveResult(
+                x=mesh_arg.vertices.copy(),
+                v=np.zeros_like(mesh_arg.vertices),
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=True,
+                chebyshev_skipped_damaging=0,
+            )
+
+        with patch(
+            "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
+            return_value=True,
+        ):
+            worker = SimulationWorker(
+                mesh=mesh,
+                config=config,
+                n_layers=1,
+                output_dir="outputs/test_worker_field_debug_cpp",
+                use_cpp=True,
+                field_debug_enabled=True,
+            )
+        worker._trace = lambda msg: None
+        worker._run_cpp_subprocess = lambda: (_ for _ in ()).throw(
+            AssertionError("field debug should not use the C++ subprocess")
+        )
+        logs: list[str] = []
+        worker.log_message.connect(logs.append)
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_until_stable",
+                side_effect=fake_cpp_solve,
+            ),
+            patch(
+                "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+                side_effect=AssertionError(
+                    "field debug should use the direct C++ adapter"
+                ),
+            ),
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(cpp_calls), 2)
+        self.assertAlmostEqual(cpp_calls[0], 0.0)
+        self.assertGreater(cpp_calls[1], 0.0)
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_debug_solver_backend"], "cpp_adapter")
+        self.assertEqual(metrics["field_effective_mode"], "with_field")
+        self.assertTrue(any("C++ adapter" in msg for msg in logs))
+
+    def test_field_debug_cpp_adapter_failure_falls_back_to_python(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        mesh.vertices[0, 2] = 1.0
+        mesh.ideal_vertices[0, 2] = 1.0
+        python_calls: list[float] = []
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_until_stable(self, mesh_arg, layer_id, e_z, on_iteration=None):  # noqa: ANN001, ARG002
+                python_calls.append(float(e_z))
+                mesh_arg.vertices[0, 2] = 0.5 if float(e_z) <= 0.0 else 0.9
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        with patch(
+            "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
+            return_value=True,
+        ):
+            worker = SimulationWorker(
+                mesh=mesh,
+                config=config,
+                n_layers=1,
+                output_dir="outputs/test_worker_field_debug_cpp_fallback",
+                use_cpp=True,
+                field_debug_enabled=True,
+            )
+        worker._trace = lambda msg: None
+        logs: list[str] = []
+        worker.log_message.connect(logs.append)
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_until_stable",
+                side_effect=RuntimeError("adapter failed"),
+            ),
+            patch(
+                "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+                FakeSolver,
+            ),
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(python_calls), 2)
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_debug_solver_backend"], "python")
+        self.assertEqual(metrics["field_debug_cpp_fallbacks"], 1.0)
+        self.assertEqual(metrics["field_effective_mode"], "with_field")
+        self.assertTrue(any("回退 Python" in msg for msg in logs))
+
+
+    def test_field_debug_rejects_candidate_when_max_error_worsens(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            rms_guard_tolerance=0.01,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        n_vertices = 100
+        mesh = MeshState(
+            vertices=np.ones((n_vertices, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(n_vertices, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(n_vertices, dtype=np.int32),
+            is_top_surface_of_layer=np.full(n_vertices, -1, dtype=np.int32),
+        )
+        mesh.is_top_surface_of_layer[0] = 1
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(n_vertices, dtype=np.int32)
+        mesh.node_mass = np.ones(n_vertices, dtype=float)
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_until_stable(self, mesh_arg, layer_id, e_z, on_iteration=None):  # noqa: ANN001, ARG002
+                if float(e_z) <= 0.0:
+                    mesh_arg.vertices[:, 2] = 0.9
+                else:
+                    mesh_arg.vertices[:, 2] = 1.0
+                    mesh_arg.vertices[1, 2] = 0.895
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_max_guard",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_effective_mode"], "no_field")
+        self.assertEqual(metrics["field_guard_passed"], 0.0)
+        self.assertEqual(metrics["field_guard_reason"], "max_error_worse")
+        self.assertAlmostEqual(metrics["E_z"], 0.0)
+        self.assertGreater(
+            metrics["field_with_field_max_error"],
+            metrics["field_no_field_max_error"],
+        )
+
+    def test_field_debug_keeps_no_field_when_candidate_has_no_improvement(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        mesh.vertices[0, 2] = 1.0
+        mesh.ideal_vertices[0, 2] = 1.0
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_until_stable(self, mesh_arg, layer_id, e_z, on_iteration=None):  # noqa: ANN001, ARG002
+                mesh_arg.vertices[0, 2] = 0.5
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_no_improvement",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_effective_mode"], "no_field")
+        self.assertEqual(metrics["field_guard_reason"], "no_improvement")
+        self.assertAlmostEqual(metrics["field_derived_E_z"], 0.5)
+        self.assertAlmostEqual(metrics["E_z"], 0.0)
+
+    def test_field_debug_emits_no_field_and_selected_frames(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        mesh.vertices[0, 2] = 1.0
+        mesh.ideal_vertices[0, 2] = 1.0
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_until_stable(self, mesh_arg, layer_id, e_z, on_iteration=None):  # noqa: ANN001, ARG002
+                mesh_arg.vertices[0, 2] = 0.5 if float(e_z) <= 0.0 else 0.9
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_frames",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+        frames: list[dict] = []
+        worker.frame_ready.connect(frames.append)
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            worker._run_layers()
+
+        titles = [frame["title"] for frame in frames]
+        self.assertTrue(any("no-field" in title for title in titles))
+        self.assertTrue(any("selected" in title for title in titles))
+
+    def test_field_debug_v2_applies_field_only_at_detach_and_peak_windows(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        from hydrogel_vbd.core.state import MeshState
+
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        call_ez: list[float] = []
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_with_lift(self, mesh_arg, layer_id, e_z, lifting_top, on_iteration=None):  # noqa: ANN001, ARG002
+                call_ez.append(float(e_z))
+                mesh_arg.vertices[0, 2] = 0.9 if float(e_z) > 0.0 else 0.5
+                step_in_branch = ((len(call_ez) - 1) % 5) + 1
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=(step_in_branch == 3),
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_v2_windows",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(call_ez[:5], [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(call_ez[5:10], [0.0, 0.0, 0.5, 0.5, 0.5])
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_timing_mode"], "event_windows_v2")
+        self.assertEqual(metrics["field_window_detach_step"], 3.0)
+        self.assertEqual(metrics["field_window_peak_start_step"], 5.0)
+        self.assertEqual(metrics["field_window_applied_steps"], 3.0)
+
+    def test_field_debug_v2_uses_separate_detach_and_peak_field_values(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        call_ez: list[float] = []
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_with_lift(self, mesh_arg, layer_id, e_z, lifting_top, on_iteration=None):  # noqa: ANN001, ARG002
+                call_ez.append(float(e_z))
+                step_in_branch = ((len(call_ez) - 1) % 5) + 1
+                if len(call_ez) <= 5:
+                    mesh_arg.vertices[0, 2] = 0.3 if step_in_branch == 3 else 0.8
+                else:
+                    mesh_arg.vertices[0, 2] = 0.9
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=(step_in_branch == 3),
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_v2_split_fields",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(call_ez[:5], [0.0, 0.0, 0.0, 0.0, 0.0])
+        np.testing.assert_allclose(call_ez[5:10], [0.0, 0.0, 0.7, 0.7, 0.2])
+        metrics = results[0].error_metrics
+        self.assertAlmostEqual(metrics["field_detach_E_z"], 0.7)
+        self.assertAlmostEqual(metrics["field_peak_E_z"], 0.2)
+
+    def test_field_debug_commits_detach_state_not_peak_guard_state(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        call_count = 0
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_with_lift(self, mesh_arg, layer_id, e_z, lifting_top, on_iteration=None):  # noqa: ANN001, ARG002
+                nonlocal call_count
+                call_count += 1
+                step_in_branch = ((call_count - 1) % 5) + 1
+                mesh_arg.vertices[:, 2] = float(step_in_branch)
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=(step_in_branch == 2),
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_commit_detach",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+        frames: list[dict] = []
+        worker.frame_ready.connect(frames.append)
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        self.assertAlmostEqual(results[0].x_sim[0, 2], 2.0)
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_effective_mode"], "no_field")
+        self.assertEqual(metrics["field_window_detach_step"], 2.0)
+        self.assertEqual(metrics["field_commit_step"], 2.0)
+        self.assertEqual(metrics["field_guard_step"], 5.0)
+        no_field_frames = [
+            frame for frame in frames if "no-field baseline" in frame["title"]
+        ]
+        self.assertEqual(len(no_field_frames), 1)
+        self.assertAlmostEqual(no_field_frames[0]["vertices"][0, 2], 2.0)
+
+    def test_field_debug_czm_disabled_commits_all_free_state_not_peak(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=False,
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        call_count = 0
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_with_lift(self, mesh_arg, layer_id, e_z, lifting_top, on_iteration=None):  # noqa: ANN001, ARG002
+                nonlocal call_count
+                call_count += 1
+                step_in_branch = ((call_count - 1) % 5) + 1
+                mesh_arg.vertices[:, 2] = float(step_in_branch)
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=(step_in_branch == 2),
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug_czm_disabled_commit",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        metrics = results[0].error_metrics
+        self.assertAlmostEqual(results[0].x_sim[0, 2], 2.0)
+        self.assertEqual(metrics["field_window_detach_step"], 2.0)
+        self.assertEqual(metrics["field_commit_step"], 2.0)
+        self.assertEqual(metrics["field_guard_step"], 5.0)
+
+    def test_field_debug_cpp_czm_sync_commits_python_all_free_state(self) -> None:
+        from types import SimpleNamespace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.physics.czm import CZMState
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=True,
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+            is_top_fixed=np.array([True, False], dtype=bool),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        cpp_calls = 0
+        czm_updates = 0
+
+        def fake_cpp_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            nonlocal cpp_calls
+            cpp_calls += 1
+            step_in_branch = ((cpp_calls - 1) % 5) + 1
+            mesh_arg.vertices[:, 2] = float(step_in_branch)
+            return VBDSolveResult(
+                x=mesh_arg.vertices.copy(),
+                v=np.zeros_like(mesh_arg.vertices),
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        def fake_update_czm_states(mesh_arg, bottom, **kwargs):  # noqa: ANN001, ARG001
+            nonlocal czm_updates
+            czm_updates += 1
+            if ((czm_updates - 1) % 5) + 1 >= 2:
+                mesh_arg.czm_state[bottom] = int(CZMState.FREE)
+
+        with patch(
+            "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
+            return_value=True,
+        ):
+            worker = SimulationWorker(
+                mesh=mesh,
+                config=config,
+                n_layers=1,
+                output_dir="outputs/test_worker_field_debug_cpp_czm_sync",
+                use_cpp=True,
+                field_debug_enabled=True,
+            )
+        worker._trace = lambda msg: None
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=fake_cpp_solve,
+            ),
+            patch(
+                "hydrogel_vbd.physics.local_terms.build_local_physics_terms",
+                return_value=SimpleNamespace(force=np.zeros((2, 3), dtype=float)),
+            ),
+            patch(
+                "hydrogel_vbd.physics.czm.update_czm_states",
+                side_effect=fake_update_czm_states,
+            ),
+        ):
+            results = worker._run_layers()
+
+        metrics = results[0].error_metrics
+        self.assertAlmostEqual(results[0].x_sim[0, 2], 2.0)
+        self.assertEqual(metrics["field_debug_solver_backend"], "cpp_adapter")
+        self.assertEqual(metrics["field_commit_step"], 2.0)
+        self.assertEqual(metrics["field_guard_step"], 5.0)
+
+    def test_field_debug_cpp_returns_platform_before_committing_peak_no_detach(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=True,
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_multiplier=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+            is_top_fixed=np.array([True, False], dtype=bool),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        observed_v_lift: list[float] = []
+
+        def fake_cpp_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
+            observed_v_lift.append(float(cfg_arg.v_lift))
+            step = float(cfg_arg.v_lift) * float(cfg_arg.dt)
+            mesh_arg.vertices[np.asarray(lifting_top, dtype=int), 2] += step
+            return VBDSolveResult(
+                x=mesh_arg.vertices.copy(),
+                v=np.zeros_like(mesh_arg.vertices),
+                iterations=1,
+                max_dx=0.0,
+                kinetic_energy=0.0,
+                stable_steps=1,
+                all_free=False,
+                chebyshev_skipped_damaging=0,
+            )
+
+        with patch(
+            "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
+            return_value=True,
+        ):
+            worker = SimulationWorker(
+                mesh=mesh,
+                config=config,
+                n_layers=2,
+                output_dir="outputs/test_worker_field_debug_cpp_return_commit",
+                use_cpp=True,
+                field_debug_enabled=True,
+            )
+        worker._trace = lambda msg: None
+
+        with patch(
+            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+            side_effect=fake_cpp_solve,
+        ):
+            results = worker._run_layers()
+
+        self.assertAlmostEqual(results[0].x_sim[0, 2], 0.0)
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_commit_step"], 5.0)
+        self.assertEqual(metrics["field_guard_step"], 5.0)
+        self.assertEqual(metrics["field_platform_return_steps"], 5.0)
+        self.assertEqual(observed_v_lift[:5], [1.0] * 5)
+        self.assertEqual(observed_v_lift[5:10], [-1.0] * 5)
+
 
 class LayerActivatorTopFallbackTests(unittest.TestCase):
     """层顶面分类缺失时的激活回归测试。"""
@@ -1293,6 +2162,81 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertTrue(created["field_debug_enabled"])
         app.quit()
 
+    def test_field_debug_cpp_checkbox_uses_direct_adapter_not_subprocess(self) -> None:
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6 import QtCore
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        mesh = MeshState(
+            vertices=np.zeros((1, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(1, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+        )
+        win = MainWindow()
+        win._generated_mesh = mesh
+        win._actual_layers = 1
+        win._chk_field_debug.setChecked(True)
+        win._chk_use_cpp.setChecked(True)
+
+        created = {}
+
+        class FakeThread:
+            def __init__(self, parent=None) -> None:  # noqa: ANN001
+                self.started = _FakeSignal()
+                self.finished = _FakeSignal()
+
+            def start(self) -> None:
+                pass
+
+            def quit(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+            def requestInterruption(self) -> None:
+                pass
+
+        class FakeWorker:
+            def __init__(self, **kwargs) -> None:  # noqa: ANN003
+                created.update(kwargs)
+                self.frame_ready = _FakeSignal()
+                self.progress_update = _FakeSignal()
+                self.log_message = _FakeSignal()
+                self.finished = _FakeSignal()
+                self.cancelled = _FakeSignal()
+                self.error = _FakeSignal()
+                self.sub_progress = _FakeSignal()
+                self.layer_finished = _FakeSignal()
+
+            def moveToThread(self, thread) -> None:  # noqa: ANN001
+                pass
+
+            def run(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+        with patch(
+            "hydrogel_vbd.gui.main_window.SimulationWorker",
+            FakeWorker,
+        ), patch.object(QtCore, "QThread", FakeThread), patch(
+            "hydrogel_vbd.gui.main_window.is_cpp_available",
+            return_value=True,
+        ):
+            win._on_run()
+
+        self.assertFalse(created["use_cpp"])
+        self.assertTrue(created["field_debug_use_cpp"])
+        app.quit()
+
     def test_disable_chebyshev_checkbox_sets_runtime_rho_cheb_zero(self) -> None:
         from hydrogel_vbd.core.state import MeshState
         from hydrogel_vbd.gui.main_window import MainWindow
@@ -1471,6 +2415,54 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertEqual(plot_data.secondary_label, "rms_error (m)")
         np.testing.assert_allclose(plot_data.primary, [3.0e-4])
         np.testing.assert_allclose(plot_data.secondary, [2.0e-4])
+
+    def test_report_field_debug_aux_shows_rms_improvement_and_guard_status(self) -> None:
+        from hydrogel_vbd.core.state import FieldCommand, LayerResult
+        from hydrogel_vbd.gui.main_window import ElectricFieldPlotWindow
+
+        results = [
+            LayerResult(
+                layer_id=0,
+                x_sim=np.zeros((0, 3)),
+                v_sim=np.zeros((0, 3)),
+                error_metrics={
+                    "E_z": 120.0,
+                    "max_error": 4.0e-3,
+                    "rms_error": 3.0e-3,
+                    "field_no_field_rms": 4.0e-3,
+                    "field_with_field_rms": 3.0e-3,
+                    "field_guard_passed": 1.0,
+                    "shape_error_available": 1.0,
+                },
+                field_command_next=FieldCommand(np.array([])),
+                max_deformation=4.0e-3,
+                rms_error=3.0e-3,
+                success=True,
+            ),
+            LayerResult(
+                layer_id=1,
+                x_sim=np.zeros((0, 3)),
+                v_sim=np.zeros((0, 3)),
+                error_metrics={
+                    "E_z": 0.0,
+                    "max_error": 5.0e-3,
+                    "rms_error": 4.0e-3,
+                    "field_no_field_rms": 4.0e-3,
+                    "field_with_field_rms": 5.0e-3,
+                    "field_guard_passed": 0.0,
+                    "shape_error_available": 1.0,
+                },
+                field_command_next=FieldCommand(np.array([])),
+                max_deformation=5.0e-3,
+                rms_error=4.0e-3,
+                success=True,
+            ),
+        ]
+        plot_data = ElectricFieldPlotWindow._build_plot_data(results)
+
+        self.assertEqual(plot_data.aux_label, "RMS 改善率 (%)")
+        np.testing.assert_allclose(plot_data.aux_pct, [25.0, -25.0])
+        np.testing.assert_allclose(plot_data.guard_passed, [1.0, 0.0])
 
 
 class CppAdapterStateWritebackTests(unittest.TestCase):

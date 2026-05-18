@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -177,6 +178,7 @@ class BottomZFieldController:
         )
         self.E_z = 0.0
         self._previous_error_by_node: dict[int, float] = {}
+        self._integral_by_node: dict[int, float] = {}
 
     def update(
         self,
@@ -191,12 +193,14 @@ class BottomZFieldController:
 
         if bottom.size == 0:
             self._previous_error_by_node = {}
+            self._integral_by_node = {}
             return self._set_state(
                 e_z=0.0,
                 mean_error=0.0,
                 max_error=0.0,
                 unclipped=0.0,
                 prev_error=0.0,
+                pid_integral=0.0,
             )
 
         z_error = target[bottom, 2] - simulated[bottom, 2]
@@ -207,18 +211,29 @@ class BottomZFieldController:
         )
 
         derivative = np.zeros_like(active_error)
+        integral = np.zeros_like(active_error)
         dt = max(float(self.config.dt), 1e-12)
+        k_i = float(getattr(self.config, "K_i", 0.0))
+        q_ion = float(self.config.q_ion)
+        integral_limit = math.inf
+        if abs(k_i) > 1e-12 and abs(q_ion) > 1e-12:
+            integral_limit = abs(q_ion) * float(self.config.E_max) / abs(k_i)
         for local_idx, node_id in enumerate(bottom):
-            previous = self._previous_error_by_node.get(int(node_id))
+            node_key = int(node_id)
+            previous = self._previous_error_by_node.get(node_key)
             if previous is not None:
                 derivative[local_idx] = (active_error[local_idx] - previous) / dt
+            integral[local_idx] = self._integral_by_node.get(node_key, 0.0)
+            integral[local_idx] += active_error[local_idx] * dt
+        if math.isfinite(integral_limit):
+            integral = np.clip(integral, -integral_limit, integral_limit)
 
         desired_force = (
             float(self.config.K_p) * active_error
+            + k_i * integral
             + float(self.config.K_d) * derivative
         )
 
-        q_ion = float(self.config.q_ion)
         if abs(q_ion) < 1e-12 or not np.any(desired_force):
             unclipped = 0.0
         else:
@@ -234,12 +249,17 @@ class BottomZFieldController:
             int(node_id): float(error)
             for node_id, error in zip(bottom, active_error)
         }
+        self._integral_by_node = {
+            int(node_id): float(value)
+            for node_id, value in zip(bottom, integral)
+        }
         return self._set_state(
             e_z=clipped,
             mean_error=mean_error,
             max_error=max_error,
             unclipped=unclipped,
             prev_error=float(np.mean(active_error)),
+            pid_integral=float(np.mean(integral)),
         )
 
     def _set_state(
@@ -250,6 +270,7 @@ class BottomZFieldController:
         max_error: float,
         unclipped: float,
         prev_error: float,
+        pid_integral: float,
     ) -> BottomZFieldState:
         previous_e_z = self.E_z
         self.E_z = float(e_z)
@@ -259,6 +280,7 @@ class BottomZFieldController:
             bottom_z_max_error=float(max_error),
             unclipped_E_z=float(unclipped),
             err_avg=float(mean_error),
+            PID_integral=float(pid_integral),
             prev_error=float(prev_error),
             delta_E=float(self.E_z - previous_e_z),
         )
