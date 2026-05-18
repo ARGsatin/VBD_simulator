@@ -26,6 +26,7 @@ C++ 求解器函数 ``solve_lift_and_relax`` 已降级为"单步求解器"
 from __future__ import annotations
 
 import atexit
+import copy
 import math
 import os
 import time
@@ -88,6 +89,7 @@ class SimulationWorker(QtCore.QObject):
         use_cpp: bool = True,
         solver_diagnostics_enabled: bool | None = None,
         solver_diagnostics_stride: int | None = None,
+        field_debug_enabled: bool = False,
     ) -> None:
         super().__init__()
         self._mesh_original = mesh
@@ -100,6 +102,7 @@ class SimulationWorker(QtCore.QObject):
         self._cpp_solver: Any | None = None
         self._solver_diagnostics_enabled = solver_diagnostics_enabled
         self._solver_diagnostics_stride = solver_diagnostics_stride
+        self._field_debug_enabled = bool(field_debug_enabled)
 
     # ───────────────────────────────────────────────────────────
     # 网格深拷贝（避免数据竞争 → 杜绝 Segfault）
@@ -329,6 +332,117 @@ class SimulationWorker(QtCore.QObject):
             dt=config.dt,
         )
         return pull
+
+    @staticmethod
+    def _shape_debug_metrics(mesh: MeshState, layer_id: int) -> dict[str, float]:
+        """Return global RMS and current-bottom Z metrics for a mesh snapshot."""
+        target = np.asarray(mesh.ideal_vertices, dtype=float)
+        vertices = np.asarray(mesh.vertices, dtype=float)
+        if target.shape != vertices.shape or vertices.size == 0:
+            rms = 0.0
+            max_error = 0.0
+        else:
+            error = target - vertices
+            rms = float(np.sqrt(np.mean(np.sum(error * error, axis=1))))
+            max_error = float(np.max(np.linalg.norm(error, axis=1)))
+
+        bottom = mesh.bottom_nodes(layer_id)
+        if len(bottom):
+            z_error = target[bottom, 2] - vertices[bottom, 2]
+            bottom_mean = float(np.mean(z_error))
+            bottom_max = float(np.max(z_error))
+        else:
+            bottom_mean = 0.0
+            bottom_max = 0.0
+
+        return {
+            "rms": rms,
+            "max_error": max_error,
+            "bottom_z_mean": bottom_mean,
+            "bottom_z_max": bottom_max,
+            "bottom_count": float(len(bottom)),
+        }
+
+    def _run_field_debug_branch(
+        self,
+        source_mesh: MeshState,
+        config: SimulationConfig,
+        layer_id: int,
+        e_z: float,
+    ) -> tuple[MeshState, Any, int, int, int, int, float]:
+        """Run a cloned layer branch for field-debug comparison."""
+        from hydrogel_vbd.geometry.layer_activator import LayerActivator
+        from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
+
+        mesh = copy.deepcopy(source_mesh)
+        layer_z_fep = self._layer_contact_z(config, layer_id)
+        layer_config = replace(config, z_fep=layer_z_fep)
+        activator = LayerActivator()
+        activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
+        solver = PythonReferenceVBDSolver(layer_config)
+
+        lift_max = config.lift_multiplier * config.layer_thickness
+        lift_step = config.v_lift * config.dt
+        expected_lift_steps = (
+            self._expected_lift_steps(lift_max, lift_step)
+            if lift_step > 0.0
+            else 0
+        )
+        top_ids = self._current_lifting_top(mesh)
+
+        total_iterations = 0
+        max_iter_hits = 0
+        clipped_steps = 0
+        layer_steps = 0
+        if expected_lift_steps > 0 and len(top_ids) > 0:
+            self._validate_lift_plan(
+                layer_id, lift_max, lift_step, expected_lift_steps
+            )
+            result = None
+            for _ in range(expected_lift_steps):
+                result = solver.solve_with_lift(
+                    mesh, layer_id=layer_id, e_z=e_z, lifting_top=top_ids
+                )
+                layer_steps += 1
+                total_iterations += int(getattr(result, "iterations", 0))
+                if getattr(result, "iterations", 0) >= config.max_iters:
+                    max_iter_hits += 1
+                if (
+                    getattr(result, "max_dx", 0.0)
+                    >= self.DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
+                ):
+                    clipped_steps += 1
+                if result.all_free and bool(getattr(config, "enable_czm", True)):
+                    self._raise_if_detached_before_convergence(
+                        layer_id, layer_steps, result, layer_config
+                    )
+                    break
+            if result is None:
+                result = solver.solve_until_stable(mesh, layer_id=layer_id, e_z=e_z)
+        else:
+            x_before_solve = mesh.vertices.copy()
+            result = solver.solve_until_stable(mesh, layer_id=layer_id, e_z=e_z)
+            total_iterations += int(getattr(result, "iterations", 0))
+            if getattr(result, "iterations", 0) >= config.max_iters:
+                max_iter_hits += 1
+            if (
+                getattr(result, "max_dx", 0.0)
+                >= self.DX_CLIP_DIAGNOSTIC * (1.0 - 1e-9)
+            ):
+                clipped_steps += 1
+            self._update_czm_from_current_terms(
+                mesh, layer_config, layer_id, e_z, x_before_solve
+            )
+
+        return (
+            mesh,
+            result,
+            layer_steps,
+            total_iterations,
+            max_iter_hits,
+            clipped_steps,
+            lift_max,
+        )
 
     def _validate_lift_plan(
         self, layer_id: int, lift_max: float, lift_step: float, expected_steps: int
@@ -626,7 +740,10 @@ class SimulationWorker(QtCore.QObject):
         """
         from hydrogel_vbd.solver.vbd_solver import PythonReferenceVBDSolver
         from hydrogel_vbd.geometry.layer_activator import LayerActivator
-        from hydrogel_vbd.control.field_controller import PIDFieldController
+        from hydrogel_vbd.control.field_controller import (
+            BottomZFieldController,
+            PIDFieldController,
+        )
         from hydrogel_vbd.solver.cpp_adapter import (
             solve_until_stable as cpp_solve_until_stable,
             solve_lift_and_relax as cpp_solve_lift_and_relax,
@@ -638,6 +755,12 @@ class SimulationWorker(QtCore.QObject):
             prepare_solver_diagnostics_csv,
             write_solver_diagnostics_csv,
         )
+
+        if self._use_cpp and self._field_debug_enabled:
+            self.log_message.emit(
+                "  [field-debug] 电场对比需要克隆同层状态，已切换到 Python 求解器"
+            )
+            self._use_cpp = False
 
         if self._use_cpp:
             self.log_message.emit("  [info] 使用 C++ 加速求解器 (子进程)")
@@ -657,6 +780,7 @@ class SimulationWorker(QtCore.QObject):
         self.log_message.emit("  [info] 使用 Python 参考求解器")
         activator = LayerActivator()
         pid = PIDFieldController(self._config)
+        bottom_z_debug = BottomZFieldController(self._config)
         self._trace(
             f"solvers_ready cpp={self._use_cpp} n_layers={self._n_layers} "
             f"enable_czm={getattr(self._config, 'enable_czm', True)} "
@@ -762,6 +886,172 @@ class SimulationWorker(QtCore.QObject):
             self.log_message.emit(
                 f"  🔹 第 {layer_id + 1}/{self._n_layers} 层 ← 开始 VBD 求解"
             )
+
+            if self._field_debug_enabled:
+                layer_start_mesh = copy.deepcopy(self._mesh)
+                call_start = time.perf_counter()
+                (
+                    no_field_mesh,
+                    no_field_result,
+                    no_field_steps,
+                    no_field_iterations,
+                    no_field_max_iter_hits,
+                    no_field_clipped_steps,
+                    lift_max,
+                ) = self._run_field_debug_branch(
+                    layer_start_mesh, self._config, layer_id, e_z=0.0
+                )
+                no_field_metrics = self._shape_debug_metrics(no_field_mesh, layer_id)
+                derived_state = bottom_z_debug.update(
+                    bottom_nodes=no_field_mesh.bottom_nodes(layer_id),
+                    target_vertices=no_field_mesh.ideal_vertices,
+                    simulated_vertices=no_field_mesh.vertices,
+                )
+                (
+                    with_field_mesh,
+                    with_field_result,
+                    with_field_steps,
+                    with_field_iterations,
+                    with_field_max_iter_hits,
+                    with_field_clipped_steps,
+                    _,
+                ) = self._run_field_debug_branch(
+                    layer_start_mesh,
+                    self._config,
+                    layer_id,
+                    e_z=derived_state.E_z,
+                )
+                with_field_metrics = self._shape_debug_metrics(
+                    with_field_mesh, layer_id
+                )
+                guard_limit = (
+                    no_field_metrics["rms"]
+                    * (1.0 + float(getattr(self._config, "rms_guard_tolerance", 0.01)))
+                    + 1e-12
+                )
+                guard_passed = with_field_metrics["rms"] <= guard_limit
+                if guard_passed:
+                    self._mesh = with_field_mesh
+                    selected_result = with_field_result
+                    selected_metrics = with_field_metrics
+                    effective_mode = "with_field"
+                    selected_e_z = float(derived_state.E_z)
+                    layer_steps = with_field_steps
+                    layer_total_iterations = with_field_iterations
+                    layer_max_iter_hits = with_field_max_iter_hits
+                    layer_clipped_steps = with_field_clipped_steps
+                else:
+                    self._mesh = no_field_mesh
+                    selected_result = no_field_result
+                    selected_metrics = no_field_metrics
+                    effective_mode = "no_field"
+                    selected_e_z = 0.0
+                    layer_steps = no_field_steps
+                    layer_total_iterations = no_field_iterations
+                    layer_max_iter_hits = no_field_max_iter_hits
+                    layer_clipped_steps = no_field_clipped_steps
+
+                x_final = self._mesh.vertices.copy()
+                v_final = (
+                    self._mesh.velocities.copy()
+                    if self._mesh.velocities is not None
+                    else np.zeros_like(x_final)
+                )
+                layer_elapsed_s = time.perf_counter() - layer_start
+                branch_elapsed_s = time.perf_counter() - call_start
+                avg_call_ms = (
+                    branch_elapsed_s / 2.0 * 1000.0
+                )
+                layer_metrics: dict[str, float | str] = {
+                    "E_z": selected_e_z,
+                    "solver_total_steps": float(layer_steps),
+                    "solver_final_max_dx": float(
+                        getattr(selected_result, "max_dx", 0.0)
+                    ),
+                    "solver_total_iterations": float(layer_total_iterations),
+                    "solver_max_iter_hits": float(layer_max_iter_hits),
+                    "solver_clipped_steps": float(layer_clipped_steps),
+                    "solver_elapsed_s": float(layer_elapsed_s),
+                    "solver_avg_call_ms": float(avg_call_ms),
+                    "solver_lift_max": float(lift_max),
+                    "solver_lift_step": float(
+                        self._config.v_lift * self._config.dt
+                    ),
+                    "solver_expected_steps": float(
+                        self._expected_lift_steps(
+                            lift_max, self._config.v_lift * self._config.dt
+                        )
+                        if self._config.v_lift * self._config.dt > 0.0
+                        else 0
+                    ),
+                    "solver_top_nodes": float(
+                        len(self._current_lifting_top(self._mesh))
+                    ),
+                    "shape_error_available": 1.0,
+                    "field_debug_enabled": 1.0,
+                    "field_bottom_node_count": no_field_metrics["bottom_count"],
+                    "field_no_field_rms": no_field_metrics["rms"],
+                    "field_with_field_rms": with_field_metrics["rms"],
+                    "field_rms_improvement": (
+                        no_field_metrics["rms"] - with_field_metrics["rms"]
+                    ),
+                    "field_no_field_bottom_z_mean": no_field_metrics[
+                        "bottom_z_mean"
+                    ],
+                    "field_no_field_bottom_z_max": no_field_metrics[
+                        "bottom_z_max"
+                    ],
+                    "field_with_field_bottom_z_mean": with_field_metrics[
+                        "bottom_z_mean"
+                    ],
+                    "field_with_field_bottom_z_max": with_field_metrics[
+                        "bottom_z_max"
+                    ],
+                    "field_derived_E_z": float(derived_state.E_z),
+                    "field_unclipped_E_z": float(derived_state.unclipped_E_z),
+                    "field_guard_passed": float(guard_passed),
+                    "field_effective_mode": effective_mode,
+                    "rms_error": selected_metrics["rms"],
+                    "max_error": selected_metrics["max_error"],
+                }
+                self.log_message.emit(
+                    "  [field-debug] "
+                    f"layer={layer_id + 1}, bottom={int(no_field_metrics['bottom_count'])}, "
+                    f"z_mean(no/with)="
+                    f"{no_field_metrics['bottom_z_mean']:.6e}/"
+                    f"{with_field_metrics['bottom_z_mean']:.6e}, "
+                    f"rms(no/with)="
+                    f"{no_field_metrics['rms']:.6e}/"
+                    f"{with_field_metrics['rms']:.6e}, "
+                    f"E_z={derived_state.E_z:.6e} "
+                    f"(raw={derived_state.unclipped_E_z:.6e}), "
+                    f"guard={'pass' if guard_passed else 'fallback'}"
+                )
+                layer_result = LayerResult(
+                    layer_id=layer_id,
+                    x_sim=x_final,
+                    v_sim=v_final,
+                    error_metrics=layer_metrics,
+                    field_command_next=FieldCommand(
+                        np.array([selected_e_z], dtype=float),
+                        electrode_ids=["E_z"],
+                    ),
+                    max_deformation=selected_metrics["max_error"],
+                    rms_error=selected_metrics["rms"],
+                    success=(
+                        diag_stop_reason is None
+                        and getattr(selected_result, "all_free", True)
+                    ),
+                )
+                results.append(layer_result)
+                self.layer_finished.emit(layer_result)
+                self.progress_update.emit(
+                    layer_id + 1,
+                    self._n_layers,
+                    step_counter + int(layer_total_iterations),
+                    int(getattr(selected_result, "iterations", 0)),
+                )
+                continue
 
             # ── 激活当前层（继承版：处理激活传播 + FEP 阈值）──
             layer_z_fep = self._layer_contact_z(self._config, layer_id)

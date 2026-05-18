@@ -143,6 +143,128 @@ class FieldController:
 
 
 @dataclass
+class BottomZFieldState:
+    """底部 Z 向局部控制器状态快照。"""
+
+    E_z: float
+    bottom_z_mean_error: float
+    bottom_z_max_error: float
+    unclipped_E_z: float
+    err_avg: float
+    PID_integral: float = 0.0
+    prev_error: float = 0.0
+    delta_E: float = 0.0
+
+
+class BottomZFieldController:
+    """基于当前层底部节点 Z 向误差的一维电场控制器。
+
+    v1 使用现有均匀电场力模型，将每个底部节点的单位场强响应写成
+    ``q_ion``，即 ``B_z = q_ion * 1``。求解出的单个标量仍作为
+    求解器已有的 ``e_z`` 参数传入，不改变底层力模型。
+    """
+
+    def __init__(
+        self,
+        config: SimulationConfig,
+        regularization: float | None = None,
+    ) -> None:
+        self.config = config
+        self.regularization = float(
+            getattr(config, "field_regularization", 1e-3)
+            if regularization is None
+            else regularization
+        )
+        self.E_z = 0.0
+        self._previous_error_by_node: dict[int, float] = {}
+
+    def update(
+        self,
+        bottom_nodes: np.ndarray,
+        target_vertices: np.ndarray,
+        simulated_vertices: np.ndarray,
+    ) -> BottomZFieldState:
+        """根据底部节点 Z 误差计算下一步均匀电场强度。"""
+        bottom = np.asarray(bottom_nodes, dtype=int).reshape(-1)
+        target = np.asarray(target_vertices, dtype=float)
+        simulated = np.asarray(simulated_vertices, dtype=float)
+
+        if bottom.size == 0:
+            self._previous_error_by_node = {}
+            return self._set_state(
+                e_z=0.0,
+                mean_error=0.0,
+                max_error=0.0,
+                unclipped=0.0,
+                prev_error=0.0,
+            )
+
+        z_error = target[bottom, 2] - simulated[bottom, 2]
+        mean_error = float(np.mean(z_error))
+        max_error = float(np.max(z_error))
+        active_error = np.maximum(
+            z_error - float(self.config.err_target), 0.0
+        )
+
+        derivative = np.zeros_like(active_error)
+        dt = max(float(self.config.dt), 1e-12)
+        for local_idx, node_id in enumerate(bottom):
+            previous = self._previous_error_by_node.get(int(node_id))
+            if previous is not None:
+                derivative[local_idx] = (active_error[local_idx] - previous) / dt
+
+        desired_force = (
+            float(self.config.K_p) * active_error
+            + float(self.config.K_d) * derivative
+        )
+
+        q_ion = float(self.config.q_ion)
+        if abs(q_ion) < 1e-12 or not np.any(desired_force):
+            unclipped = 0.0
+        else:
+            mapping = q_ion * np.ones((bottom.size, 1), dtype=float)
+            unclipped = float(
+                solve_regularized_voltage(
+                    mapping, desired_force, self.regularization
+                )[0]
+            )
+
+        clipped = float(np.clip(unclipped, 0.0, float(self.config.E_max)))
+        self._previous_error_by_node = {
+            int(node_id): float(error)
+            for node_id, error in zip(bottom, active_error)
+        }
+        return self._set_state(
+            e_z=clipped,
+            mean_error=mean_error,
+            max_error=max_error,
+            unclipped=unclipped,
+            prev_error=float(np.mean(active_error)),
+        )
+
+    def _set_state(
+        self,
+        *,
+        e_z: float,
+        mean_error: float,
+        max_error: float,
+        unclipped: float,
+        prev_error: float,
+    ) -> BottomZFieldState:
+        previous_e_z = self.E_z
+        self.E_z = float(e_z)
+        return BottomZFieldState(
+            E_z=self.E_z,
+            bottom_z_mean_error=float(mean_error),
+            bottom_z_max_error=float(max_error),
+            unclipped_E_z=float(unclipped),
+            err_avg=float(mean_error),
+            prev_error=float(prev_error),
+            delta_E=float(self.E_z - previous_e_z),
+        )
+
+
+@dataclass
 class PIDFieldState:
     """标量 PID 控制器的状态快照。
 

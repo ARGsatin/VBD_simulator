@@ -698,6 +698,73 @@ class WorkerLiftControlTests(unittest.TestCase):
         header = csv_path.read_text(encoding="utf-8").splitlines()[0].split(",")
         self.assertEqual(header, SolverStepDiagnostics.csv_fields())
 
+    def test_python_worker_field_debug_compares_no_field_and_with_field(self) -> None:
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            v_lift=0.0,
+            max_iters=1,
+            N_stable=1,
+        )
+        mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
+        mesh.vertices[0, 2] = 1.0
+        mesh.ideal_vertices[0, 2] = 1.0
+
+        class FakeSolver:
+            def __init__(self, cfg) -> None:  # noqa: ANN001
+                self.config = cfg
+
+            def solve_until_stable(self, mesh_arg, layer_id, e_z, on_iteration=None):  # noqa: ANN001, ARG002
+                mesh_arg.vertices[0, 2] = 0.5 if float(e_z) <= 0.0 else 0.9
+                return VBDSolveResult(
+                    x=mesh_arg.vertices.copy(),
+                    v=np.zeros_like(mesh_arg.vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                )
+
+        worker = SimulationWorker(
+            mesh=mesh,
+            config=config,
+            n_layers=1,
+            output_dir="outputs/test_worker_field_debug",
+            use_cpp=False,
+            field_debug_enabled=True,
+        )
+        worker._trace = lambda msg: None
+        logs: list[str] = []
+        worker.log_message.connect(logs.append)
+
+        with patch(
+            "hydrogel_vbd.solver.vbd_solver.PythonReferenceVBDSolver",
+            FakeSolver,
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(len(results), 1)
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_debug_enabled"], 1.0)
+        self.assertAlmostEqual(metrics["field_no_field_rms"], 0.5)
+        self.assertAlmostEqual(metrics["field_with_field_rms"], 0.1)
+        self.assertAlmostEqual(metrics["field_no_field_bottom_z_mean"], 0.5)
+        self.assertAlmostEqual(metrics["field_with_field_bottom_z_mean"], 0.1)
+        self.assertAlmostEqual(metrics["field_derived_E_z"], 0.5)
+        self.assertEqual(metrics["field_effective_mode"], "with_field")
+        self.assertTrue(any("[field-debug]" in msg for msg in logs))
+
 
 class LayerActivatorTopFallbackTests(unittest.TestCase):
     """层顶面分类缺失时的激活回归测试。"""
@@ -850,7 +917,11 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertIsNotNone(config.kappa)
         self.assertIsNotNone(config.v_lift)
         self.assertIsNotNone(config.K_p)
-        self.assertAlmostEqual(config.k_d, 0.01)
+        self.assertAlmostEqual(config.mu, 5000.0)
+        self.assertAlmostEqual(config.kappa, 250000.0)
+        self.assertAlmostEqual(config.T_max, 3000.0)
+        self.assertAlmostEqual(config.delta_f, 0.002)
+        self.assertAlmostEqual(config.k_d, 0.05)
         self.assertAlmostEqual(config.c_shrink, 1.0)
         self.assertEqual(config.max_iters, 50)
         self.assertEqual(config.N_stable, 3)
@@ -900,6 +971,8 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertEqual(win.windowTitle(), "Hydrogel VBD Simulator")
         self.assertIsNotNone(win._chk_solver_diag)
         self.assertFalse(win._chk_solver_diag.isChecked())
+        self.assertIsNotNone(win._chk_field_debug)
+        self.assertFalse(win._chk_field_debug.isChecked())
         self.assertGreaterEqual(win._left_layout.stretch(
             win._left_layout.indexOf(win._param_scroll_area)
         ), 1)
@@ -1145,6 +1218,79 @@ class GuiParamConfigTests(unittest.TestCase):
             win._on_run()
 
         self.assertTrue(created["solver_diagnostics_enabled"])
+        app.quit()
+
+    def test_field_debug_checkbox_is_passed_to_worker(self) -> None:
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.main_window import MainWindow
+        from PySide6 import QtCore
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        mesh = MeshState(
+            vertices=np.zeros((1, 3), dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(1, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+        )
+        win = MainWindow()
+        win._generated_mesh = mesh
+        win._actual_layers = 1
+        win._chk_field_debug.setChecked(True)
+
+        created = {}
+
+        class FakeThread:
+            def __init__(self, parent=None) -> None:  # noqa: ANN001
+                self.started = _FakeSignal()
+                self.finished = _FakeSignal()
+
+            def start(self) -> None:
+                pass
+
+            def quit(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+            def requestInterruption(self) -> None:
+                pass
+
+        class FakeWorker:
+            def __init__(self, **kwargs) -> None:  # noqa: ANN003
+                created.update(kwargs)
+                self.frame_ready = _FakeSignal()
+                self.progress_update = _FakeSignal()
+                self.log_message = _FakeSignal()
+                self.finished = _FakeSignal()
+                self.cancelled = _FakeSignal()
+                self.error = _FakeSignal()
+                self.sub_progress = _FakeSignal()
+                self.layer_finished = _FakeSignal()
+
+            def moveToThread(self, thread) -> None:  # noqa: ANN001
+                pass
+
+            def run(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:
+                pass
+
+        with patch(
+            "hydrogel_vbd.gui.main_window.SimulationWorker",
+            FakeWorker,
+        ), patch.object(QtCore, "QThread", FakeThread), patch(
+            "hydrogel_vbd.gui.main_window.is_cpp_available",
+            return_value=False,
+        ):
+            win._on_run()
+
+        self.assertTrue(created["field_debug_enabled"])
         app.quit()
 
     def test_disable_chebyshev_checkbox_sets_runtime_rho_cheb_zero(self) -> None:

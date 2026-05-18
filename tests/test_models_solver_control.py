@@ -101,6 +101,89 @@ class ModelsSolverControlTests(unittest.TestCase):
         voltage = solve_regularized_voltage(mapping, np.array([1.0, -2.0]), regularization=0.0)
         np.testing.assert_allclose(voltage, np.array([1.0, -2.0]))
 
+    def test_bottom_z_controller_maps_bottom_sag_to_positive_field(self):
+        from hydrogel_vbd.control.field_controller import BottomZFieldController
+        from hydrogel_vbd.core.config import SimulationConfig
+
+        config = SimulationConfig(
+            err_target=0.05,
+            K_p=10.0,
+            K_i=0.0,
+            K_d=0.0,
+            q_ion=2.0,
+            E_max=10.0,
+        )
+        controller = BottomZFieldController(config, regularization=0.0)
+        target = np.array(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]
+        )
+        simulated = np.array(
+            [[0.0, 0.0, 0.8], [0.0, 0.0, 0.9], [0.0, 0.0, 1.0]]
+        )
+
+        state = controller.update(
+            bottom_nodes=np.array([0, 1], dtype=int),
+            target_vertices=target,
+            simulated_vertices=simulated,
+        )
+
+        self.assertAlmostEqual(state.E_z, 0.5)
+        self.assertAlmostEqual(state.bottom_z_mean_error, 0.15)
+        self.assertAlmostEqual(state.bottom_z_max_error, 0.2)
+
+    def test_bottom_z_controller_ignores_empty_or_overlifted_bottom(self):
+        from hydrogel_vbd.control.field_controller import BottomZFieldController
+        from hydrogel_vbd.core.config import SimulationConfig
+
+        config = SimulationConfig(err_target=0.01, K_p=10.0, K_d=0.0, E_max=5.0)
+        controller = BottomZFieldController(config, regularization=0.0)
+        target = np.array([[0.0, 0.0, 1.0]])
+
+        empty = controller.update(
+            bottom_nodes=np.array([], dtype=int),
+            target_vertices=target,
+            simulated_vertices=target.copy(),
+        )
+        self.assertEqual(empty.E_z, 0.0)
+
+        overlifted = controller.update(
+            bottom_nodes=np.array([0], dtype=int),
+            target_vertices=target,
+            simulated_vertices=np.array([[0.0, 0.0, 1.2]]),
+        )
+        self.assertEqual(overlifted.E_z, 0.0)
+
+    def test_bottom_z_controller_derivative_uses_dt_and_voltage_clip(self):
+        from hydrogel_vbd.control.field_controller import BottomZFieldController
+        from hydrogel_vbd.core.config import SimulationConfig
+
+        config = SimulationConfig(
+            err_target=0.0,
+            K_p=0.0,
+            K_i=0.0,
+            K_d=2.0,
+            dt=0.5,
+            q_ion=1.0,
+            E_max=0.25,
+        )
+        controller = BottomZFieldController(config, regularization=0.0)
+        target = np.array([[0.0, 0.0, 1.0]])
+
+        first = controller.update(
+            bottom_nodes=np.array([0], dtype=int),
+            target_vertices=target,
+            simulated_vertices=np.array([[0.0, 0.0, 0.9]]),
+        )
+        self.assertEqual(first.E_z, 0.0)
+
+        second = controller.update(
+            bottom_nodes=np.array([0], dtype=int),
+            target_vertices=target,
+            simulated_vertices=np.array([[0.0, 0.0, 0.8]]),
+        )
+        self.assertAlmostEqual(second.unclipped_E_z, 0.4)
+        self.assertAlmostEqual(second.E_z, 0.25)
+
 
 if __name__ == "__main__":
     unittest.main()

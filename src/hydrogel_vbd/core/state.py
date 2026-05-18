@@ -682,7 +682,7 @@ class LayerResult:
         仿真结束后的顶点坐标。
     v_sim : np.ndarray, shape (N, 3)
         仿真结束后的顶点速度。
-    error_metrics : dict[str, float]
+    error_metrics : dict[str, float | str]
         各类形状误差度量（如 RMS、最大偏差等）。
     field_command_next : FieldCommand
         为下一层计算的电场指令。
@@ -696,7 +696,7 @@ class LayerResult:
     layer_id: int
     x_sim: np.ndarray                    # (N, 3) 终点坐标
     v_sim: np.ndarray                    # (N, 3) 终点速度
-    error_metrics: dict[str, float]      # 误差度量字典
+    error_metrics: dict[str, float | str]  # 误差度量字典
     field_command_next: FieldCommand     # 下一层电场指令
     max_deformation: float               # 最大变形 (m)
     rms_error: float                     # RMS 误差

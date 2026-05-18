@@ -144,6 +144,9 @@ class SimulationConfig:
     # ────────── 电场 ──────────
     q_ion: float = 1.2e-3        # 离子电荷密度 (C/m³)
     E_max: float = 500.0         # 最大电场强度 (V/m)
+    field_control_mode: str = "scalar_pid"  # 电场控制模式
+    field_regularization: float = 1.0e-3    # 电压反演 Tikhonov 正则
+    rms_guard_tolerance: float = 0.01       # guarded 模式 RMS 容忍比例
 
     # ────────── 打印工艺 ──────────
     layer_thickness: float = 5e-5    # 层厚 / 平台提升距离 (m) = 0.05mm

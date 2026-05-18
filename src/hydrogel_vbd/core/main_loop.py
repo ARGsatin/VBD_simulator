@@ -28,14 +28,20 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 from hydrogel_vbd.core.config import SimulationConfig
-from hydrogel_vbd.control.field_controller import PIDFieldController, PIDFieldState
+from hydrogel_vbd.control.field_controller import (
+    BottomZFieldController,
+    BottomZFieldState,
+    PIDFieldController,
+    PIDFieldState,
+)
 from hydrogel_vbd.physics.czm import update_czm_states
 from hydrogel_vbd.physics.local_terms import build_local_physics_terms
 from hydrogel_vbd.geometry.conformal_pipeline import ConformalMeshPipeline
@@ -49,6 +55,32 @@ from hydrogel_vbd.solver.vbd_solver import (
     _normal_pull_from_terms,
 )
 from hydrogel_vbd.core.state import FieldCommand, LayerResult, MeshState
+
+
+FIELD_CONTROL_SCALAR_PID = "scalar_pid"
+FIELD_CONTROL_BOTTOM_Z = "bottom_z"
+FIELD_CONTROL_BOTTOM_Z_GUARDED = "bottom_z_guarded"
+FIELD_CONTROL_MODES = {
+    FIELD_CONTROL_SCALAR_PID,
+    FIELD_CONTROL_BOTTOM_Z,
+    FIELD_CONTROL_BOTTOM_Z_GUARDED,
+}
+DEFAULT_RMS_GUARD_TOLERANCE = 0.01
+
+
+@dataclass
+class _LayerRunData:
+    """一次单层求解后的可复用结果快照。"""
+
+    x_sim: np.ndarray
+    v_sim: np.ndarray
+    bottom: np.ndarray
+    err_avg: float
+    bottom_z_mean_error: float
+    bottom_z_max_error: float
+    max_error: float
+    rms_error: float
+    base_metrics: dict[str, float]
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +107,7 @@ def create_demo_mesh(layers: int) -> MeshState:
     return mesh
 
 
-def _command_json(layer_id: int, command: PIDFieldState) -> dict:
+def _command_json(layer_id: int, command: PIDFieldState | BottomZFieldState) -> dict:
     """将 PID 控制器状态序列化为 JSON 友好的字典。
 
     用于生成 `simulation_field_commands.json` 回放文件，
@@ -85,15 +117,15 @@ def _command_json(layer_id: int, command: PIDFieldState) -> dict:
     ----------
     layer_id : int
         当前层编号（从 0 开始）。
-    command : PIDFieldState
-        PID 控制器的当前状态快照。
+    command : PIDFieldState or BottomZFieldState
+        控制器的当前状态快照。
 
     Returns
     -------
     dict
         含层号、电场强度、误差、PID 积分项等信息的字典。
     """
-    return {
+    payload = {
         "layer_id": layer_id,
         "E_z": float(command.E_z),
         "err_avg": float(command.err_avg),
@@ -101,11 +133,187 @@ def _command_json(layer_id: int, command: PIDFieldState) -> dict:
         "prev_error": float(command.prev_error),
         "delta_E": float(command.delta_E),
     }
+    if hasattr(command, "bottom_z_mean_error"):
+        payload.update(
+            {
+                "bottom_z_mean_error": float(command.bottom_z_mean_error),
+                "bottom_z_max_error": float(command.bottom_z_max_error),
+                "bottom_z_E_z": float(command.E_z),
+            }
+        )
+    return payload
 
 
 def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
     """Return the layer-local FEP contact plane in world coordinates."""
     return float(config.z_fep)
+
+
+def _validate_field_control_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in FIELD_CONTROL_MODES:
+        allowed = ", ".join(sorted(FIELD_CONTROL_MODES))
+        raise ValueError(f"field_control_mode must be one of: {allowed}")
+    return normalized
+
+
+def _select_rms_guarded_result(
+    baseline: LayerResult,
+    candidate: LayerResult,
+    *,
+    tolerance: float = DEFAULT_RMS_GUARD_TOLERANCE,
+) -> tuple[LayerResult, bool]:
+    """Select candidate only when its global RMS is within the tolerance band."""
+    limit = float(baseline.rms_error) * (1.0 + float(tolerance)) + 1e-12
+    passed = float(candidate.rms_error) <= limit
+    return (candidate if passed else baseline), passed
+
+
+def _simulate_layer_once(
+    mesh: MeshState,
+    config: SimulationConfig,
+    layer_id: int,
+    target_vertices: np.ndarray,
+    e_z: float,
+) -> _LayerRunData:
+    """Run one layer on ``mesh`` in place using a scalar ``e_z`` command."""
+    layer_z_fep = _layer_contact_z(config, layer_id)
+    layer_config = replace(config, z_fep=layer_z_fep)
+    solver = PythonReferenceVBDSolver(layer_config)
+    activator = LayerActivator()
+    activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
+
+    bottom = mesh.bottom_nodes(layer_id)
+    x_before_solve = mesh.vertices.copy()
+    did_lift = config.v_lift > 0 and np.any(mesh.is_top_fixed)
+    if did_lift:
+        lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
+        solve_result = solver.solve_with_lift(
+            mesh,
+            layer_id=layer_id,
+            e_z=e_z,
+            lifting_top=lifting_top,
+        )
+    else:
+        solve_result = solver.solve_until_stable(
+            mesh, layer_id=layer_id, e_z=e_z
+        )
+        if len(bottom):
+            terms_after = build_local_physics_terms(
+                mesh, layer_config, e_z=e_z, x_prev=x_before_solve
+            )
+            update_czm_states(
+                mesh,
+                bottom,
+                internal_pull_z=_normal_pull_from_terms(
+                    terms_after.force, bottom
+                ),
+                area=layer_config.node_area,
+                t_max=layer_config.T_max,
+                k_czm=layer_config.K_czm,
+                delta_f=layer_config.delta_f,
+                z_fep=layer_config.z_fep,
+                dt=layer_config.dt,
+            )
+
+    x_sim, v_sim = solve_result.x, solve_result.v
+    if len(bottom):
+        bottom_z_error = target_vertices[bottom, 2] - x_sim[bottom, 2]
+        err_avg = float(np.mean(bottom_z_error))
+        bottom_z_max_error = float(np.max(bottom_z_error))
+    else:
+        err_avg = 0.0
+        bottom_z_max_error = 0.0
+
+    max_error = float(np.max(np.linalg.norm(target_vertices - x_sim, axis=1)))
+    rms_error = float(
+        np.sqrt(np.mean(np.sum((target_vertices - x_sim) ** 2, axis=1)))
+    )
+    return _LayerRunData(
+        x_sim=x_sim.copy(),
+        v_sim=v_sim.copy(),
+        bottom=bottom.copy(),
+        err_avg=err_avg,
+        bottom_z_mean_error=err_avg,
+        bottom_z_max_error=bottom_z_max_error,
+        max_error=max_error,
+        rms_error=rms_error,
+        base_metrics={
+            "err_avg": err_avg,
+            "kinetic_energy": solve_result.kinetic_energy,
+            "stable_steps": float(solve_result.stable_steps),
+            "max_dx": solve_result.max_dx,
+            "all_free": float(solve_result.all_free),
+            "max_error": max_error,
+        },
+    )
+
+
+def _build_layer_result(
+    layer_id: int,
+    data: _LayerRunData,
+    command: PIDFieldState | BottomZFieldState,
+    *,
+    requested_mode: str,
+    effective_mode: str,
+    rms_guard_passed: bool | None = None,
+    rms_guard_baseline: float | None = None,
+    rms_guard_candidate: float | None = None,
+    bottom_state: BottomZFieldState | None = None,
+) -> LayerResult:
+    """Convert a layer run snapshot and chosen command into a public result."""
+    metrics: dict[str, float | str] = dict(data.base_metrics)
+    metrics.update(
+        {
+            "E_z": float(command.E_z),
+            "PID_integral": float(command.PID_integral),
+            "field_control_requested": requested_mode,
+            "field_control_effective": effective_mode,
+            "rms_guard_passed": (
+                float(rms_guard_passed)
+                if rms_guard_passed is not None
+                else float("nan")
+            ),
+            "rms_guard_baseline": (
+                float(rms_guard_baseline)
+                if rms_guard_baseline is not None
+                else float("nan")
+            ),
+            "rms_guard_candidate": (
+                float(rms_guard_candidate)
+                if rms_guard_candidate is not None
+                else float("nan")
+            ),
+            "bottom_z_mean_error": (
+                float(bottom_state.bottom_z_mean_error)
+                if bottom_state is not None
+                else data.bottom_z_mean_error
+            ),
+            "bottom_z_max_error": (
+                float(bottom_state.bottom_z_max_error)
+                if bottom_state is not None
+                else data.bottom_z_max_error
+            ),
+            "bottom_z_E_z": (
+                float(bottom_state.E_z)
+                if bottom_state is not None
+                else 0.0
+            ),
+        }
+    )
+    return LayerResult(
+        layer_id=layer_id,
+        x_sim=data.x_sim,
+        v_sim=data.v_sim,
+        error_metrics=metrics,
+        field_command_next=FieldCommand(
+            voltage=np.array([command.E_z], dtype=float),
+            electrode_ids=["E_z"],
+        ),
+        max_deformation=data.max_error,
+        rms_error=data.rms_error,
+        success=bool(data.max_error < 2.0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +323,7 @@ def _layer_contact_z(config: SimulationConfig, layer_id: int) -> float:
 def run_demo(
     layers: int = 3,
     output: str | Path = "outputs/demo",
+    field_control_mode: str | None = None,
 ) -> list[LayerResult]:
     """运行完整的水凝胶 DLP VBD 仿真演示。
 
@@ -137,6 +346,9 @@ def run_demo(
         仿真层数，默认 3 层。
     output : str | Path
         输出根目录路径，所有结果文件将保存在其子目录中。
+    field_control_mode : str or None
+        电场控制模式：``scalar_pid``、``bottom_z`` 或
+        ``bottom_z_guarded``。None 时使用配置默认值。
 
     Returns
     -------
@@ -154,6 +366,14 @@ def run_demo(
 
     # ── 2. 初始化各组件 ──
     config = SimulationConfig(layer_thickness=5e-5)
+    requested_mode = _validate_field_control_mode(
+        field_control_mode
+        if field_control_mode is not None
+        else getattr(config, "field_control_mode", FIELD_CONTROL_SCALAR_PID)
+    )
+    rms_guard_tolerance = float(
+        getattr(config, "rms_guard_tolerance", DEFAULT_RMS_GUARD_TOLERANCE)
+    )
     # 2a. 生成多层共形四面体网格
     mesh, _ = ConformalMeshPipeline.create_demo(
         layers=layers,
@@ -162,114 +382,130 @@ def run_demo(
     )
     # 保存目标（理想）形状作为误差参照
     target_vertices = mesh.ideal_vertices.copy()
-    # 2b. Chebyshev 半隐式 VBD 求解器
-    # 2c. 逐层激活器（保形继承 + 防穿透）
-    activator = LayerActivator()
-    # 2d. PID 电场控制器
-    controller = PIDFieldController(config)
+    # 2b. 电场控制器
+    scalar_controller = PIDFieldController(config)
+    bottom_controller = BottomZFieldController(config)
 
     # ── 3. 逐层仿真循环 ──
     results: list[LayerResult] = []
-    commands_by_layer: dict[int, PIDFieldState] = {}
+    commands_by_layer: dict[int, PIDFieldState | BottomZFieldState] = {}
 
     for layer_id in range(layers):
-        # ── 3a. 激活当前层 ──
-        # 激活新层节点：标记为 active，初始化速度，
-        # 并对离型膜（FEP）平面附近的节点进行防穿透处理
-        layer_z_fep = _layer_contact_z(config, layer_id)
-        layer_config = replace(config, z_fep=layer_z_fep)
-        solver = PythonReferenceVBDSolver(layer_config)
-        activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
+        if requested_mode == FIELD_CONTROL_SCALAR_PID:
+            data = _simulate_layer_once(
+                mesh, config, layer_id, target_vertices, scalar_controller.E_z
+            )
+            pid_state = scalar_controller.update(err_avg=data.err_avg)
+            bottom_state = bottom_controller.update(
+                bottom_nodes=data.bottom,
+                target_vertices=target_vertices,
+                simulated_vertices=data.x_sim,
+            )
+            command = pid_state
+            result = _build_layer_result(
+                layer_id,
+                data,
+                command,
+                requested_mode=requested_mode,
+                effective_mode=FIELD_CONTROL_SCALAR_PID,
+                bottom_state=bottom_state,
+            )
 
-        # 获取当前层的底部表面节点（用于 CZM 和误差评估）
-        bottom = mesh.bottom_nodes(layer_id)
+        elif requested_mode == FIELD_CONTROL_BOTTOM_Z:
+            data = _simulate_layer_once(
+                mesh, config, layer_id, target_vertices, bottom_controller.E_z
+            )
+            scalar_controller.update(err_avg=data.err_avg)
+            bottom_state = bottom_controller.update(
+                bottom_nodes=data.bottom,
+                target_vertices=target_vertices,
+                simulated_vertices=data.x_sim,
+            )
+            command = bottom_state
+            result = _build_layer_result(
+                layer_id,
+                data,
+                command,
+                requested_mode=requested_mode,
+                effective_mode=FIELD_CONTROL_BOTTOM_Z,
+                bottom_state=bottom_state,
+            )
 
-        # ── 3c. 执行 VBD 求解 ──
-        # 根据是否启用平台提升选择不同的求解模式
-        x_before_solve = mesh.vertices.copy()
-        did_lift = config.v_lift > 0 and np.any(mesh.is_top_fixed)
-        if did_lift:
-            # 含平台提升的求解（顶部固定节点随平台上升）
-            lifting_top = np.flatnonzero(mesh.is_top_fixed & mesh.active_vertex_mask)
-            solve_result = solver.solve_with_lift(
-                mesh,
+        else:
+            pre_layer_mesh = copy.deepcopy(mesh)
+            baseline_mesh = copy.deepcopy(pre_layer_mesh)
+            candidate_mesh = copy.deepcopy(pre_layer_mesh)
+            baseline_data = _simulate_layer_once(
+                baseline_mesh,
+                config,
+                layer_id,
+                target_vertices,
+                scalar_controller.E_z,
+            )
+            candidate_data = _simulate_layer_once(
+                candidate_mesh,
+                config,
+                layer_id,
+                target_vertices,
+                bottom_controller.E_z,
+            )
+            baseline_guard = LayerResult(
                 layer_id=layer_id,
-                e_z=controller.E_z,
-                lifting_top=lifting_top,
+                x_sim=baseline_data.x_sim,
+                v_sim=baseline_data.v_sim,
+                error_metrics={},
+                field_command_next=FieldCommand(np.array([scalar_controller.E_z])),
+                max_deformation=baseline_data.max_error,
+                rms_error=baseline_data.rms_error,
+                success=True,
             )
-        else:
-            # 标准求解（无提升，仅电场作用）
-            solve_result = solver.solve_until_stable(
-                mesh, layer_id=layer_id, e_z=controller.E_z
+            candidate_guard = LayerResult(
+                layer_id=layer_id,
+                x_sim=candidate_data.x_sim,
+                v_sim=candidate_data.v_sim,
+                error_metrics={},
+                field_command_next=FieldCommand(np.array([bottom_controller.E_z])),
+                max_deformation=candidate_data.max_error,
+                rms_error=candidate_data.rms_error,
+                success=True,
             )
-            if len(bottom):
-                terms_after = build_local_physics_terms(
-                    mesh, layer_config, e_z=controller.E_z, x_prev=x_before_solve
-                )
-                update_czm_states(
-                    mesh,
-                    bottom,
-                    internal_pull_z=_normal_pull_from_terms(
-                        terms_after.force, bottom
-                    ),
-                    area=layer_config.node_area,
-                    t_max=layer_config.T_max,
-                    k_czm=layer_config.K_czm,
-                    delta_f=layer_config.delta_f,
-                    z_fep=layer_config.z_fep,
-                    dt=layer_config.dt,
-                )
+            selected_guard, guard_passed = _select_rms_guarded_result(
+                baseline_guard,
+                candidate_guard,
+                tolerance=rms_guard_tolerance,
+            )
+            if selected_guard is candidate_guard:
+                mesh = candidate_mesh
+                data = candidate_data
+                effective_mode = FIELD_CONTROL_BOTTOM_Z
+            else:
+                mesh = baseline_mesh
+                data = baseline_data
+                effective_mode = FIELD_CONTROL_SCALAR_PID
 
-        # ── 3d. 计算形状误差 ──
-        # 提取求解后的顶点和速度
-        x_sim, v_sim = solve_result.x, solve_result.v
+            pid_state = scalar_controller.update(err_avg=data.err_avg)
+            bottom_state = bottom_controller.update(
+                bottom_nodes=data.bottom,
+                target_vertices=target_vertices,
+                simulated_vertices=data.x_sim,
+            )
+            command = bottom_state if guard_passed else pid_state
+            result = _build_layer_result(
+                layer_id,
+                data,
+                command,
+                requested_mode=requested_mode,
+                effective_mode=effective_mode,
+                rms_guard_passed=guard_passed,
+                rms_guard_baseline=baseline_data.rms_error,
+                rms_guard_candidate=candidate_data.rms_error,
+                bottom_state=bottom_state,
+            )
 
-        # 底部节点平均垂度（sag）：理想 Z - 实际 Z
-        # 正值表示下垂（需要增大电场），负值表示过度提升
-        if len(bottom):
-            err_avg = float(np.mean(target_vertices[bottom, 2] - x_sim[bottom, 2]))
-        else:
-            err_avg = 0.0
-
-        # ── 3e. PID 控制更新 ──
-        # 根据当前误差计算下一层的电场强度 E_z
-        pid_state = controller.update(err_avg=err_avg)
-
-        # 计算额外的误差指标
-        max_error = float(np.max(np.linalg.norm(target_vertices - x_sim, axis=1)))
-        rms_error = float(
-            np.sqrt(np.mean(np.sum((target_vertices - x_sim) ** 2, axis=1)))
-        )
-
-        # ── 3f. 组装结果 ──
-        metrics = {
-            "err_avg": err_avg,
-            "E_z": pid_state.E_z,
-            "PID_integral": pid_state.PID_integral,
-            "kinetic_energy": solve_result.kinetic_energy,
-            "stable_steps": float(solve_result.stable_steps),
-            "max_dx": solve_result.max_dx,
-            "all_free": float(solve_result.all_free),
-            "max_error": max_error,
-        }
-
-        result = LayerResult(
-            layer_id=layer_id,
-            x_sim=x_sim.copy(),
-            v_sim=v_sim.copy(),
-            error_metrics=metrics,
-            field_command_next=FieldCommand(
-                voltage=np.array([pid_state.E_z]),
-                electrode_ids=["E_z"],
-            ),
-            max_deformation=max_error,
-            rms_error=rms_error,
-            success=bool(max_error < 2.0),  # 最大变形 < 2m 视为成功
-        )
         results.append(result)
 
         # ── 3g. 保存当前层状态 ──
-        commands_by_layer[layer_id] = pid_state
+        commands_by_layer[layer_id] = command
         save_layer_state(states_dir / f"layer_{layer_id:04d}.npz", result)
         write_vtu(
             vtk_dir / f"layer_{layer_id:04d}.vtu",
@@ -319,8 +555,18 @@ def main() -> None:
         default=Path("outputs/demo"),
         help="输出目录路径",
     )
+    parser.add_argument(
+        "--field-control-mode",
+        choices=sorted(FIELD_CONTROL_MODES),
+        default=None,
+        help="电场控制模式",
+    )
     args = parser.parse_args()
-    run_demo(layers=args.layers, output=args.output)
+    run_demo(
+        layers=args.layers,
+        output=args.output,
+        field_control_mode=args.field_control_mode,
+    )
 
 
 if __name__ == "__main__":

@@ -126,12 +126,12 @@ def _should_retry_standard_meshing(
 # 参数元数据列表：定义每个参数在 GUI 中的显示标签、默认值、取值范围
 _PARAM_META: list[dict[str, Any]] = [
     {"key": "mu", "label": "剪切模量 μ (Pa)", "default": 5000.0, "min": 500.0, "max": 1e6},
-    {"key": "kappa", "label": "体积模量 κ (Pa)", "default": 25000.0, "min": 2000.0, "max": 1e7},
-    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.01, "min": 0.0, "max": 1.0},
+    {"key": "kappa", "label": "体积模量 κ (Pa)", "default": 250000.0, "min": 2000.0, "max": 1e7},
+    {"key": "k_d", "label": "阻尼系数 k_d", "default": 0.05, "min": 0.0, "max": 1.0},
     {"key": "c_shrink", "label": "收缩因子 c_shrink", "default": 1.0, "min": 0.8, "max": 1.0},
     {"key": "T_max", "label": "最大附着力 T_max (Pa)", "default": 3000.0, "min": 100.0, "max": 50000.0},
     {"key": "K_czm", "label": "CZM 刚度 (Pa/m)", "default": 1.0e7, "min": 1e6, "max": 1e10},
-    {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 5.0e-4, "min": 1e-6, "max": 1e-2},
+    {"key": "delta_f", "label": "CZM 失效位移 δ_f (m)", "default": 2.0e-3, "min": 1e-6, "max": 1e-2},
     {"key": "node_area", "label": "CZM node area (m^2)", "default": 1.0e-6, "min": 1e-10, "max": 1e-3},
     {"key": "eta", "label": "流体/损伤系数 η", "default": 0.8, "min": 0.0, "max": 10.0, "step": 0.1},
     {"key": "C_0", "label": "流体负压倍率 C_0", "default": 1.0, "min": 0.0, "max": 1000.0, "step": 1.0},
@@ -354,6 +354,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._combo_mesh_algo: QtWidgets.QComboBox | None = None
         self._chk_use_cpp: QtWidgets.QCheckBox | None = None
         self._chk_solver_diag: QtWidgets.QCheckBox | None = None
+        self._chk_field_debug: QtWidgets.QCheckBox | None = None
         self._combo_print_z_axis: QtWidgets.QComboBox | None = None
         self._chk_disable_czm: QtWidgets.QCheckBox | None = None
         self._chk_disable_chebyshev: QtWidgets.QCheckBox | None = None
@@ -597,6 +598,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "勾选后本次仿真写入 outputs/gui/reports/solver_diagnostics.csv"
         )
         info_3.addWidget(self._chk_solver_diag)
+        info_3.addSpacing(12)
+        self._chk_field_debug = QtWidgets.QCheckBox("电场调试对比")
+        self._chk_field_debug.setChecked(False)
+        self._chk_field_debug.setToolTip(
+            "勾选后每层克隆同一初态，分别计算 E=0 与 Bottom-Z 推导电场后的指标；"
+            "会额外增加求解耗时"
+        )
+        info_3.addWidget(self._chk_field_debug)
         info_3.addSpacing(12)
         self._chk_disable_czm = QtWidgets.QCheckBox("禁用 CZM")
         self._chk_disable_czm.setChecked(False)
@@ -1610,6 +1619,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chk_solver_diag is not None
             and self._chk_solver_diag.isChecked()
         )
+        field_debug_enabled = (
+            self._chk_field_debug is not None
+            and self._chk_field_debug.isChecked()
+        )
 
         # ── 恢复网格数据，确保 Worker 构造函数获取到完整 MeshState ──
         self._generated_mesh = saved_generated_mesh
@@ -1619,7 +1632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _user_wants_cpp = (
             self._chk_use_cpp is not None and self._chk_use_cpp.isChecked()
         )
-        _cpp_ready = _user_wants_cpp and is_cpp_available()
+        _cpp_ready = _user_wants_cpp and is_cpp_available() and not field_debug_enabled
         if _user_wants_cpp and not is_cpp_available():
             builder = CppBuilder()
             if builder.pyd_exists():
@@ -1637,6 +1650,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._log.append_log("  [build] 前置条件就绪，正在后台编译 ...")
                 self._start_cpp_build(builder, config)
                 return
+        if field_debug_enabled and _user_wants_cpp:
+            self._log.append_log(
+                "  [field-debug] 电场调试对比需要 Python 克隆分支，已暂时关闭 C++"
+            )
         if _cpp_ready:
             self._log.append_log("  [info] 使用 C++ 加速求解器")
         elif _user_wants_cpp and not is_cpp_available():
@@ -1657,6 +1674,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log.append_log(
                 f"  [diag] 输出求解器诊断 CSV: {diag_csv_path}"
             )
+        if field_debug_enabled:
+            self._log.append_log(
+                "  [field-debug] 已开启每层 no-field / with-field 指标对比"
+            )
 
         try:
             # ── 创建异步 Worker 并移入 QThread ──
@@ -1667,6 +1688,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 output_dir=output_dir,
                 use_cpp=_cpp_ready,
                 solver_diagnostics_enabled=solver_diag_enabled,
+                field_debug_enabled=field_debug_enabled,
             )
             self._thread = QtCore.QThread(self)
 

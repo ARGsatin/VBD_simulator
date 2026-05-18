@@ -47,6 +47,16 @@ def save_layer_state(path: str | Path, result: LayerResult) -> Path:
     """
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    metric_keys = list(result.error_metrics.keys())
+    metric_values: list[str] = []
+    metric_value_types: list[str] = []
+    for value in result.error_metrics.values():
+        if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+            metric_values.append(repr(float(value)))
+            metric_value_types.append("float")
+        else:
+            metric_values.append(str(value))
+            metric_value_types.append("str")
     np.savez(
         output,
         layer_id=np.array(result.layer_id, dtype=int),
@@ -56,10 +66,9 @@ def save_layer_state(path: str | Path, result: LayerResult) -> Path:
         max_deformation=np.array(result.max_deformation, dtype=float),
         rms_error=np.array(result.rms_error, dtype=float),
         success=np.array(result.success, dtype=bool),
-        metric_keys=np.array(list(result.error_metrics.keys())),
-        metric_values=np.array(
-            list(result.error_metrics.values()), dtype=float
-        ),
+        metric_keys=np.array(metric_keys),
+        metric_values=np.array(metric_values),
+        metric_value_types=np.array(metric_value_types),
     )
     return output
 
@@ -87,11 +96,19 @@ def load_layer_state(path: str | Path) -> dict:
         - ``"max_deformation"`` (float)：最大变形量
         - ``"rms_error"`` (float)：RMS 误差
         - ``"success"`` (bool)：求解是否收敛
-        - ``"error_metrics"`` (dict[str, float])：完整误差指标
+        - ``"error_metrics"`` (dict[str, float | str])：完整误差指标
     """
     with np.load(Path(path), allow_pickle=False) as data:
         metric_keys = [str(item) for item in data["metric_keys"]]
-        metric_values = [float(item) for item in data["metric_values"]]
+        raw_values = [str(item) for item in data["metric_values"]]
+        if "metric_value_types" in data:
+            value_types = [str(item) for item in data["metric_value_types"]]
+        else:
+            value_types = ["float"] * len(raw_values)
+        metric_values = [
+            float(value) if value_type == "float" else value
+            for value, value_type in zip(raw_values, value_types)
+        ]
         return {
             "layer_id": int(data["layer_id"]),
             "x_sim": data["x_sim"].copy(),
