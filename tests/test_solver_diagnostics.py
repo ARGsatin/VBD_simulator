@@ -10,35 +10,33 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 class SolverDiagnosticsTests(unittest.TestCase):
-    def test_logged_lift_plan_explains_9991_steps(self) -> None:
+    def test_logged_lift_plan_uses_absolute_5mm_height(self) -> None:
         from hydrogel_vbd.solver.diagnostics import compute_lift_plan
 
         plan = compute_lift_plan(
-            layer_thickness=0.0019981,
+            lift_height=5.0e-3,
             v_lift=0.001,
             dt=0.001,
-            lift_multiplier=5.0,
             avg_call_ms=24.536,
         )
 
-        self.assertAlmostEqual(plan.lift_max, 0.0099905)
+        self.assertAlmostEqual(plan.lift_max, 0.005)
         self.assertAlmostEqual(plan.lift_step, 1.0e-6)
-        self.assertEqual(plan.expected_steps, 9991)
-        self.assertGreater(plan.estimated_wall_s, 240.0)
+        self.assertEqual(plan.expected_steps, 5000)
+        self.assertGreater(plan.estimated_wall_s, 120.0)
 
-    def test_gui_default_lift_plan_uses_configurable_multiplier(self) -> None:
+    def test_gui_default_lift_plan_uses_absolute_height(self) -> None:
         from hydrogel_vbd.solver.diagnostics import compute_lift_plan
 
         plan = compute_lift_plan(
-            layer_thickness=1.0e-4,
+            lift_height=5.0e-3,
             v_lift=0.001,
             dt=0.001,
-            lift_multiplier=1.5,
         )
 
-        self.assertAlmostEqual(plan.lift_max, 1.5e-4)
+        self.assertAlmostEqual(plan.lift_max, 5.0e-3)
         self.assertAlmostEqual(plan.lift_step, 1.0e-6)
-        self.assertEqual(plan.expected_steps, 150)
+        self.assertEqual(plan.expected_steps, 5000)
 
     def test_default_performance_benchmark_matrix_covers_main_slow_modes(self) -> None:
         from hydrogel_vbd.solver.diagnostics import (
@@ -47,15 +45,15 @@ class SolverDiagnosticsTests(unittest.TestCase):
 
         scenarios = default_performance_benchmark_matrix()
 
-        self.assertEqual(len(scenarios), 8)
+        self.assertEqual(len(scenarios), 4)
         self.assertTrue(all(s.model_path.name == "demo7.STEP" for s in scenarios))
         self.assertTrue(all(s.layers == 32 for s in scenarios))
         self.assertIn(
-            (True, 5.0, True),
+            (True, 5.0e-3, True),
             {
                 (
                     s.enable_czm,
-                    s.lift_multiplier,
+                    s.lift_height,
                     s.field_debug_enabled,
                 )
                 for s in scenarios

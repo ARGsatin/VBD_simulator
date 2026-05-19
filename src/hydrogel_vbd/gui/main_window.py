@@ -144,7 +144,7 @@ _PARAM_META: list[dict[str, Any]] = [
     {"key": "max_iters", "label": "最大迭代次数", "default": 50, "min": 5, "max": 200},
     {"key": "N_stable", "label": "稳定步数判决", "default": 3, "min": 2, "max": 50},
     {"key": "layer_thickness", "label": "层厚 (mm)", "default": 0.7993, "min": 0.01, "max": 10.0},
-    {"key": "lift_multiplier", "label": "提升距离倍数", "default": 1.5, "min": 0.1, "max": 5.0},
+    {"key": "lift_height", "label": "提升高度 (mm)", "default": 5.0, "min": 0.0, "max": 50.0, "step": 0.5},
     {"key": "v_lift", "label": "提升速度 (m/s)", "default": 0.01, "min": 0.0, "max": 0.01},
     {"key": "K_p", "label": "PID K_p", "default": 150.0, "min": 0.0, "max": 1000.0},
     {"key": "K_i", "label": "PID K_i", "default": 20.0, "min": 0.0, "max": 200.0},
@@ -213,6 +213,8 @@ class ParameterPanel(QtWidgets.QGroupBox):
         values = dict(params)
         if "layer_thickness" in values:
             values["layer_thickness"] = float(values["layer_thickness"]) * 1e-3
+        if "lift_height" in values:
+            values["lift_height"] = float(values["lift_height"]) * 1e-3
         return values
 
     def get_config(self) -> SimulationConfig:
@@ -892,6 +894,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # 动态更新层厚显示
         lt_mm = float(params.get("layer_thickness", self._layer_thickness_mm))
         self._lbl_thickness.setText(f"{lt_mm:.2f}")
+        if (
+            hasattr(self, "_status")
+            and bool(getattr(self._config, "enable_czm", True))
+            and float(self._config.lift_height) < float(self._config.delta_f)
+        ):
+            self._status.showMessage(
+                "警告：提升高度小于 CZM 失效位移，可能不足以完成脱粘"
+            )
         # 自动重新计算层数和分辨率（仅在非自定义模式下）
         is_custom = (
             self._chk_custom_res is not None

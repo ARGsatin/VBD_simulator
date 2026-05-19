@@ -79,10 +79,16 @@ field-debug 分支仍然需要克隆同层状态来保证 no-field/with-field �
 - 模型：`assets/test_models/demo7.STEP`
 - 层数：32
 - CZM：开/关
-- 提升距离倍数：`1.5` / `5.0`
+- 提升高度：默认 `5mm`
 - 电场调试：开/关
 
-组合数为 8 个，用于覆盖当前最容易拖慢仿真的主要因素。
+组合数为 4 个，用于覆盖当前最容易拖慢仿真的主要因素。
+
+### 6. C++ field-debug branch runner
+
+field-debug 的直接 C++ adapter 路径现在优先调用 `solve_field_debug_branch`，将单个 no-field/with-field 分支的 lift 循环、event window 电场、commit/guard 快照和平台回程合并到一次 C++ 调用中。GUI 侧仍然负责每层双分支对比、RMS/max 守门和 selected mesh 选择，因此物理守门语义保持不变。
+
+性能 CSV 对应的 `perf_cpp_solve_ms`、`perf_no_field_ms`、`perf_with_field_ms` 仍可用于观察耗时；`LayerResult.error_metrics` 额外记录 `field_branch_runner_enabled`、`field_cpp_module`、`field_cpp_openmp_enabled` 和 `field_cpp_threads`，用于确认本次是否走到了新热路径。
 
 ## 建议的测试指标
 
@@ -148,7 +154,7 @@ field-debug 分支仍然需要克隆同层状态来保证 no-field/with-field �
    - 使用 C++ 加速求解器
    - 电场调试对比
    - 禁用/启用 CZM
-   - 不同提升距离倍数
+   - 固定 5mm 提升高度
 3. 仿真结束后查看：
    - `outputs/gui/reports/solver_diagnostics.csv`
    - `outputs/gui/reports/performance_diagnostics.csv`

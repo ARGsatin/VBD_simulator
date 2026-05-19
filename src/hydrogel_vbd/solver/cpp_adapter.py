@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -201,6 +202,9 @@ def _build_cpp_config(cfg: SimulationConfig) -> Any:
     cpp_cfg.v_lift = cfg.v_lift
     cpp_cfg.layer_thickness = cfg.layer_thickness
     cpp_cfg.dx_clip = solver_dx_clip(cfg)
+    cpp_cfg.field_detach_pre_steps = int(getattr(cfg, "field_detach_pre_steps", 0))
+    cpp_cfg.field_detach_post_steps = int(getattr(cfg, "field_detach_post_steps", 1))
+    cpp_cfg.field_peak_window_steps = int(getattr(cfg, "field_peak_window_steps", 1))
     cpp_cfg.c_init = cfg.c_init
     return cpp_cfg
 
@@ -519,4 +523,128 @@ def solve_lift_and_relax(
         stable_steps=result_dict["stable_steps"],
         all_free=result_dict["all_free"],
         chebyshev_skipped_damaging=result_dict["chebyshev_skipped_damaging"],
+    )
+
+
+def _result_from_dict(result_dict: dict[str, Any], x: np.ndarray, v: np.ndarray) -> VBDSolveResult:
+    return VBDSolveResult(
+        x=x,
+        v=v,
+        iterations=int(result_dict["iterations"]),
+        max_dx=float(result_dict["max_dx"]),
+        kinetic_energy=float(result_dict["kinetic_energy"]),
+        stable_steps=int(result_dict["stable_steps"]),
+        all_free=bool(result_dict["all_free"]),
+        chebyshev_skipped_damaging=int(result_dict["chebyshev_skipped_damaging"]),
+    )
+
+
+def solve_field_debug_branch(
+    mesh: MeshState,
+    config: SimulationConfig,
+    layer_id: int,
+    e_z: float,
+    lifting_top: np.ndarray,
+    *,
+    expected_lift_steps: int,
+    event_window_detach_step: int | None = None,
+    peak_e_z: float | None = None,
+    continue_to_peak: bool = False,
+    n_layers: int = 1,
+) -> Any:
+    """Run one field-debug branch inside the C++ module."""
+    if not _CPP_AVAILABLE:
+        raise ImportError(
+            f"C++ solver 涓嶅彲鐢ㄣ€傝缂栬瘧 C++ 妯″潡鍚庨噸璇曘€俓n"
+            f"瀵煎叆閿欒: {_CPP_IMPORT_ERROR}"
+        )
+    if not hasattr(hydrogel_vbd_cpp, "solve_field_debug_branch"):
+        raise NotImplementedError("C++ field-debug branch runner is unavailable")
+
+    _czm = _ensure_mesh_int32_array(mesh, "czm_state")
+    _tets = np.ascontiguousarray(mesh.tets, dtype=np.int32)
+    _colors = np.ascontiguousarray(mesh.colors, dtype=np.int32)
+    _first_active_layer = np.ascontiguousarray(mesh.first_active_layer, dtype=np.int32)
+    _surface_layers = np.ascontiguousarray(mesh.is_top_surface_of_layer, dtype=np.int32)
+    _bs = np.ascontiguousarray(mesh.is_bottom_surface, dtype=bool)
+    _current_bottom = _current_bottom_mask(mesh, layer_id)
+
+    _validate_arrays(
+        mesh.vertices, mesh.velocities, mesh.masses,
+        _first_active_layer, _surface_layers,
+        mesh.active_vertex_mask, mesh.is_top_fixed,
+        _bs, _current_bottom, _czm, mesh.damage, mesh.time_free,
+        _tets, mesh.active_tet_mask,
+        mesh.dm_inv, mesh.tet_volumes, _colors,
+    )
+
+    cpp_cfg = _build_cpp_config(config)
+    lifting_top_list = [int(x) for x in lifting_top]
+    detach_step = 0 if event_window_detach_step is None else int(event_window_detach_step)
+    peak_value = float(e_z if peak_e_z is None else peak_e_z)
+    raw = hydrogel_vbd_cpp.solve_field_debug_branch(
+        mesh.vertices,
+        mesh.velocities,
+        mesh.ideal_vertices,
+        mesh.masses,
+        _first_active_layer,
+        _surface_layers,
+        mesh.active_vertex_mask,
+        mesh.is_top_fixed,
+        _bs,
+        _current_bottom,
+        _czm,
+        mesh.damage,
+        mesh.time_free,
+        _tets,
+        mesh.active_tet_mask,
+        mesh.dm_inv,
+        mesh.tet_volumes,
+        _colors,
+        cpp_cfg,
+        int(layer_id),
+        float(e_z),
+        lifting_top_list,
+        int(expected_lift_steps),
+        int(detach_step),
+        float(peak_value),
+        bool(continue_to_peak),
+        int(n_layers),
+    )
+
+    commit_vertices = np.asarray(raw["commit_vertices"], dtype=np.float64)
+    commit_velocities = np.asarray(raw["commit_velocities"], dtype=np.float64)
+    guard_vertices = np.asarray(raw["guard_vertices"], dtype=np.float64)
+    guard_velocities = np.asarray(raw["guard_velocities"], dtype=np.float64)
+    info = dict(raw["info"])
+    info["cpp_module"] = cpp_module_info()
+    info["cpp_openmp_enabled"] = float(_USE_OMP)
+    try:
+        info["cpp_threads"] = float(os.environ.get("OMP_NUM_THREADS", "1"))
+    except ValueError:
+        info["cpp_threads"] = 1.0
+    return SimpleNamespace(
+        commit_vertices=commit_vertices,
+        commit_velocities=commit_velocities,
+        commit_czm_state=np.asarray(raw["commit_czm_state"], dtype=np.int32),
+        commit_damage=np.asarray(raw["commit_damage"], dtype=np.float64),
+        commit_time_free=np.asarray(raw["commit_time_free"], dtype=np.float64),
+        guard_vertices=guard_vertices,
+        guard_velocities=guard_velocities,
+        guard_czm_state=np.asarray(raw["guard_czm_state"], dtype=np.int32),
+        guard_damage=np.asarray(raw["guard_damage"], dtype=np.float64),
+        guard_time_free=np.asarray(raw["guard_time_free"], dtype=np.float64),
+        commit_result=_result_from_dict(
+            raw["commit_result"], commit_vertices, commit_velocities
+        ),
+        guard_result=_result_from_dict(
+            raw["guard_result"], guard_vertices, guard_velocities
+        ),
+        commit_steps=int(raw["commit_steps"]),
+        executed_steps=int(raw["executed_steps"]),
+        total_iterations=int(raw["total_iterations"]),
+        max_iter_hits=int(raw["max_iter_hits"]),
+        clipped_steps=int(raw["clipped_steps"]),
+        lift_max=float(raw["lift_max"]),
+        info=info,
     )

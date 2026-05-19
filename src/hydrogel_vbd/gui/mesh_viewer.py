@@ -116,6 +116,42 @@ class MeshViewer(QtWidgets.QWidget):
         return tets[mask]
 
     @staticmethod
+    def _surface_polygons(
+        vertices_plot: np.ndarray,
+        boundary_faces: np.ndarray,
+    ) -> np.ndarray:
+        """Return exact triangular surface polygons for 3D collection rendering."""
+        faces = np.asarray(boundary_faces, dtype=int)
+        if len(faces) == 0:
+            return np.empty((0, 3, 3), dtype=float)
+        return np.asarray(vertices_plot, dtype=float)[faces]
+
+    def _draw_boundary_surface(
+        self,
+        vertices_plot: np.ndarray,
+        boundary_faces: np.ndarray,
+        *,
+        cmap_name: str = "viridis",
+        face_values: np.ndarray | None = None,
+    ) -> None:
+        polygons = self._surface_polygons(vertices_plot, boundary_faces)
+        if len(polygons) == 0:
+            return
+
+        self._surf = Poly3DCollection(
+            polygons,
+            cmap=cmap_name,
+            alpha=0.75,
+            edgecolors="k",
+            linewidths=0.3,
+        )
+        if face_values is not None:
+            self._surf.set_array(np.asarray(face_values, dtype=float))
+        else:
+            self._surf.set_facecolor("steelblue")
+        self._ax.add_collection3d(self._surf)
+
+    @staticmethod
     def _equal_axis_bounds(
         points: np.ndarray,
         pad_fraction: float = 0.1,
@@ -173,20 +209,11 @@ class MeshViewer(QtWidgets.QWidget):
         self._boundary_faces = self._extract_boundary_faces(tets)
         boundary_faces = self._boundary_faces
 
-        # 用 trisurf 绘制外表面
+        # Draw exact boundary triangles so vertical/overlapping 3D surfaces are not re-triangulated.
         try:
-            self._surf = self._ax.plot_trisurf(
-                vertices_plot[:, 0],
-                vertices_plot[:, 1],
-                vertices_plot[:, 2],
-                triangles=boundary_faces,
-                cmap="viridis",
-                alpha=0.75,
-                edgecolor="k",
-                linewidth=0.3,
-            )
+            self._draw_boundary_surface(vertices_plot, boundary_faces)
         except Exception:
-            # 如果 trisurf 失败（如退化面），回退到散点图
+            # Fall back to points if a degenerate surface cannot be rendered.
             self._scatter = self._ax.scatter(
                 vertices_plot[:, 0],
                 vertices_plot[:, 1],
@@ -303,18 +330,12 @@ class MeshViewer(QtWidgets.QWidget):
         )
 
         try:
-            self._surf = self._ax.plot_trisurf(
-                vertices_plot[:, 0],
-                vertices_plot[:, 1],
-                vertices_plot[:, 2],
-                triangles=boundary_faces,
-                cmap=cmap_name,
-                alpha=0.75,
-                edgecolor="k",
-                linewidth=0.3,
+            self._draw_boundary_surface(
+                vertices_plot,
+                boundary_faces,
+                cmap_name=cmap_name,
+                face_values=face_values,
             )
-            if face_values is not None:
-                self._surf.set_array(face_values)
         except Exception:
             if active_mask is not None and np.any(active_mask):
                 colors = np.where(active_mask, "red", "gray")

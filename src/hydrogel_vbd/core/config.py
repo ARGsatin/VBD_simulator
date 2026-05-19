@@ -99,7 +99,8 @@ class SimulationConfig:
     - `E_max`：最大电场强度 (V/m)
 
     **打印工艺参数**
-    - `layer_thickness`：每层厚度 / 提升高度 (m)
+    - `layer_thickness`：每层厚度 (m)
+    - `lift_height`：单层平台提升目标高度 (m)
     - `z_fep`：离型膜（FEP）Z 坐标 (m)
     - `v_lift`：平台提升速度 (m/s)，为 0 时跳过提升阶段
     - `C_0`：初始固化度比例常数
@@ -152,8 +153,8 @@ class SimulationConfig:
     field_peak_window_steps: int = 1        # v2 最高点窗口：末尾步数
 
     # ────────── 打印工艺 ──────────
-    layer_thickness: float = 5e-5    # 层厚 / 平台提升距离 (m) = 0.05mm
-    lift_multiplier: float = 1.5    # 提升距离倍数（相对于 layer_thickness），用于计算实际提升高度
+    layer_thickness: float = 5e-5    # 层厚 (m) = 0.05mm
+    lift_height: float = 5.0e-3     # 单层平台提升目标高度 (m) = 5mm
     z_fep: float = 0.0              # 离型膜 Z 坐标 (m)（Solver 内部 Z = 构建轴）
     v_lift: float = 0.001           # 提升速度 (m/s)，0 则跳过提升
     C_0: float = 1.0                # 固化度比例常数

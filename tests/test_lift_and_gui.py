@@ -343,7 +343,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             0.01,
         )
 
-    def test_cpp_subprocess_config_includes_lift_multiplier(self) -> None:
+    def test_cpp_subprocess_config_includes_lift_height(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
         from hydrogel_vbd.solver.cpp_subprocess import _DoneMsg
@@ -366,7 +366,7 @@ class WorkerLiftControlTests(unittest.TestCase):
         mesh = PythonLiftSolverStabilityTests._single_vertex_mesh()
         worker = SimulationWorker(
             mesh=mesh,
-            config=SimulationConfig(lift_multiplier=1.5),
+            config=SimulationConfig(lift_height=5.0e-3),
             n_layers=0,
             output_dir="outputs/gui",
             use_cpp=False,
@@ -380,7 +380,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             worker._run_cpp_subprocess()
 
         config_dict = captured["config_dict"]
-        self.assertEqual(config_dict["lift_multiplier"], 1.5)
+        self.assertEqual(config_dict["lift_height"], 5.0e-3)
 
     def test_push_frame_includes_active_tet_mask(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
@@ -447,12 +447,12 @@ class WorkerLiftControlTests(unittest.TestCase):
         config_dict = captured["config_dict"]
         self.assertIs(config_dict["enable_czm"], False)
 
-    def test_yaml_config_loads_lift_multiplier(self) -> None:
+    def test_yaml_config_loads_lift_height(self) -> None:
         from hydrogel_vbd.core.config import SimulationConfig
 
         config = SimulationConfig.from_yaml(ROOT / "configs" / "config.yaml")
 
-        self.assertAlmostEqual(config.lift_multiplier, 1.5)
+        self.assertAlmostEqual(config.lift_height, 5.0e-3)
 
     def test_cpp_done_payload_converts_to_layer_result(self) -> None:
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
@@ -632,7 +632,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=20.0e-6,
-            lift_multiplier=5.0,
+            lift_height=100.0e-6,
             max_iters=2,
             N_stable=1,
             epsilon=1.0e-9,
@@ -1153,7 +1153,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1235,7 +1235,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1316,7 +1316,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1404,7 +1404,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1487,7 +1487,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1531,6 +1531,69 @@ class WorkerLiftControlTests(unittest.TestCase):
             if ((czm_updates - 1) % 5) + 1 >= 2:
                 mesh_arg.czm_state[bottom] = int(CZMState.FREE)
 
+        def fake_branch_runner(mesh_arg, cfg_arg, layer_id, e_z, lifting_top, **kwargs):  # noqa: ANN001, ARG001
+            commit_vertices = mesh_arg.vertices.copy()
+            guard_vertices = mesh_arg.vertices.copy()
+            commit_vertices[:, 2] = 2.0
+            guard_vertices[:, 2] = 5.0
+            return SimpleNamespace(
+                commit_vertices=commit_vertices,
+                commit_velocities=np.zeros_like(commit_vertices),
+                commit_czm_state=np.full_like(mesh_arg.czm_state, int(CZMState.FREE)),
+                commit_damage=mesh_arg.damage.copy(),
+                commit_time_free=mesh_arg.time_free.copy(),
+                guard_vertices=guard_vertices,
+                guard_velocities=np.zeros_like(guard_vertices),
+                guard_czm_state=np.full_like(mesh_arg.czm_state, int(CZMState.FREE)),
+                guard_damage=mesh_arg.damage.copy(),
+                guard_time_free=mesh_arg.time_free.copy(),
+                commit_result=VBDSolveResult(
+                    x=commit_vertices,
+                    v=np.zeros_like(commit_vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                ),
+                guard_result=VBDSolveResult(
+                    x=guard_vertices,
+                    v=np.zeros_like(guard_vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                ),
+                commit_steps=2,
+                executed_steps=5,
+                total_iterations=5,
+                max_iter_hits=0,
+                clipped_steps=0,
+                lift_max=5.0,
+                info={
+                    "timing_mode": "event_windows_v2",
+                    "expected_steps": 5.0,
+                    "detach_step": 2.0,
+                    "commit_step": 2.0,
+                    "guard_step": 5.0,
+                    "return_steps": 0.0,
+                    "platform_return_distance": 0.0,
+                    "peak_start_step": 5.0,
+                    "applied_steps": 0.0,
+                    "detach_E_z": float(e_z),
+                    "peak_E_z": float(e_z),
+                    "cpp_solve_ms": 1.0,
+                    "python_solve_ms": 0.0,
+                    "czm_sync_ms": 0.0,
+                    "return_ms": 0.0,
+                    "snapshot_ms": 0.0,
+                    "branch_runner": 1.0,
+                },
+            )
+
         with patch(
             "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
             return_value=True,
@@ -1547,8 +1610,8 @@ class WorkerLiftControlTests(unittest.TestCase):
 
         with (
             patch(
-                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
-                side_effect=fake_cpp_solve,
+                "hydrogel_vbd.solver.cpp_adapter.solve_field_debug_branch",
+                side_effect=fake_branch_runner,
             ),
             patch(
                 "hydrogel_vbd.physics.local_terms.build_local_physics_terms",
@@ -1567,7 +1630,9 @@ class WorkerLiftControlTests(unittest.TestCase):
         self.assertEqual(metrics["field_commit_step"], 2.0)
         self.assertEqual(metrics["field_guard_step"], 5.0)
 
-    def test_field_debug_cpp_returns_platform_before_committing_peak_no_detach(self) -> None:
+    def test_field_debug_cpp_prefers_single_branch_runner_call(self) -> None:
+        from types import SimpleNamespace
+
         from hydrogel_vbd.core.config import SimulationConfig
         from hydrogel_vbd.core.state import MeshState
         from hydrogel_vbd.gui.simulation_worker import SimulationWorker
@@ -1585,7 +1650,7 @@ class WorkerLiftControlTests(unittest.TestCase):
             dt=1.0,
             v_lift=1.0,
             layer_thickness=1.0,
-            lift_multiplier=5.0,
+            lift_height=5.0,
             max_iters=1,
             N_stable=1,
             epsilon=1.0,
@@ -1604,21 +1669,214 @@ class WorkerLiftControlTests(unittest.TestCase):
         mesh.active_tet_mask = np.zeros(0, dtype=bool)
         mesh.colors = np.zeros(2, dtype=np.int32)
         mesh.node_mass = np.ones(2, dtype=float)
-        observed_v_lift: list[float] = []
+        branch_calls: list[float] = []
 
-        def fake_cpp_solve(mesh_arg, cfg_arg, e_z, layer_id, lifting_top):  # noqa: ANN001, ARG001
-            observed_v_lift.append(float(cfg_arg.v_lift))
-            step = float(cfg_arg.v_lift) * float(cfg_arg.dt)
-            mesh_arg.vertices[np.asarray(lifting_top, dtype=int), 2] += step
-            return VBDSolveResult(
-                x=mesh_arg.vertices.copy(),
-                v=np.zeros_like(mesh_arg.vertices),
-                iterations=1,
-                max_dx=0.0,
-                kinetic_energy=0.0,
-                stable_steps=1,
-                all_free=False,
-                chebyshev_skipped_damaging=0,
+        def fake_branch_runner(
+            mesh_arg, cfg_arg, layer_id, e_z, lifting_top, **kwargs
+        ):  # noqa: ANN001, ARG001
+            branch_calls.append(float(e_z))
+            commit_vertices = mesh_arg.vertices.copy()
+            guard_vertices = mesh_arg.vertices.copy()
+            if float(e_z) <= 0.0:
+                commit_vertices[:, 2] = -0.5
+                guard_vertices[:, 2] = -0.5
+            else:
+                commit_vertices[:, 2] = -0.2
+                guard_vertices[:, 2] = -0.2
+            return SimpleNamespace(
+                commit_vertices=commit_vertices,
+                commit_velocities=np.zeros_like(commit_vertices),
+                commit_czm_state=mesh_arg.czm_state.copy(),
+                commit_damage=mesh_arg.damage.copy(),
+                commit_time_free=mesh_arg.time_free.copy(),
+                guard_vertices=guard_vertices,
+                guard_velocities=np.zeros_like(guard_vertices),
+                guard_czm_state=mesh_arg.czm_state.copy(),
+                guard_damage=mesh_arg.damage.copy(),
+                guard_time_free=mesh_arg.time_free.copy(),
+                commit_result=VBDSolveResult(
+                    x=commit_vertices,
+                    v=np.zeros_like(commit_vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                ),
+                guard_result=VBDSolveResult(
+                    x=guard_vertices,
+                    v=np.zeros_like(guard_vertices),
+                    iterations=1,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=True,
+                    chebyshev_skipped_damaging=0,
+                ),
+                commit_steps=2,
+                executed_steps=5,
+                total_iterations=5,
+                max_iter_hits=0,
+                clipped_steps=0,
+                lift_max=5.0,
+                info={
+                    "timing_mode": "event_windows_v2",
+                    "expected_steps": 5.0,
+                    "detach_step": 2.0,
+                    "commit_step": 2.0,
+                    "guard_step": 5.0,
+                    "return_steps": 0.0,
+                    "platform_return_distance": 0.0,
+                    "peak_start_step": 5.0,
+                    "applied_steps": 3.0 if float(e_z) > 0.0 else 0.0,
+                    "detach_E_z": float(e_z),
+                    "peak_E_z": float(kwargs.get("peak_e_z") or e_z),
+                    "cpp_solve_ms": 1.0,
+                    "python_solve_ms": 0.0,
+                    "czm_sync_ms": 0.0,
+                    "return_ms": 0.0,
+                    "snapshot_ms": 0.0,
+                    "branch_runner": 1.0,
+                },
+            )
+
+        with patch(
+            "hydrogel_vbd.gui.simulation_worker.is_cpp_available",
+            return_value=True,
+        ):
+            worker = SimulationWorker(
+                mesh=mesh,
+                config=config,
+                n_layers=1,
+                output_dir="outputs/test_worker_field_debug_branch_runner",
+                use_cpp=True,
+                field_debug_enabled=True,
+            )
+        worker._trace = lambda msg: None
+
+        with (
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_field_debug_branch",
+                side_effect=fake_branch_runner,
+            ),
+            patch(
+                "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
+                side_effect=AssertionError(
+                    "branch runner should replace per-step C++ calls"
+                ),
+            ),
+        ):
+            results = worker._run_layers()
+
+        self.assertEqual(branch_calls, [0.0, 0.5])
+        metrics = results[0].error_metrics
+        self.assertEqual(metrics["field_debug_solver_backend"], "cpp_adapter")
+        self.assertEqual(metrics["field_branch_runner_enabled"], 1.0)
+        self.assertEqual(metrics["field_commit_step"], 2.0)
+        self.assertEqual(metrics["field_guard_step"], 5.0)
+
+    def test_field_debug_cpp_returns_platform_before_committing_peak_no_detach(self) -> None:
+        from types import SimpleNamespace
+
+        from hydrogel_vbd.core.config import SimulationConfig
+        from hydrogel_vbd.core.state import MeshState
+        from hydrogel_vbd.gui.simulation_worker import SimulationWorker
+        from hydrogel_vbd.solver.vbd_solver import VBDSolveResult
+
+        config = SimulationConfig(
+            enable_czm=True,
+            g=(0.0, 0.0, 0.0),
+            q_ion=1.0,
+            K_p=1.0,
+            K_i=0.0,
+            K_d=0.0,
+            err_target=0.0,
+            field_regularization=0.0,
+            dt=1.0,
+            v_lift=1.0,
+            layer_thickness=1.0,
+            lift_height=5.0,
+            max_iters=1,
+            N_stable=1,
+            epsilon=1.0,
+        )
+        mesh = MeshState(
+            vertices=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+            tets=np.zeros((0, 4), dtype=np.int32),
+            layer_id_per_vertex=np.zeros(2, dtype=np.int32),
+            layer_id_per_tet=np.zeros(0, dtype=np.int32),
+            first_active_layer=np.zeros(2, dtype=np.int32),
+            is_top_surface_of_layer=np.array([1, 0], dtype=np.int32),
+            is_top_fixed=np.array([True, False], dtype=bool),
+        )
+        mesh.ideal_vertices[:] = mesh.vertices
+        mesh.active_vertex_mask[:] = True
+        mesh.active_tet_mask = np.zeros(0, dtype=bool)
+        mesh.colors = np.zeros(2, dtype=np.int32)
+        mesh.node_mass = np.ones(2, dtype=float)
+        branch_calls: list[float] = []
+
+        def fake_branch_runner(mesh_arg, cfg_arg, layer_id, e_z, lifting_top, **kwargs):  # noqa: ANN001, ARG001
+            branch_calls.append(float(e_z))
+            commit_vertices = mesh_arg.vertices.copy()
+            guard_vertices = mesh_arg.vertices.copy()
+            return SimpleNamespace(
+                commit_vertices=commit_vertices,
+                commit_velocities=np.zeros_like(commit_vertices),
+                commit_czm_state=mesh_arg.czm_state.copy(),
+                commit_damage=mesh_arg.damage.copy(),
+                commit_time_free=mesh_arg.time_free.copy(),
+                guard_vertices=guard_vertices,
+                guard_velocities=np.zeros_like(guard_vertices),
+                guard_czm_state=mesh_arg.czm_state.copy(),
+                guard_damage=mesh_arg.damage.copy(),
+                guard_time_free=mesh_arg.time_free.copy(),
+                commit_result=VBDSolveResult(
+                    x=commit_vertices,
+                    v=np.zeros_like(commit_vertices),
+                    iterations=5,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=False,
+                    chebyshev_skipped_damaging=0,
+                ),
+                guard_result=VBDSolveResult(
+                    x=guard_vertices,
+                    v=np.zeros_like(guard_vertices),
+                    iterations=5,
+                    max_dx=0.0,
+                    kinetic_energy=0.0,
+                    stable_steps=1,
+                    all_free=False,
+                    chebyshev_skipped_damaging=0,
+                ),
+                commit_steps=5,
+                executed_steps=5,
+                total_iterations=10,
+                max_iter_hits=0,
+                clipped_steps=0,
+                lift_max=5.0,
+                info={
+                    "timing_mode": "event_windows_v2",
+                    "expected_steps": 5.0,
+                    "detach_step": 0.0,
+                    "commit_step": 5.0,
+                    "guard_step": 5.0,
+                    "return_steps": 5.0,
+                    "platform_return_distance": 5.0,
+                    "peak_start_step": 5.0,
+                    "applied_steps": 0.0,
+                    "detach_E_z": float(e_z),
+                    "peak_E_z": float(e_z),
+                    "cpp_solve_ms": 1.0,
+                    "python_solve_ms": 0.0,
+                    "czm_sync_ms": 0.0,
+                    "return_ms": 0.0,
+                    "snapshot_ms": 0.0,
+                    "branch_runner": 1.0,
+                },
             )
 
         with patch(
@@ -1636,8 +1894,8 @@ class WorkerLiftControlTests(unittest.TestCase):
         worker._trace = lambda msg: None
 
         with patch(
-            "hydrogel_vbd.solver.cpp_adapter.solve_lift_and_relax",
-            side_effect=fake_cpp_solve,
+            "hydrogel_vbd.solver.cpp_adapter.solve_field_debug_branch",
+            side_effect=fake_branch_runner,
         ):
             results = worker._run_layers()
 
@@ -1646,8 +1904,7 @@ class WorkerLiftControlTests(unittest.TestCase):
         self.assertEqual(metrics["field_commit_step"], 5.0)
         self.assertEqual(metrics["field_guard_step"], 5.0)
         self.assertEqual(metrics["field_platform_return_steps"], 5.0)
-        self.assertEqual(observed_v_lift[:5], [1.0] * 5)
-        self.assertEqual(observed_v_lift[5:10], [-1.0] * 5)
+        self.assertEqual(branch_calls[:1], [0.0])
 
 
 class LayerActivatorTopFallbackTests(unittest.TestCase):
@@ -1811,8 +2068,9 @@ class GuiParamConfigTests(unittest.TestCase):
         self.assertEqual(config.N_stable, 3)
         self.assertAlmostEqual(config.layer_thickness, 0.7993e-3)
         self.assertAlmostEqual(config.v_lift, 0.01)
-        self.assertIn("lift_multiplier", panel._spin_map)
-        self.assertAlmostEqual(config.lift_multiplier, 1.5)
+        self.assertNotIn("lift_multiplier", panel._spin_map)
+        self.assertIn("lift_height", panel._spin_map)
+        self.assertAlmostEqual(config.lift_height, 5.0e-3)
         self.assertIn("node_area", panel._spin_map)
         self.assertAlmostEqual(config.node_area, 1.0e-6)
         app.quit()
@@ -1945,6 +2203,34 @@ class GuiParamConfigTests(unittest.TestCase):
                 dtype=float,
             ),
         )
+
+    def test_mesh_viewer_surface_polygons_follow_boundary_face_indices(self) -> None:
+        from hydrogel_vbd.gui.mesh_viewer import MeshViewer
+
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [10.0, 10.0, 10.0],
+            ],
+            dtype=float,
+        )
+        faces = np.array(
+            [
+                [0, 1, 2],
+                [0, 2, 3],
+            ],
+            dtype=int,
+        )
+
+        polygons = MeshViewer._surface_polygons(vertices, faces)
+
+        self.assertEqual(polygons.shape, (2, 3, 3))
+        np.testing.assert_array_equal(polygons[0], vertices[[0, 1, 2]])
+        np.testing.assert_array_equal(polygons[1], vertices[[0, 2, 3]])
+        self.assertNotIn(10.0, polygons)
 
     def test_mesh_bbox_summary_reports_mm_extents(self) -> None:
         from hydrogel_vbd.gui.main_window import _format_bbox_mm
@@ -2787,6 +3073,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
+            lift_height=1.5e-6,
             max_iters=2,
             N_stable=1,
         )
@@ -2810,6 +3097,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -2867,7 +3155,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
-            lift_multiplier=1.0,
+            lift_height=1.0e-6,
             max_iters=1,
             N_stable=1,
         )
@@ -2891,7 +3179,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -2951,7 +3239,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
-            lift_multiplier=1.5,
+            lift_height=1.5e-6,
             max_iters=1,
             N_stable=1,
         )
@@ -2975,7 +3263,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -3033,7 +3321,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
-            lift_multiplier=1.5,
+            lift_height=1.5e-6,
             max_iters=1,
             N_stable=1,
         )
@@ -3057,7 +3345,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -3112,7 +3400,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
-            lift_multiplier=1.5,
+            lift_height=1.5e-6,
             max_iters=1,
             N_stable=1,
         )
@@ -3136,7 +3424,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -3193,7 +3481,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0,
             layer_thickness=1.0e-3,
-            lift_multiplier=1.0,
+            lift_height=1.0e-3,
             max_iters=3,
             N_stable=1,
             epsilon=1.0e-9,
@@ -3218,7 +3506,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
             "epsilon": config.epsilon,
@@ -3280,6 +3568,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
+            lift_height=1.5e-6,
             max_iters=2,
             N_stable=1,
             epsilon=1.0e-9,
@@ -3304,6 +3593,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
             "epsilon": config.epsilon,
@@ -3359,6 +3649,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=2.0e-7,
+            lift_height=3.0e-7,
             max_iters=2,
             N_stable=1,
             epsilon=1.0e-9,
@@ -3383,6 +3674,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
             "epsilon": config.epsilon,
@@ -3454,7 +3746,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=20.0e-6,
-            lift_multiplier=5.0,
+            lift_height=100.0e-6,
             max_iters=2,
             N_stable=1,
             epsilon=1.0e-9,
@@ -3479,7 +3771,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
-            "lift_multiplier": config.lift_multiplier,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
             "epsilon": config.epsilon,
@@ -3569,6 +3861,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=2.0e-7,
+            lift_height=3.0e-7,
             max_iters=2,
             N_stable=1,
         )
@@ -3591,6 +3884,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }
@@ -3641,6 +3935,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             dt=1.0e-3,
             v_lift=1.0e-3,
             layer_thickness=1.0e-6,
+            lift_height=1.5e-6,
             max_iters=2,
             N_stable=1,
         )
@@ -3664,6 +3959,7 @@ class CppSubprocessRuntimeTests(unittest.TestCase):
             "dt": config.dt,
             "v_lift": config.v_lift,
             "layer_thickness": config.layer_thickness,
+            "lift_height": config.lift_height,
             "max_iters": config.max_iters,
             "N_stable": config.N_stable,
         }

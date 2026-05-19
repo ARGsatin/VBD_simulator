@@ -59,6 +59,11 @@ struct SolverConfig {
     double layer_thickness = 5e-5;
     double dx_clip = 2e-3;
 
+    // Field-debug event windows
+    int field_detach_pre_steps = 0;
+    int field_detach_post_steps = 1;
+    int field_peak_window_steps = 1;
+
     // Adaptive acceleration
     double c_init = 0.5;
 };

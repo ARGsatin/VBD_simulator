@@ -289,6 +289,24 @@ class SimulationWorker(QtCore.QObject):
 
         return copy_mesh
 
+    @classmethod
+    def _mesh_from_branch_arrays(
+        cls,
+        template: MeshState,
+        vertices: np.ndarray,
+        velocities: np.ndarray,
+        czm_state: np.ndarray,
+        damage: np.ndarray,
+        time_free: np.ndarray,
+    ) -> MeshState:
+        mesh = cls._deep_copy_mesh(template)
+        mesh.vertices = np.asarray(vertices, dtype=float).copy()
+        mesh.velocities = np.asarray(velocities, dtype=float).copy()
+        mesh.czm_state = np.asarray(czm_state, dtype=np.int32).copy()
+        mesh.damage = np.asarray(damage, dtype=float).copy()
+        mesh.time_free = np.asarray(time_free, dtype=float).copy()
+        return mesh
+
     # ───────────────────────────────────────────────────────────
     # 停止控制
     # ───────────────────────────────────────────────────────────
@@ -599,6 +617,7 @@ class SimulationWorker(QtCore.QObject):
 
         if use_cpp:
             from hydrogel_vbd.solver.cpp_adapter import (
+                solve_field_debug_branch as cpp_solve_field_debug_branch,
                 solve_until_stable as cpp_solve_until_stable,
                 solve_lift_and_relax as cpp_solve_lift_and_relax,
             )
@@ -620,7 +639,7 @@ class SimulationWorker(QtCore.QObject):
         activator.activate_with_inheritance(mesh, layer_id, z_fep=layer_z_fep)
         python_solver = None if use_cpp else solver(layer_config)
 
-        lift_max = config.lift_multiplier * config.layer_thickness
+        lift_max = config.lift_height
         lift_step = config.v_lift * config.dt
         expected_lift_steps = (
             self._expected_lift_steps(lift_max, lift_step)
@@ -628,6 +647,56 @@ class SimulationWorker(QtCore.QObject):
             else 0
         )
         top_ids = self._current_lifting_top(mesh)
+
+        if use_cpp and expected_lift_steps > 0 and len(top_ids) > 0:
+            branch_start = time.perf_counter()
+            branch = cpp_solve_field_debug_branch(
+                mesh,
+                layer_config,
+                layer_id,
+                e_z,
+                top_ids,
+                expected_lift_steps=expected_lift_steps,
+                event_window_detach_step=event_window_detach_step,
+                peak_e_z=peak_e_z,
+                continue_to_peak=continue_to_peak,
+                n_layers=self._n_layers,
+            )
+            branch_elapsed_ms = (time.perf_counter() - branch_start) * 1000.0
+            commit_mesh = self._mesh_from_branch_arrays(
+                mesh,
+                branch.commit_vertices,
+                branch.commit_velocities,
+                branch.commit_czm_state,
+                branch.commit_damage,
+                branch.commit_time_free,
+            )
+            guard_mesh = self._mesh_from_branch_arrays(
+                mesh,
+                branch.guard_vertices,
+                branch.guard_velocities,
+                branch.guard_czm_state,
+                branch.guard_damage,
+                branch.guard_time_free,
+            )
+            info = dict(branch.info)
+            info["cpp_solve_ms"] = float(
+                info.get("cpp_solve_ms", branch_elapsed_ms)
+            )
+            info["branch_runner"] = 1.0
+            return _FieldDebugBranchRun(
+                commit_mesh=commit_mesh,
+                guard_mesh=guard_mesh,
+                commit_result=branch.commit_result,
+                guard_result=branch.guard_result,
+                commit_steps=int(branch.commit_steps),
+                executed_steps=int(branch.executed_steps),
+                total_iterations=int(branch.total_iterations),
+                max_iter_hits=int(branch.max_iter_hits),
+                clipped_steps=int(branch.clipped_steps),
+                lift_max=float(branch.lift_max),
+                info=info,
+            )
 
         total_iterations = 0
         max_iter_hits = 0
@@ -1108,7 +1177,7 @@ class SimulationWorker(QtCore.QObject):
             "enable_czm",
             "z_fep", "C_0", "eta", "fluid_radius",
             "d_min", "d_fluid_max", "t_fluid_max",
-            "v_lift", "layer_thickness", "lift_multiplier", "c_init",
+            "v_lift", "layer_thickness", "lift_height", "c_init",
         ):
             val = getattr(self._config, attr, None)
             if val is not None:
@@ -1626,6 +1695,18 @@ class SimulationWorker(QtCore.QObject):
                     "field_debug_enabled": 1.0,
                     "field_debug_solver_backend": field_solver_backend,
                     "field_debug_cpp_fallbacks": float(field_cpp_fallbacks),
+                    "field_branch_runner_enabled": float(
+                        no_field_run.info.get("branch_runner", 0.0)
+                    ),
+                    "field_cpp_openmp_enabled": float(
+                        no_field_run.info.get("cpp_openmp_enabled", 0.0)
+                    ),
+                    "field_cpp_threads": float(
+                        no_field_run.info.get("cpp_threads", 1.0)
+                    ),
+                    "field_cpp_module": str(
+                        no_field_run.info.get("cpp_module", "")
+                    ),
                     "field_candidate_skipped": float(candidate_skipped),
                     "field_timing_mode": with_field_info["timing_mode"],
                     "field_window_expected_steps": with_field_info[
@@ -1799,7 +1880,7 @@ class SimulationWorker(QtCore.QObject):
             # 若存在提升需求（当前层夹持顶面非空），按预估步数反复调用
             # 单步求解器，每步执行：提升 → 静平衡 → CZM 更新
             # ══════════════════════════════════════════════════
-            lift_max = self._config.lift_multiplier * self._config.layer_thickness
+            lift_max = self._config.lift_height
             lift_step = self._config.v_lift * self._config.dt
             expected_lift_steps = (
                 self._expected_lift_steps(lift_max, lift_step)

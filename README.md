@@ -143,7 +143,7 @@ VBD_simulator/
 | **求解器** | `dt`, `epsilon`, `max_iters`, `N_stable` | 时间步长、收敛容差、最大迭代 |
 | **PID 控制** | `c_init`, `err_target`, `K_p`, `K_i`, `K_d` | 初始固化度、目标误差、PID 增益 |
 | **电场** | `q_ion`, `E_max` | 离子电荷密度、最大电场强度 |
-| **打印工艺** | `layer_thickness`, `z_fep`, `v_lift`, `build_axis` | 层厚、离型膜位置、提升速度、构建方向（0=X/1=Y/2=Z） |
+| **打印工艺** | `layer_thickness`, `lift_height`, `z_fep`, `v_lift`, `build_axis` | 层厚、单层提升高度、离型膜位置、提升速度、构建方向（0=X/1=Y/2=Z） |
 
 ---
 

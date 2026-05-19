@@ -533,7 +533,7 @@ def _run_simulation(
         pid_state = pid.update(0.0)
         e_z = pid_state.E_z
 
-        lift_max = config.lift_multiplier * config.layer_thickness
+        lift_max = config.lift_height
         lift_distance = 0.0
         v_lift = config.v_lift
         dt = config.dt

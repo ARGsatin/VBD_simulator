@@ -37,7 +37,7 @@ class PerformanceBenchmarkScenario:
     model_path: Path
     layers: int
     enable_czm: bool
-    lift_multiplier: float
+    lift_height: float
     field_debug_enabled: bool
 
 
@@ -49,22 +49,23 @@ def default_performance_benchmark_matrix(
     """Return the standard slow-mode benchmark matrix without running it."""
     path = Path(model_path)
     scenarios: list[PerformanceBenchmarkScenario] = []
+    lift_height = 5.0e-3
     for enable_czm in (False, True):
-        for lift_multiplier in (1.5, 5.0):
-            for field_debug_enabled in (False, True):
-                scenarios.append(
-                    PerformanceBenchmarkScenario(
-                        name=(
-                            f"demo7_32l_czm-{int(enable_czm)}_"
-                            f"lift-{lift_multiplier:g}_field-{int(field_debug_enabled)}"
-                        ),
-                        model_path=path,
-                        layers=int(layers),
-                        enable_czm=bool(enable_czm),
-                        lift_multiplier=float(lift_multiplier),
-                        field_debug_enabled=bool(field_debug_enabled),
-                    )
+        for field_debug_enabled in (False, True):
+            scenarios.append(
+                PerformanceBenchmarkScenario(
+                    name=(
+                        f"demo7_32l_czm-{int(enable_czm)}_"
+                        f"lift-{lift_height * 1000.0:g}mm_"
+                        f"field-{int(field_debug_enabled)}"
+                    ),
+                    model_path=path,
+                    layers=int(layers),
+                    enable_czm=bool(enable_czm),
+                    lift_height=lift_height,
+                    field_debug_enabled=bool(field_debug_enabled),
                 )
+            )
     return scenarios
 
 
@@ -86,14 +87,13 @@ def _expected_lift_steps(lift_max: float, lift_step: float) -> int:
 
 def compute_lift_plan(
     *,
-    layer_thickness: float,
+    lift_height: float,
     v_lift: float,
     dt: float,
-    lift_multiplier: float = 1.5,
     avg_call_ms: float | None = None,
 ) -> LiftPlanDiagnostics:
     """Compute the outer lift-loop plan without mutating solver state."""
-    lift_max = float(lift_multiplier) * float(layer_thickness)
+    lift_max = float(lift_height)
     lift_step = float(v_lift) * float(dt)
     expected_steps = (
         _expected_lift_steps(lift_max, lift_step) if lift_step > 0.0 else 0
